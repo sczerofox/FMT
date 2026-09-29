@@ -1,0 +1,56 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev, "feature/**"]
+  pull_request:
+    branches: [main, dev]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-msvc
+            os: windows-latest
+            generator: Ninja
+          - name: ubuntu-gcc
+            os: ubuntu-latest
+            generator: Ninja
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@v4.4.2
+        with:
+          cmakeVersion: 3.31.x
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -G "${{ matrix.generator }}"
+          -DCMAKE_BUILD_TYPE=Debug
+          -DBUILD_TESTING=ON
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke test the executable
+        shell: bash
+        run: |
+          ./build/bin/FMT --version
+          ./build/bin/FMT --help
