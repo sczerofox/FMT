@@ -9,7 +9,6 @@
     {
       "name": "base",
       "hidden": true,
-      "binaryDir": "${sourceDir}/cmake-build-${presetName}",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
@@ -17,8 +16,10 @@
     {
       "name": "msvc-debug",
       "displayName": "MSVC x64 Debug (Ninja)",
+      "description": "Shares cmake-build-debug with CLion's default Debug profile.",
       "inherits": "base",
       "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "BUILD_TESTING": "ON",
@@ -30,6 +31,7 @@
       "displayName": "MSVC x64 Release (Ninja)",
       "inherits": "base",
       "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "BUILD_TESTING": "ON",
@@ -41,6 +43,7 @@
       "displayName": "MinGW g++ Debug (Ninja)",
       "inherits": "base",
       "generator": "Ninja",
+      "binaryDir": "${sourceDir}/cmake-build-debug",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "BUILD_TESTING": "ON",

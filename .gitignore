@@ -1,4 +1,6 @@
 # ---- Build output ----
+# cmake-build-debug/ is the single build directory used by both CLion's
+# default Debug profile and the CMake presets; it is never committed.
 cmake-build-*/
 build/
 out/

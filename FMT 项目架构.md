@@ -28,7 +28,7 @@
 ```
 FMT/
 ├── CMakeLists.txt              顶层构建脚本：全局设置、版本头生成、子目录编排
-├── CMakePresets.json           本地构建预设（MSVC / MinGW，Ninja 后端）
+├── CMakePresets.json           本地构建预设（MSVC / MinGW，Ninja，共用 cmake-build-debug）
 ├── .gitignore                  忽略构建产物、IDE 配置、编译中间文件
 ├── README.md                   （待撰写）
 ├── FMT 开发文档.md              （待撰写）
@@ -143,13 +143,13 @@ MSVC 在中文代码页下会误报 C4819 或产生乱码。
 唯一的第三方依赖 Catch2 通过 `FetchContent` 在配置阶段拉取：
 
 - 固定在 tag `v3.7.1`，可用 `-DFMT_CATCH2_TAG=...` 覆盖；
-- `GIT_SHALLOW TRUE` 只取最新一次提交，实测克隆体积约 8.9 MB；
+- `GIT_SHALLOW TRUE` 只取最新一次提交，实测克隆体积约 9 MB；
 - `SYSTEM` 使其头文件按系统头处理，不触发本项目的警告；
 - 测试源码内嵌在 `tests/CMakeLists.txt` 中，只能通过关闭 `BUILD_TESTING`
   来跳过拉取。
 
-本地实测首次配置耗时约 641 秒，时间几乎全部消耗在这次网络拉取上，与编译无关；
-构建目录建立后会复用，不会重复下载。
+本地多次实测首次配置耗时 283～641 秒，差异全部来自这次网络拉取，与编译无关
+（同样的配置在缓存命中时仅需约 2 秒）；构建目录建立后会复用，不会重复下载。
 
 ### 4.4 安装规则
 
@@ -250,6 +250,9 @@ inline constexpr std::string_view STRING = "0.1.0";
 | 编译器 | MSVC 14.51（VS 2026 BuildTools）实测通过；MinGW g++ 15.1 实测通过 |
 | 构建后端 | Ninja（未安装 Ninja 也可用 Makefiles / 其他生成器） |
 | 网络 | 首次配置需访问 github.com 拉取 Catch2 |
+| 构建目录 | 仅 `cmake-build-debug/`，不入版本控制 |
+| 磁盘占用 | 单个 Debug 构建目录约 150 MB（含 Catch2 源码与库） |
+| 首次配置耗时 | 实测 283～641 秒，取决于网络（下载 Catch2 约 9 MB），与编译无关 |
 
 `cmake_minimum_required` 定为 3.20 而非更高版本：骨架只用到
 `configure_file`、`FetchContent`、CTest 这些 3.20 已具备的能力。这个下限
@@ -257,7 +260,13 @@ inline constexpr std::string_view STRING = "0.1.0";
 
 ### 6.2 本地构建
 
-提供了 [`CMakePresets.json`](CMakePresets.json) 三套预设：
+工程只保留**一个**构建目录 `cmake-build-debug/`。这一点是刻意的，有三重考量：
+避免磁盘上堆积多份重复的依赖与中间产物、避免 CMake 缓存与生成器配置互相干扰、
+让 CLion 与命令行落在同一处而看不到「两份不一致的构建结果」。
+
+CLion 的默认 `Debug` 配置本就用这个目录（生成器 Ninja）。为了让命令行预设与它
+对齐，[`CMakePresets.json`](CMakePresets.json) 中三套预设的 `binaryDir` 都指向
+这同一个目录：
 
 | 预设 | 生成器 | 编译器 | 构建类型 | 测试 |
 |---|---|---|---|---|
@@ -266,15 +275,26 @@ inline constexpr std::string_view STRING = "0.1.0";
 | `mingw-debug` | Ninja | MinGW g++（绝对路径） | Debug | 开启 |
 
 ```powershell
-cmake --preset msvc-debug          # 配置
-cmake --build --preset msvc-debug  # 编译
-ctest --preset msvc-debug          # 测试
+cmake --preset msvc-debug                    # 配置（复用 cmake-build-debug）
+cmake --build --preset msvc-debug            # 编译
+ctest --preset msvc-debug                    # 测试
 ```
 
-**三点注意事项：**
+**注意事项：**
 
+- **切换预设前先清空目录。** 三套预设共用 `cmake-build-debug`，而 CMake 缓存中的
+  编译器与构建类型是**粘性**的：在已配置好的目录里换预设，CMake 会忽略新的
+  `CMAKE_BUILD_TYPE` 而沿用旧缓存，或者直接报工具链不一致。需要切换时先删除该
+  目录（或另给一个 `-B` 目录）：
+  ```powershell
+  Remove-Item cmake-build-debug -Recurse -Force
+  cmake --preset mingw-debug
+  ```
+- **不要与正在构建的 CLion 同时操作同一目录。** 两边并发写入 `cmake-build-debug`
+  会破坏 CMake 缓存状态。命令行配置期间请让 CLion 处于空闲，或先在 CLion 中
+  停止当前构建。
 - Ninja 需要 MSVC 环境变量（`cl`、`link` 在 PATH 中）。请在 *Visual Studio
-  开发者命令行* 中执行，或直接使用 CLion 打开项目并选择 `msvc-debug` 预设。
+  开发者命令行* 中执行，或直接使用 CLion 打开项目并选择 `Debug` 配置。
 - 预设中显式写入了 `CMAKE_CXX_COMPILER=cl`。这不是冗余：Ninja 生成器在
   PATH 中同时存在 g++ 时可能优先选中它，显式指定可避免误用编译器。
 - `mingw-debug` 里是 `D:/MinGW/MinGW-win64-v12.0.0/bin/` 这样的**本机绝对
@@ -284,10 +304,12 @@ ctest --preset msvc-debug          # 测试
 不使用预设时的等价命令：
 
 ```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
+cmake -S . -B cmake-build-debug -G Ninja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
+cmake --build cmake-build-debug --parallel
+ctest --test-dir cmake-build-debug --output-on-failure
 ```
+
+`-B` 的目录名建议保持 `cmake-build-debug`，与上文约定一致。
 
 ### 6.3 持续集成
 
@@ -306,7 +328,7 @@ checkout → 安装 CMake/Ninja → 配置 → 编译 → ctest → 可执行文
   运行行为，而不只是「能编译」。
 - 同一分支的旧运行会被自动取消（`concurrency`）。
 
-### 6.4 分支模型
+### 6.4 分支与仓库状态约定
 
 | 分支 | 定位 |
 |---|---|
@@ -315,6 +337,15 @@ checkout → 安装 CMake/Ninja → 配置 → 编译 → ctest → 可执行文
 
 当前 `dev` 领先 `main` 一个提交（工程骨架）。功能开发完成后从 `dev` 向
 `main` 发起 PR。
+
+**构建目录约定：** 磁盘上只保留 `cmake-build-debug/`，任何其他构建目录都属于
+临时产物，用完即删。该目录由 [`.gitignore`](.gitignore) 中的 `cmake-build-*/`
+规则覆盖，不会进入版本控制。
+
+**IDE 配置约定：** `.idea/` 目前**不纳入**版本控制——其中
+`workspace.xml` 记录的是个人窗口布局、构建配置与最近文件等本机状态，
+`.idea/.gitignore`（CLion 生成）本身也忽略了它。是否需要像常见 C++ 工程那样
+提交 `misc.xml`、`modules.xml` 等共享配置，见 7.2 待决事项。
 
 ---
 
@@ -347,6 +378,8 @@ checkout → 安装 CMake/Ninja → 配置 → 编译 → ctest → 可执行文
 | 编译器矩阵 | 仅验证 MSVC 与 MinGW；Clang 未验证 |
 | 测试覆盖 | 当前仅覆盖版本信息，被测逻辑本身是占位代码 |
 | 文档落位 | 架构文档在根目录，开发文档亦在根目录；内容增多后建议移入 `docx/` 并建立索引 |
+| 构建目录 | 现为单一 `cmake-build-debug/`，切换预设需手工清空；若日后需要并行保存 Debug/Release 产物，需重新划分目录并在本文档 6.2 记录 |
+| IDE 配置 | `.idea/` 当前整体不入版本控制，团队协作时是否提交共享配置尚未确定，见 6.4 |
 
 ### 7.3 已知限制
 
@@ -357,5 +390,10 @@ checkout → 安装 CMake/Ninja → 配置 → 编译 → ctest → 可执行文
   行尾造成整文件 diff。跨平台协作若需要统一行尾，应改用 `.gitattributes`
   显式声明，而不是依赖个人配置。
 - **首次配置耗时。** 见 4.3，主要成本是拉取 Catch2。
+- **构建目录内含嵌套 Git 仓库。** `cmake-build-debug/_deps/catch2-src/` 是
+  FetchContent 检出的 Catch2 副本，自带 `.git` 目录。它在仓库的 `.gitignore`
+  中额外被自己的 `.gitignore` 忽略，因此 `git status` 看不到它；但 `git clean -xdf`
+  之类的操作可能把它当作嵌套仓库处理，清理构建目录时直接删除整个
+  `cmake-build-debug/` 更省事。
 - **`FMT` 缩写歧义。** 项目名 `FMT` 与多个既有项目重名（如 {fmt} 格式化库、
   FMT 仿真工具）。在文档与代码注释中首次出现全称有助于避免混淆。
