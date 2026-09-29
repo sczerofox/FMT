@@ -1,0 +1,61 @@
+# ---- Build output ----
+cmake-build-*/
+build/
+out/
+bin/
+lib/
+install/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+*.cmake.in
+
+# ---- Compiled artifacts ----
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.exe.*
+*.pdb
+*.ilk
+*.exp
+*.gch
+*.pch
+*.d
+
+# ---- IDE / editor ----
+.idea/
+.vscode/
+.vs/
+CMakeSettings.json
+*.user
+*.suo
+*.sln
+*.vcxproj
+*.vcxproj.*
+.cache/
+.clangd/
+compile_flags.txt
+*.swp
+*.swo
+*~
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Logs & temp ----
+*.log
+*.tmp
