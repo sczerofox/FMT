@@ -1023,6 +1023,14 @@ trash/<用户>/.original                     桶级身份记录（原名 / 回�
 `moved_to` 也由它算出来（第 43 节）。和仓库侧一样，路径不写进任何记录，
 只由 `file_id` + `user` + `bucket` + `file_name` 现推。
 
+> **`<bucket>` 取的是记录自己的 `bucket`，不是当前 Bucket（提交 `0ad9efc` 明确）**：
+> `trash_path_of(const FileRecord&)` 只读传进来的那条记录（`record.bucket`），
+> 从头到尾不看 `config_.current_bucket`。所以「在桶 B 里按名字删掉桶 A 的文件」时，
+> 文件会进 `trash/<用户>/.files/<A 的桶名>/YYYY/MM/DD/<文件名>`，**不会**落在 B 下。
+> 这样落点和恢复目标才对得上：`file.json` 里那条记录的 `bucket` 仍是 A，
+> 阶段 7 的文件级恢复要搬回 `repository/<用户>/<A>/…`（第 43 节）。用例
+> `File.按名字删除用的是记录自己的Bucket` 就钉这一条。
+
 ---
 
 # 22. File ID 生成
@@ -1695,7 +1703,8 @@ Result<FileRecord> FileService::commit_upload(PreparedUpload& prepared);
 第二段（锁内，第 37～40 节）
 9.  检查当前用户（FMT-604）、current_bucket（FMT-305）、桶目录是否存在（FMT-200）
 10. MD5 去重：同用户 + 任何 Bucket + 正常文件命中 → FMT-304（第 37 节）
-11. 文件名冲突：同用户 + 任何 Bucket + 正常文件 + 同名 → FMT-105（第 38 节）
+11. 文件名冲突：同用户 + 任何 Bucket + 正常文件 + 同名 → FMT-105（第 38 节；
+    **同名不区分大小写**，提交 `5bf2c1f`）
 12. 生成 file_id（第 22 节）→ 由它推出日期目录
 13. 移动临时文件到 repository/<user>/<bucket>/YYYY/MM/DD/（第 39 节）
 14. 写入 file.json；写不进去就把刚提交的仓库文件删掉（第 40 节）
@@ -2121,11 +2130,20 @@ test_1.txt
 ```text
 命中条件   record.user == current_user
         && !record.is_trash
-        && record.file_name == prepared.file_name
+        && iequals(record.file_name, prepared.file_name)     ← 提交 5bf2c1f
 
 返回值     FMT-105 FileNameConflict（退出码 4）
 消息       「同名文件已存在：<file_name>（换一个文件名再上传）」
 ```
+
+**名字比较不区分大小写（提交 `5bf2c1f`，修的是数据损坏）**：这一条原来是 `==` 精确比较，
+于是先传 `doc.txt`、再传 `DOC.TXT` 会被当成两个不同的名字放过——而两者在 Windows 上
+落到**同一个磁盘路径**，第二次上传把第一个文件的字节**覆盖**掉，
+`file.json` 里第一条记录还写着旧的 `size` / `md5`。结果是**同一个磁盘文件被两条记录指向
++ 字节被覆盖 + 元数据失真**（回归用例 `File.大小写不同的同名必须被当成重名`：
+仓库里那个文件 `file_size` 期望 11、实际 22）。所以：**名字在同用户范围内唯一
+（不区分大小写）**，`doc.txt` 与 `DOC.TXT` 不能共存——这不是额外限制，
+是那条覆盖路径的根因防线（`FMT 技术文档.md` 第 18.22 节）。
 
 **重名不自动改名**：不生成 `test(1).txt` / `test_1.txt`，也不覆盖旧文件——
 要用户自己换一个名字再传（`file upload <来源> <新名字>`）。
@@ -2354,8 +2372,11 @@ file get <filename>
 命令：
 
 ```text
-file delete <file_id>
+file delete <file_id|文件名>
 ```
+
+**定位规则与第 42 节 `file get` 完全一致（提交 `0ad9efc`）**——两处参数**同名同义**，
+不需要先 `file get` 把文件名换成 `file_id` 再来删（见本节末的「为什么与第 42 节对齐」）。
 
 流程：
 
@@ -2381,25 +2402,82 @@ file_id
 
 不改变。
 
-**实现（提交 `188e85d`，`FileService::remove()`）：软删除，`file_id` 不变。**
+**实现（提交 `188e85d` 落地，`0ad9efc` 把定位改成与 `file get` 一致；
+`FileService::remove(std::string_view file_id_or_name)`）：软删除，`file_id` 不变。**
+
+**① 定位记录（提交 `0ad9efc`，私有函数 `locate_record(records, key)`；
+三处比较在提交 `5bf2c1f` 改为不区分大小写，第 38 节）**——参数是
+`<file_id|文件名>`，**三步**，与第 42 节 `file get` 的定位**同一套规则**：
 
 ```text
-① 查记录      按 file_id 在 file.json 里找；找不到 → FMT-002 FileNotFound（退出码 3）
-② 确认状态    不属于当前用户 → FMT-004 PermissionDenied（退出码 5）
-              已经在回收站（is_trash == true）→ FMT-001 InvalidArgument（退出码 2）
-              「该文件已经在回收站里：<file_id>」
-③ 定位路径    resolve_path()（第 20 节）拿到仓库里的实际位置；
-              trash_path_of() 由 file_id 的日期推出 trash/<用户>/.files/<桶>/YYYY/MM/DD/<文件名>
-              （第 21 节），先 ensure_directory() 建好父目录
-④ 搬文件      move_file(仓库 → 回收站)：同卷 rename，跨卷 复制 → 校验大小 → 删源
-⑤ 写 trash.json  追加一条**文件级**记录（第 17.1 节）：type = "file"，
-              file_id / file_name / original_path / trash_path / deleted_at，
-              路径一律相对数据根、正斜杠
-⑥ 改 metadata  同一份快照上把 is_trash 置 true、trash_reason 置 "file"，写回 file.json
-⑦ 记 INFO 日志「软删除：<file_id> <file_name> -> <回收站路径>」
+① 先当 file_id     iequals(record.file_id, 参数) 即命中（**不区分大小写**）。
+                   全局唯一；file_id 形状固定（fmt-YYYYMMDD-N），先查不会误伤名字
+                   ——与第 42 节同一套理由（**但名字本身可以长得像 id**，
+                     这种遮住的情况仍是待决项，见第 122 节的「比较与定位」三条）
+② 再当文件名       record.user == current_user && !record.is_trash &&
+                   iequals(record.file_name, 参数)
+                   （同用户**跨 Bucket**：别的 Bucket 里的同名文件也会命中；
+                    名字在同用户范围内唯一——**不区分大小写也算同名**，
+                    重名上传会被 FMT-105 拒绝，所以不会出现「一个名字对应两条正常记录」
+                    的歧义，也不会出现「两条记录指向同一个磁盘文件」的数据损坏）
+③ 名字存在但已在回收站
+                   → FMT-001 InvalidArgument（退出码 2），
+                     消息「该文件已经在回收站里：<名字>（file_id <file_id>）」
+                     ——**不能报成「文件不存在」**：文件还在，只是不在正常区
+                   这一步只认「当前用户 + is_trash + 同名」（比较同样不区分大小写）；
+                   按 file_id 命中时不会走到这里，
+                   而是走下面「② 命中之后的原有校验」的第 ① 步
+都没有             → FMT-002 FileNotFound（退出码 3），消息「文件不存在：<参数>」
 ```
 
-服务端 `data`（管道与 HTTP 相同）：
+**② 命中之后的原有校验与落地步骤（提交 `188e85d`，未变）**：
+
+```text
+① 确认状态    不属于当前用户 → FMT-004 PermissionDenied（退出码 5）
+              已经在回收站（is_trash == true，按 file_id 命中时）→ FMT-001 InvalidArgument
+              （退出码 2）「该文件已经在回收站里：<file_id>」
+              ——这一条与新加的定位第 ③ 步是**两个入口、同一个错误码**：
+                按 id 命中的在这里报，按名字命中的在定位时就报，消息都带 file_id
+② 定位路径    resolve_path()（第 20 节）拿到仓库里的实际位置；
+              trash_path_of() 由 file_id 的日期推出 trash/<用户>/.files/<桶>/YYYY/MM/DD/<文件名>
+              （第 21 节），先 ensure_directory() 建好父目录
+③ 搬文件      move_file(仓库 → 回收站)：同卷 rename，跨卷 复制 → 校验大小 → 删源
+④ 写 trash.json  追加一条**文件级**记录（第 17.1 节）：type = "file"，
+              file_id / file_name / original_path / trash_path / deleted_at，
+              路径一律相对数据根、正斜杠
+⑤ 改 metadata  同一份快照上把 is_trash 置 true、trash_reason 置 "file"，写回 file.json
+⑥ 记 INFO 日志「软删除：<file_id> <file_name> -> <回收站路径>」
+```
+
+**回收站落点用记录自己的 `bucket`（提交 `0ad9efc` 明确，第 21 节）**：第 ② 步的
+`trash_path_of(records[index])` 只读**命中记录**的 `bucket`，不看当前 Bucket——
+所以在桶 B 里按名字删掉桶 A 的文件时，文件进的是
+`trash/<用户>/.files/<A 的桶名>/…`，而不是 B。命中之后剩下的每一步都只依赖这一条记录，
+与「用户现在站在哪个 Bucket」无关。用例 `File.按名字删除用的是记录自己的Bucket` 钉这一条。
+
+**为什么与第 42 节对齐（提交 `0ad9efc`）**：`file get` 一直两种参数都收，`file delete`
+只收 `file_id`，开发文档也**从来没写出理由**——这是对称性缺失，不是有意为之。而且只按
+`file_id` 单向查找时，用户用名字称呼一个确实存在的文件，落空后会报
+`FMT-002 文件不存在`，**诊断是错的**（文件在，只是没用 id 称呼它）。所以 `remove()` 也
+照第 42 节那两步来查——命令层与 `remove()` 都是「先当 file_id、再当文件名」，
+**规则同一套、代码各走各的**：「命令层」用 `get_by_id()` + `get_by_name()`（第 42 节），
+`remove()` 用 `locate_record()`（本节），`locate_record()` 多出来的第 ③ 步只服务删除。
+**参数语义与失败语义必须一致**，这才是对齐的要点。
+
+**比较一律不区分大小写（提交 `5bf2c1f`，数据损坏修复）**：上面三步的比较
+**都用 `iequals()`（ASCII 大小写折叠）**，不是 `==`。这不是体验优化——
+按精确比较时，先传 `doc.txt` 再传 `DOC.TXT` 会被当作两个不同的名字放过，
+而两者在 Windows 上落到**同一个磁盘路径**，第二次上传直接**覆盖**第一个文件的字节，
+`file.json` 里第一条记录还写着旧的 `size`/`md5`——**同一个磁盘文件被两条记录指向 +
+字节被覆盖 + 元数据失真**。回归用例 `File.大小写不同的同名必须被当成重名` 就是先复现、
+后修复这条路径的。同一提交还把 `get_by_name()`、上传的重名判定、桶侧
+（`is_current` / `was_current` / 回收站定位）一并改成不区分大小写，详见第 38 节与
+`FMT 技术文档.md` 第 10.1、10.2.4、18.22 节。由此定下的三条口径：**凡按名字/标识定位
+一律不区分大小写**；**名字在同用户范围内唯一（不区分大小写）**——`doc.txt` 与
+`DOC.TXT` 不能共存，这是上面那起覆盖事故的根因防线；`bucket use WORK` 时
+`current_bucket` **保留用户敲的拼写**，但「当前」标记与 `was_current` 按不区分大小写匹配。
+
+服务端 `data`（管道与 HTTP 相同，**形状未变**）：
 
 ```json
 { "file_id": "fmt-20261008-0", "file_name": "test.txt",
@@ -2431,8 +2509,9 @@ file.json 写失败      → 先撤掉刚追加的 trash.json 记录（remove_tr
 > 数据本身是完好的：文件在 `trash/<用户>/.files/…` 下，`file.json` 里那条记录
 > `is_trash = true`、`trash_reason = "file"`，`file get <file_id>` 仍能查到它。
 
-HTTP 侧对应 `DELETE /api/file/<file_id>`，**不需要确认**（软删除可恢复，与
-`trash delete` 的永久删除不同；`FMT 技术文档.md` 第 12.3.2 节）。
+HTTP 侧对应 `DELETE /api/file/<file_id_or_name>`（提交 `0ad9efc` 起路径参数也可给文件名，
+路由本身仍是原来的 `([^/]+)` + `url_decode()`，见 `FMT 技术文档.md` 第 12.3.2 节），
+**不需要确认**（软删除可恢复，与 `trash delete` 的永久删除不同）。
 
 ---
 
@@ -3606,38 +3685,44 @@ trash —— 回收站（当前是桶级条目；文件级条目随阶段 5/7 �
 > **已作废**——现在四条子命令都落地了，「当前是桶级条目；文件级条目随阶段 5/7 进来」
 > 这句标题也把剩余范围说清了（第 52、53.3、59、60 节）。
 
-`help file` 现在是这样（`src/cli/cli.cpp`，提交 `188e85d`，**照源码抄**）：
+`help file` 现在是这样（`src/cli/cli.cpp`；`delete` 那两行在提交 `0ad9efc` 改过，
+`upload` 与末行在 `a2b6cd1` 之后也改过，**照源码抄**）：
 
 ```text
 file —— 文件（当前用户在当前 Bucket 里的文件）
-  upload <来源> [文件名]   来源可以是 http:// 的 URL，也可以是本机路径。
-                           v1 不支持 https（需要 OpenSSL）；同时只支持 http。
+  upload <来源> [文件名]   来源可以是 http:// 或 https:// 的 URL，也可以是本机路径。
                            文件名省略时取来源的最后一段；重名不会自动改名，
-                           会提示换一个名字。相同内容的文件（MD5 相同）
-                           会被拒绝，不重复入库。
+                           会提示换一个名字；相同内容（MD5 相同）会被拒绝，
+                           不重复入库。大小上限取 config.json 的 max_upload_size。
   list                     列出当前 Bucket 的正常文件
   get <file_id|文件名>     查看文件信息与磁盘路径
-  delete <file_id>         软删除进回收站，file_id 不变（可用 trash 查回）
+  delete <file_id|文件名>  软删除进回收站，file_id 不变
+                           （文件级回收站目前只能写、还不能从 trash 查回，待阶段 7）
 
 文件落在 repository/<用户>/<Bucket>/YYYY/MM/DD/ 下；上传先写 temp/，
 校验（大小上限、MD5、文件名）通过后才移动入库。
+网络下载走系统组件（WinHTTP + Schannel），支持 https，不需要 OpenSSL。
 ```
 
+> **上面这块被改过三处，已照新源码抄**：`delete` 那两行在提交 `0ad9efc` 从
+> 「`delete <file_id>` 软删除进回收站，`file_id` 不变（可用 trash 查回）」改成现在这样
+> ——`delete` 与 `get` 一样同时收 `file_id` 和文件名；「可用 trash 查回」这句本来就是
+> 跑在实现前面的说法，现在换成实况「只能写、还不能从 trash 查回，待阶段 7」
+> （第 43、53.2、104 节）。`upload` 两行与末行则是 `a2b6cd1` 之后改的：
+> 原来的「v1 不支持 https（需要 OpenSSL）；同时只支持 http」与行为相反，
+> 现在源码写的是 `http://` 或 `https://`、「大小上限取 config.json 的 max_upload_size」、
+> 末行「网络下载走系统组件（WinHTTP + Schannel），支持 https，不需要 OpenSSL」。
 > 标题里「当前用户在当前 Bucket 里的文件」说的是 `list`；`get <file_id>` 是**全局唯一**
 > 的例外、`get <文件名>` 是「当前用户 + 正常文件」（第 41、42 节），`help` 正文没细说，
-> 以第 42 节为准。`delete` 那行的「可用 trash 查回」是**当前的缺口**：
-> 文件级条目已经写进 `trash.json`、文件也在 `trash/<用户>/.files/…` 下，但
-> `trash list` 目前只列桶级条目（第 53.2、104 节）——这条帮助文案暂时跑在实现前面，
-> 阶段 7 补上文件级读取后即成立。
+> 以第 42 节为准。**按名字定位的比较在提交 `5bf2c1f` 起不区分大小写**（第 38、43 节），
+> `help` 正文没有写这一点。
 >
 > `share` 那组的帮助仍写着「服务端尚未实现，现在返回 FMT-602」，与实况一致
 > （第 105 节）。
-
-> **⚠ 残留不一致（提交 `a2b6cd1` 未清理 `src/cli/cli.cpp`）**：上面 `help file` 正文里的
-> 「**v1 不支持 https（需要 OpenSSL）；同时只支持 http。**」现在**与行为相反**——
-> `a2b6cd1` 之后 https 是合法来源（第 33 节）。这句文案是 `188e85d` 写进源码的，
-> `a2b6cd1` **只改了 `common/http_client`、两个 CMakeLists 与测试**，没动帮助文案。
-> 这里照源码抄录以保持可核对，待后续提交单独修文案（`FMT 技术文档.md` 第 11.4 节同注）。
+>
+> **原「⚠ 残留不一致」注记到此结清**：那条说的是 `a2b6cd1` 没有清理 `help file` 里的
+> https 旧文案（当时源码里确实还写着「v1 不支持 https」）。后续提交已经把那两句改掉了，
+> 现在源码与行为一致（`FMT 技术文档.md` 第 11.4、18.20 节同注）。
 
 `help <未知组>` → stderr 打印 `没有 <组> 的帮助；输入 help 查看命令列表`，退出码 2（`FMT-001`）。
 `help` / `--help` 全程**不提权、不连服务、不写日志**。
@@ -4856,13 +4941,14 @@ fmt.exe
 │   ├── use <name>
 │   └── delete <name>
 │
-├── file                              全部四条已落地（提交 188e85d）
+├── file                              全部四条已落地（提交 188e85d；delete 参数 0ad9efc）
 │   ├── upload <来源> [文件名]         来源 = http:// 或 https:// URL，或本机路径（a2b6cd1）；
 │   │                                  文件名可省略，从来源推断（第 33.5 节）
 │   ├── list
 │   ├── get <file_id>
 │   ├── get <filename>
-│   └── delete <file_id>               软删除，file_id 不变（第 43 节）
+│   └── delete <file_id|文件名>        软删除，file_id 不变（第 43 节）；
+│                                      定位与 get 同一套规则（0ad9efc）
 │
 ├── share                             仍未实现（阶段 5 剩下的部分，第 105 节）
 │   ├── create <file_id>
@@ -4907,7 +4993,8 @@ exit / quit 是交互循环里的正式命令（help exit 有说明）
 
 **`file` 四条命令也已可用**（提交 `188e85d`，不再返回 `FMT-602`）：
 `file upload <来源> [文件名]`（注意那个**可选**的文件名参数，旧文只写了 `<URL>`）、
-`file list`、`file get <file_id|文件名>`、`file delete <file_id>`。
+`file list`、`file get <file_id|文件名>`、`file delete <file_id|文件名>`
+（最后一条在提交 `0ad9efc` 从只收 `file_id` 扩成两种，与 `file get` 同一套定位规则，第 43 节）。
 CLI 侧不特殊处理 `file`：它就是通用业务命令，`parts[0] + "." + parts[1]` 拼出 op，
 其余位置参数装进 `args.argv`（`run_business_command()`）——所以
 `file upload D:/a.txt 新名字` 发出的就是 `{"op":"file.upload","args":{"argv":["D:/a.txt","新名字"]}}`。
@@ -5491,7 +5578,8 @@ HTTP 与 HTTPS 下载    ← 实况（提交 a2b6cd1）：http:// 与 https:// �
 临时文件              <数据根>/temp/fmt-upload-<随机>-<序号>.tmp（第 34 节）
 大小限制              边写边判（> max_upload_size → FMT-303），不是下完再看
 MD5                   边下载边算（Windows CNG / bcrypt，第 36 节）
-文件名冲突            同用户 + 任何 Bucket + 正常文件 + 同名 → FMT-105（第 38 节）
+文件名冲突            同用户 + 任何 Bucket + 正常文件 + 同名（**不区分大小写**，
+                      提交 5bf2c1f）→ FMT-105（第 38 节）
 MD5 去重              同用户 + 任何 Bucket + 正常文件命中 → FMT-304（第 37 节）
 File ID               fmt-<今天>-<当天最大序号 + 1>（第 22 节）
 metadata              写 file.json；写不进去就删掉刚提交的仓库文件（第 40 节）
@@ -5511,7 +5599,7 @@ metadata              写 file.json；写不进去就删掉刚提交的仓库文
 file list
 file get <file_id>
 file get <filename>
-file delete <file_id>
+file delete <file_id|文件名>
 ```
 
 验证：
@@ -5524,21 +5612,29 @@ file delete <file_id>
 文件名唯一性
 ```
 
-**状态：✅ 已完成（提交 `188e85d`）**：
+**状态：✅ 已完成（提交 `188e85d`；`file delete` 的参数在 `0ad9efc` 扩成两种）**：
 
 ```text
 file list                  当前用户 + 当前 Bucket + 正常文件，按 file_id 排序（第 41 节）
 file get <file_id>         全局唯一，不限用户/Bucket（软删除后也能查到，is_trash=true）
 file get <文件名>          当前用户 + 正常文件（同用户跨 Bucket）
                           命令层先当 file_id 查，查不到再当文件名查（第 42 节）
-file delete <file_id>      软删除：file_id 不变，搬进 trash/<用户>/.files/…、
+file delete <file_id|文件名>  软删除：file_id 不变，搬进 trash/<用户>/.files/…、
                           写文件级 trash.json 记录、置 is_trash/trash_reason（第 43 节）
+                          定位规则与 file get 完全一致（提交 0ad9efc，第 43 节）：
+                          先当 file_id → 再当文件名（同用户跨 Bucket）→
+                          名字在、但已在回收站 → FMT-001（消息带 file_id）；
+                          都没有 → FMT-002 FileNotFound（退出码 3）
+                          **三处比较都不区分大小写（提交 5bf2c1f，第 38、43 节）**
+                          回收站落点用**记录自己的 bucket**，不是当前 Bucket（第 21、43 节）
                           顺序与回滚：搬文件 → 写 trash.json（失败搬回）→ 写 file.json
                           （失败撤掉 trash 记录并搬回），见第 43 节
 ```
 
-用例：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能上传与操作文件`
-（第 109 节，`FMT 技术文档.md` 第 18.19 节）。
+用例：`File.列表与查询`、`File.软删除进回收站`、`File.按文件名也能软删除`、
+`File.按名字删除用的是记录自己的Bucket`、`File.大小写不同的同名必须被当成重名`、
+`File.按名字查询不区分大小写`、`Service.管道能上传与操作文件`
+（第 109 节，`FMT 技术文档.md` 第 18.19、18.22 节）。
 
 ---
 
@@ -5578,6 +5674,15 @@ trash delete <id>   文件级永久删除：阶段 7（桶级永久删除已完�
 文件级 trash_reason="file" 的记录在桶回退时保持不动
 文件级条目落在 trash/<user>/.files/<bucket>/YYYY/MM/DD/ 下，
   桶级扫描不会把它当成孤儿桶条目（第 21、53.1 节）
+```
+
+**提交 `0ad9efc` 已落地的那两段验收**（其余仍属阶段 7）：
+
+```text
+文件删除（按名字）     File.按文件名也能软删除：按名字删与按 id 删同一条记录；
+                      名字不存在 → FMT-002；名字在但已软删除 → FMT-001（消息带 file_id）
+文件删除（跨桶落点）   File.按名字删除用的是记录自己的Bucket：在桶 B 按名字删桶 A 的文件，
+                      落点是 trash/<用户>/.files/<A 的桶名>/…（第 21、43 节）
 ```
 
 阶段 7 保留的：文件级 trash list/get/restore/delete 的完整验收、文件级永久删除、
@@ -5724,7 +5829,8 @@ HTTP 作用于**当前数据根**，默认只监听 `127.0.0.1:4122`；CLI 不�
 不同用户同名
 ```
 
-**阶段 5 的覆盖情况（提交 `188e85d`，`tests/file_test.cpp` / `tests/service_test.cpp`）**：
+**阶段 5 的覆盖情况（提交 `188e85d`，`0ad9efc` 与 `5bf2c1f` 各补若干条；
+`tests/file_test.cpp` / `tests/service_test.cpp`）**：
 
 | 要求 | 用例 | 状态 |
 |---|---|---|
@@ -5738,10 +5844,18 @@ HTTP 作用于**当前数据根**，默认只监听 `127.0.0.1:4122`；CLI 不�
 | 没有当前 Bucket 时拒绝上传 | `File.没有当前Bucket时拒绝上传`（`FMT-305`） | ✅ |
 | 列表与查询（按 id / 按名字） | `File.列表与查询`、`Service.管道能上传与操作文件` | ✅ |
 | 软删除进回收站 | `File.软删除进回收站` | ✅ |
+| 软删除也收文件名（提交 `0ad9efc`） | `File.按文件名也能软删除`：名字不存在 → `FMT-002`「文件不存在」；按名字删与按 id 删等价（同一条记录、`is_trash=true`）；再删一次 → `FMT-001` 且消息里带 `file_id`（**不是** `FMT-002`） | ✅ |
+| 回收站落点用记录自己的 Bucket（提交 `0ad9efc`） | `File.按名字删除用的是记录自己的Bucket`：切到另一个桶按名字删，路径里是 `/工作/` 而**不是** `/生活/` | ✅ |
+| **大小写不同的同名必须被当成重名**（提交 `5bf2c1f`，**数据损坏回归**） | `File.大小写不同的同名必须被当成重名`：先传 `doc.txt` 再传 `DOC.TXT` 必须被 `FMT-105` 拒绝；断言里**先查数据完整性**（第一个文件还在、大小 == 记录里的 `size`、内容仍是 `"hello world"`）再断言拒绝——顺序刻意如此，磁盘一旦被覆盖，先炸的就是完整性断言 | ✅ |
+| 按名字查询 / 删除不区分大小写（提交 `5bf2c1f`） | `File.按名字查询不区分大小写`：`get_by_name("report.txt")` 找得到 `Report.txt`，`remove("REPORT.TXT")` 可用 | ✅ |
 | HTTP 下载入库 | `File.从HTTP下载入库`（本机起一个 httplib 服务端当地源） | ✅ |
 | 端到端（管道） | `Service.管道能上传与操作文件`（upload → list → get×2 → 去重被拒 → delete → get 仍可查到） | ✅ |
 | 端到端（HTTP） | `Server.File路由与上传` | ✅ |
-| 不同 Bucket / 不同用户同名 | **用例尚未单列**：作用域已按「同用户 + 任何 Bucket」实现（第 37、38 节），但没有专门的跨 Bucket 用例；属阶段 7 与文件级 trash 用例一起补 | ⏳ |
+| 不同 Bucket / 不同用户同名 | 作用域已按「同用户 + 任何 Bucket」实现（第 37、38 节）；**跨 Bucket 的用例已补上一条**：`File.按名字删除用的是记录自己的Bucket`（提交 `0ad9efc`，钉的是删除落点，顺带证明「切桶后仍按名字命中原桶的文件」）；**桶侧的大小写另有一条**：`Bucket.大小写不同也认得同一个桶`（提交 `5bf2c1f`，`tests/bucket_test.cpp`）。「不同用户同名」仍无用例，属阶段 7 与文件级 trash 用例一起补 | 🟡 |
+
+> **名字长得像 `file_id` 的遮住问题**（上传一个叫 `fmt-20261008-0` 的文件后按该名字删除
+> 会先命中 id 那条记录）**没有被上面任何用例覆盖，也没有定稿**——它记在第 122 节的
+> 「比较与定位」三条待决里。
 
 ---
 
@@ -5845,6 +5959,9 @@ Bucket.条目详情与永久删除         trash get 的六个字段 + trash del
 Bucket.永久删除只清桶级记录       trash_reason="file" 的记录一条都不能少
 Bucket.回收站扫描只认桶级条目     点开头跳过 + <名字>_<14 位时间戳> 形状检查
 Bucket.有索引没目录的条目可以永久删掉   幽灵条目也要能删掉（否则永远清不掉）
+Bucket.大小写不同也认得同一个桶   【5bf2c1f】create("work") 后 use("WORK")，
+                                list() 的「当前」标记必须落在实际的 work 目录上
+                                （current_bucket 里存的仍是 "WORK"，第 30、53 节）
 PathManager.回收站保持原层级      trash/<用户>/.files/<桶>/YYYY/MM/DD/<文件>
 Service.管道能执行回收站命令      list/restore/get/delete 端到端；不带 force 被拒
                                 （FMT-001 / 退出码 2），带 force 成功
@@ -5857,7 +5974,8 @@ Server.Bucket路由与状态码         DELETE /api/trash/<名字> 不带 force 
 
 **提交 `188e85d` 之后补一句（重要，别读错覆盖范围）**：文件级条目**已经能被生产**
 （`file delete` 写 `trash.json` + 搬进 `trash/<用户>/.files/…`，用例
-`File.软删除进回收站`、`Service.管道能上传与操作文件` 覆盖），
+`File.软删除进回收站`、`File.按文件名也能软删除`、`File.按名字删除用的是记录自己的Bucket`、
+`Service.管道能上传与操作文件` 覆盖），
 但**文件级的 list / get / restore / delete 一条都没实现**，
 `BucketService::list_trashed()` 只扫 `trash/<用户>/` 顶层并跳过点开头的条目。
 所以上表里的「恢复文件」「恢复冲突」「Bucket 部分恢复 —— 文件级口径」
@@ -6355,7 +6473,9 @@ V1 不做 --json 结构化输出，机器可读通道是退出码
 **阶段 5 落地后并入的决策（提交 `188e85d`）**：
 
 ```text
-file 四条命令：file upload <来源> [文件名] / file list / file get <file_id|文件名> / file delete <file_id>
+file 四条命令：file upload <来源> [文件名] / file list / file get <file_id|文件名> / file delete <file_id|文件名>
+          【0ad9efc：file delete 原先只收 file_id，现在与 file get 同一套定位规则；
+            见下面「file delete 收两种参数后并入的决策」】
 上传来源：http:// URL 或本机路径；**https 不支持**（V1 不引入 OpenSSL），返回 FMT-300
           【已作废，提交 a2b6cd1：http:// 与 https:// 都支持，走 WinHTTP + Schannel，
             不用 OpenSSL、不分发 DLL；见下一条决策组与第 33 节】
@@ -6407,9 +6527,94 @@ MD5：Windows CNG（bcrypt），增量 Md5 + 一次性 md5_hex()，不引入第�
 测试：每条用例开始前打印 [开始] <套件>.<名称>，输出逐行刷新
   （sync_with_stdio(false) + cout.setf(std::ios::unitbuf)），卡住时最后一行就是它；
   新增 tests/http_client_test.cpp 6 条；全套 124 项全绿
+    【0ad9efc：再新增 2 条 File.* 到 126 项全绿，见下一条决策组与第 109 节；
+      5bf2c1f：再新增 2 条 File.* + 1 条 Bucket.* 到 **129 项全绿**】
 口径推翻：https 不支持 → 支持；「https 会把 DLL 带进产物」→ 表述不准确且不再成立；
   「http:// 下载交 httplib::Client」→ 交 WinHTTP；
   File.暂存失败会清理临时文件 的协议用例 https → ftp://
+```
+
+**`file delete` 收两种参数后并入的决策（提交 `0ad9efc`「feat(file): let file delete
+take a file name too」）**：
+
+```text
+命令：file delete <file_id|文件名>（原口径「只收 file_id」已作废，第 43 节）
+用户的两个疑问：① 文档里从来没解释为什么 file delete 只收 id；② file delete <文件名.txt>
+  报的是「文件不存在」而不是「请输入 file_id」——两句都指同一件事：不对称 + 诊断错
+为什么改：file get 两种参数都收，file delete 只收一种，开发文档通篇没写出理由，
+  是对称性缺失；且按 id 单向查找必然落空 → 报 FMT-002 文件不存在，可文件明明存在，
+  只是用名字称呼它。改成与 file get 同一套定位规则，用户不必先 file get 换 id
+实现：私有 locate_record(records, key)（第 42、43 节同一套规则的删除侧实现——
+`file get` 的「命令层」用 get_by_id() + get_by_name()，`remove()` 用这个），三步——
+  ① 先当 file_id（全局唯一、形状固定 fmt-YYYYMMDD-N，先查不误伤名字）
+  ② 再当文件名（当前用户 + !is_trash + 同名；同用户跨 Bucket；重名上传被 FMT-105 拒绝，
+     所以同用户范围内名字唯一，无歧义）
+  ③ 名字在、但记录 is_trash → FMT-001「该文件已经在回收站里：<名字>（file_id <id>）」
+     **不能报成 FMT-002**：文件还在，只是不在正常区
+  都没有 → FMT-002 FileNotFound（退出码 3）
+签名：Result<FileRecord> remove(std::string_view file_id_or_name)
+  （include/fmt/file/file.hpp；参数名由 file_id 改为 file_id_or_name）
+不变的：命中后的两道校验（不属于当前用户 → FMT-004；按 id 命中的 is_trash → FMT-001）、
+  搬文件 → 写 trash.json → 写 file.json 的顺序与回滚、响应 data 形状
+回收站落点：用**记录自己的 bucket**（trash_path_of()），不是当前 Bucket——
+  在桶 B 里按名字删桶 A 的文件，文件进 trash/<用户>/.files/<A 的桶名>/…（第 21、43 节）
+测试：新增 File.按文件名也能软删除、File.按名字删除用的是记录自己的Bucket；
+  全套 126 项全绿（这是 0ad9efc 时的数字；紧接着的 5bf2c1f 把它推到 129）
+【0ad9efc 之后紧跟的 5bf2c1f 已把这些比较改成不区分大小写，见下一组决策】
+```
+
+**比较一律不区分大小写（提交 `5bf2c1f`「fix(file): compare names the way Windows does,
+or uploads overwrite data」）——这是数据损坏修复，不是体验优化**：
+
+```text
+损坏路径（回归用例 File.大小写不同的同名必须被当成重名 先复现、后修复）：
+  ① 上传 doc.txt（"hello world"，11 字节）→ 记录 fmt-<今天>-0，size = 11
+  ② 再传同名不同大小写的 DOC.TXT（"different content here"，22 字节）
+     旧行为：重名判定是 == 精确比较 → 放过 → 产生两条记录
+             而两者在 Windows 上落到**同一个磁盘路径**
+             → 第二次上传把第一个文件的字节**覆盖**了，
+               而 file.json 里第一条记录还写着 size = 11 / 旧的 md5
+     后果：**同一个磁盘文件被两条记录指向 + 字节被覆盖 + 元数据失真**
+           （断言证据：仓库里那个文件的 file_size 期望 11、实际 22）
+改了什么（iequals()，ASCII 大小写折叠）：
+  src/file/file.cpp
+    commit_upload()  重名判定不再区分大小写（同用户 + 正常文件 + 同名即 FMT-105，第 38 节）
+    get_by_name()    按名字查（file get <名字>）不区分大小写
+    locate_record()  ① file_id ② 文件名 ③ 已在回收站的名字，三处比较都不区分大小写
+  src/bucket/bucket.cpp
+    list()           is_current = iequals(info.name, config_.current_bucket)
+    remove()         was_current = iequals(config_.current_bucket, name)
+    find_trashed()   回收站名字与「原桶名」两轮定位都不区分大小写
+由此定下的三条口径：
+  1. **凡按名字/标识定位，一律不区分大小写**（文件名、file_id、桶名、回收站条目名）
+     ——Windows 的文件系统与路径本身就不区分大小写，用户敲 REPORT.TXT 不该得到
+     「文件不存在」
+  2. **名字在同用户范围内唯一（不区分大小写）**：doc.txt 与 DOC.TXT 不能共存
+     ——这不是限制，是上面那起覆盖事故的根因防线
+  3. bucket use WORK（目录实际叫 work）时：current_bucket 保留用户敲的拼写，
+     但 bucket list 的「当前」标记按不区分大小写匹配，bucket remove 的 was_current 同理
+测试：新增 File.大小写不同的同名必须被当成重名、File.按名字查询不区分大小写、
+  Bucket.大小写不同也认得同一个桶；全套 126 → **129 项全绿**
+（`FMT 技术文档.md` 第 10.1、10.2.4、18.22 节）
+```
+
+**比较与定位暴露出来的三条：待决，未定稿**（如实记录，不要当成已定）：
+
+```text
+① 名字长得像 file_id 时会被「先查 id」遮住
+   现在允许上传一个名字就叫 fmt-20261008-0 的文件（第 38 节的 validate_file_name 不拦）。
+   此时 file delete fmt-20261008-0 会**先命中那条 id 对应的记录**（另一个文件），
+   而用户想删的是同名文件。可选做法都未定：上传时拒绝形如 fmt-YYYYMMDD-N 的文件名；
+   或两者同时命中时报「有歧义，请用 file_id」
+② 按名字删除可能删到别的 Bucket 的文件
+   名字的作用域是「同用户跨 Bucket」（第 9.2、42、43 节），所以人在「生活」桶里敲
+   file delete a.txt 可能把「工作」桶里的 a.txt 删掉，而成功消息里只有文件名。
+   可选做法（未定）：message 带上 Bucket，形如
+   「文件已移入回收站：a.txt（Bucket：工作）」
+③ bucket use 的拼写规范化
+   现在会把用户敲的拼写（WORK）存进 current_bucket，而磁盘上的目录叫 work。
+   显示问题已由 5bf2c1f 的 iequals 解决；剩下的是「落盘时要不要规范化到磁盘上的
+   实际名字」，以及将来 restore 拼目录名时用哪个拼写。未定
 ```
 
 **已知限制（如实记录，提交 `188e85d`，`a2b6cd1` 复核）**：
@@ -6432,7 +6637,10 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 > 「file.* 返回 FMT-602」「https 不支持 / 需要 OpenSSL / 会引入 DLL」
 > 「ftp:// 报 FMT-002」「上传受 30 秒超时且无缓解」
 > 「上传持锁 / 上传期间其他命令一起等（作为现状）」
-> 「需要用户先给文件名」「文件级回收站已可用」。出现它们的地方都已在上面注明作废或改口径。
+> 「需要用户先给文件名」「文件级回收站已可用」
+> 「`file delete` 只接受 `file_id`」「`file delete` 按 id 单向查找，找不到就 FMT-002」
+> 「名字存在但已在回收站报 FMT-002」。出现它们的地方都已在上面注明作废或改口径
+> （最后三条自提交 `0ad9efc` 起成立，见第 43 节）。
 
 后续开发过程中，如果发现：
 
@@ -6943,10 +7151,22 @@ fmt> file get 报告.txt        ← 先当 file_id 查、查不到再当文件�
 文件：报告.txt
 ...
 
-fmt> file delete fmt-20261008-0
+fmt> file delete 报告.txt   ← 换成文件名也一样（提交 0ad9efc：与 file get 同一套定位规则）
 文件已移入回收站：报告.txt
 执行成功...
 错误码：0
+
+fmt> file delete 没有这个.txt
+执行失败：FMT-002 文件不存在：没有这个.txt
+错误码：3
+
+fmt> file delete 报告.txt   ← 已经在回收站里（按名字命中会走到定位的第 ③ 步）
+执行失败：FMT-001 该文件已经在回收站里：报告.txt（file_id fmt-20261008-0）
+错误码：2
+
+fmt> file delete fmt-20261008-0   ← 按 id 命中，走的是删前那两道校验，消息形状一致
+执行失败：FMT-001 该文件已经在回收站里：fmt-20261008-0
+错误码：2
 
 fmt> file get fmt-20261008-0  ← 软删除后仍能按 file_id 查到（trash_reason="file"）
 文件：报告.txt
@@ -6982,6 +7202,12 @@ fmt> file upload D:/test2/报告.txt 报告.txt
 > 打成 `text.txt`，源码里就是这么 `printf` 的）；`file delete` 走 `message` 那一类、
 > 只打一行「文件已移入回收站：<文件名>」，库里带 `file_id` / `moved_to` 但 CLI 不打印它们
 > （要看回收站路径就 `file get <file_id>`）。
+>
+> **上面 `file delete` 的三段新样例是提交 `0ad9efc` 加的**：文件名与 `file_id` 都能删
+> （同一套定位规则）；名字根本不是文件时是 `FMT-002 文件不存在：<参数>`（退出码 3，
+> **不是**「参数错误」）；名字在、但已经软删除过则是 `FMT-001`，消息里带 `file_id`
+> （`file delete <名字>` 与 `file delete <file_id>` 两条都带，只是「按名字」那条由定位的
+> 第 ③ 步报、「按 id」那条由删前校验报，第 43 节）。
 >
 > 大小文本由 `format_size()`（`src/common/string.cpp`）生成：**单位与数字之间没有空格**
 > （`512B` / `1.2KB` / `1.5MB`），≥ 1 KiB 时保留到两位小数并去掉尾随的 `0` 与 `.`。
