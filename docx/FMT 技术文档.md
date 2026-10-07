@@ -504,7 +504,8 @@ Status ServiceRuntime::switch_root(const std::filesystem::path& new_root);
 
 ### 4.4 初始化
 
-**冻结决策：初始化由 Service 执行，CLI 只读不建目录。**
+**冻结决策：初始化由 Service 执行，CLI 只读不建业务目录**（写日志用的 `log/` 是唯一例外，
+见 11.12 与 14.2）。
 CLI 连上管道后只发命令；目录与默认 JSON 由服务在**首次进入某个数据根时**创建。
 因此初始化分两条路径。
 
@@ -576,16 +577,19 @@ Reason: Access is denied.
 
 ```text
 1. 设置控制台输出编码（SetConsoleOutputCP(CP_UTF8)）
-2. 获取 exe 路径 → 计算 root（**只用于声明，不建目录、不读文件**）
+2. 获取 exe 路径 → 计算 root（**只用于声明，不建目录、不读文件**；日志目录 log/ 是唯一例外，见 11.12）
 3. 单实例检查（命名互斥体 Local\FMT.CLI.v1，见 11.11）
 4. 解析命令行
 5. service 命令 → 走 SCM 提权路径（见 13.8），结束
 6. 其他命令   → 连管道 + hello 声明 root → 进入命令循环（见 11.2）
+7. 日志        → 在 root 下创建 log/，以追加方式打开 log/fmt.log（见 11.12）
+                 ——`--help` / `--version` 不执行这一步，也不创建任何目录
 ```
 
-**CLI 绝不在本地创建任何目录。** 它连目录是否存在都不检查——那是服务的职责。
-CLI 唯一会碰磁盘的地方是 `file upload` 的**源文件路径**（只读）与
-`service install` 时的自身路径。
+**CLI 绝不在本地创建任何业务目录。**（唯一的例外是写日志用的 `log/`，见 11.12：
+CLI 连业务目录是否存在都不检查——那是服务的职责。）
+CLI 会碰磁盘的地方只有三处：`log/fmt.log` 与 `log/error.log`（追加写）、
+`file upload` 的**源文件路径**（只读）与 `service install` 时的自身路径。
 
 不主动修改系统权限，不请求管理员权限（`service` 命令的 UAC 提权除外）。
 
@@ -1361,7 +1365,8 @@ fmt.exe service --help
 ```
 
 然后把管道连接失败的 `ERROR_FILE_NOT_FOUND` 映射为 `FMT-601` / 退出码 8
-（连接超时同样归到 `FMT-601` / 8）。
+（连接超时同样归到 `FMT-601` / 8）；管道**还不存在**时先重试最多 **5 秒**
+（权限类错误不重试），见 11.12 与 13.9.4。
 
 引导命令（`service *`）走 SCM 提权路径，因此用户始终有办法把 Service 起起来，
 不会死锁。
@@ -1373,8 +1378,8 @@ fmt.exe service --help
 错误信息 → stderr
 ```
 
-CLI 输出保持简洁、明确、用户可读。**CLI 不写日志文件**，
-所有调试与运行记录由 Service 写入 `log/`。
+CLI 输出保持简洁、明确、用户可读。**CLI 也写日志文件**：它与 Service 追加同一个
+`<数据根>/log/fmt.log`（见 11.12、14.2），控制台输出只是同一次操作的面向用户的一面。
 
 具体规则：
 
@@ -1516,7 +1521,8 @@ current_bucket 为空 → 执行 file upload / file list 时提示先创建或�
 ```
 
 CLI 只是**提示**（见 18.9 的历史决策：当前实现自动落到 `default` 与默认 Bucket
-「工作」，由**服务**写回 `config.json`）；CLI 自己不创建目录、不写配置文件。
+「工作」，由**服务**写回 `config.json`）；CLI 自己不创建业务目录、不写配置文件
+（写日志要用的 `log/` 除外，见 11.12）。
 
 用户系统正式开发后，替换为正式登录机制。
 
@@ -1561,6 +1567,56 @@ if (h != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
 
 互斥体句柄在 CLI 生命周期内一直持有（不 `CloseHandle` 到退出为止），
 否则互斥体被释放，单实例失效。
+
+### 11.12 CLI 日志与管道连接重试
+
+**CLI 也写日志文件，且与 Service 追加同一个文件**（见 14.2）。
+
+```text
+文件      <数据根>/log/fmt.log（全部）与 error.log（仅 ERROR），与 Service 同一个文件
+打开方式  两个进程都以「追加」打开（MSVC 文件流是共享模式），每行一次写入
+```
+
+CLI 记录的字段与 Service 完全同一套格式（见 14.3）：
+
+| 字段 | CLI 侧取值 |
+|---|---|
+| 时间 | `YYYY-MM-DD HH:MM:SS`，本地时间 |
+| 级别 | INFO / WARN / ERROR |
+| 模块 | **`Cli`**（CLI 本体）、**`Elevated`**（提权副本） |
+| 消息 | 见下 |
+
+```text
+Cli       CLI 启动 / 退出
+Cli       用户敲的原始命令（形如  fmt> service stop ）
+Cli       每条 service 命令的提权过程与结果
+Elevated  提权副本自身的执行与结果
+Cli       业务命令的请求与结果
+Cli       连接失败
+```
+
+三条边界，必须同时成立：
+
+```text
+1. CLI 只允许创建 <数据根>/log/ 这一个目录（日志不是业务数据）；
+   repository / data / config 一概不碰，CLI 仍然不改任何业务数据。
+2. --help 与 --version 不写日志、不创建任何目录（它们不该在磁盘上留下东西）。
+3. 两个进程的数据根可能不同（服务可能被别人启动在另一个目录）：各写各自数据根下的
+   log/fmt.log；这种情况下 CLI 会额外写一行 WARN，指明服务当前数据根与服务侧日志的位置。
+```
+
+为什么 CLI 也写：用户在 CLI 里敲 `service stop`，服务随即被停掉，旧口径下这次操作
+在日志里**一个字都没有**，日志跟不上用户做过什么。日志要能回答「谁在什么时候对服务
+做了什么、结果如何」，因此两个进程都写——追加到同一个文件即不再有争抢问题。
+
+**管道连接重试**（细节见 13.9.4）：CLI 连接命名管道时，如果管道**还不存在**
+（服务刚被 `service start` 拉起、监听尚未就绪），最多重试 **5 秒**，仍连不上才报
+`FMT-601` / 退出码 8；**权限类错误（`ERROR_ACCESS_DENIED`）不重试**，直接报
+`FMT-004 PermissionDenied` / 退出码 5。旧写法是「一次失败即报 `FMT-601`」，
+实测会出现「刚启动完立刻敲命令却连不上」。
+
+**测试隔离**：ipc 的管道名做成**可参数化**，测试使用独立管道名，避免与机器上真实运行的
+服务抢同一个管道实例（`\\.\pipe\fmt.control` 仍是默认名）。
 
 ---
 
@@ -2519,7 +2575,7 @@ const wchar_t* kSddlWithMic = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;N
 
 | 场景 | 超时 | 失败处理 |
 |---|---|---|
-| `WaitNamedPipeW` / `CreateFileW` 连接 | **3 秒** | `ERROR_FILE_NOT_FOUND`（管道不存在）→ `FMT-601` / 退出码 8，提示「无法连接 FMT Service，请先执行 service install」 |
+| `WaitNamedPipeW` / `CreateFileW` 连接 | 管道不存在时最多重试 **5 秒**；权限类错误立即返回，不重试 | `ERROR_FILE_NOT_FOUND`（管道不存在）→ 重试 5 秒仍无 → `FMT-601` / 退出码 8，提示「无法连接 FMT Service，请先执行 service install」 |
 | 普通命令（list / get / config 等） | **30 秒** | 超时 → `FMT-602` / 退出码 8 |
 | 长耗时命令（upload / delete 事务） | 由 `op` 单独声明（如 10 分钟） | 同上，但要在 CLI 侧显示进度而不是静默等待 |
 | 服务端写响应 | 30 秒 | 写失败 → 记 WARN，断开该实例，**不影响其他连接** |
@@ -2527,10 +2583,12 @@ const wchar_t* kSddlWithMic = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;N
 连接阶段的错误分类：
 
 ```text
-ERROR_FILE_NOT_FOUND (2)        管道不存在 → 服务没装或没跑 → FMT-601 / 8
-ERROR_PIPE_BUSY (231)           实例被占满 → WaitNamedPipeW(3000) 重试一次
+ERROR_FILE_NOT_FOUND (2)        管道不存在 → 服务刚被拉起、监听还没就绪
+                                → 5 秒内轮询重试；仍无 → FMT-601 / 8（见 11.12）
+ERROR_PIPE_BUSY (231)           实例被占满 → WaitNamedPipeW 重试一次
 ERROR_ACCESS_DENIED (5)         DACL 或 MIC 不对 → FMT-004 PermissionDenied / 5（见 13.9.2）
-WAIT_TIMEOUT 于 WaitNamedPipeW  3 秒内没等到 → FMT-601 / 8
+                                **不重试**：权限不会因为等待而变好
+WAIT_TIMEOUT                    5 秒内没等到 → FMT-601 / 8
 ```
 
 **服务端也必须设超时**：`ConnectNamedPipe` 之后的读操作不要让线程无限期挂着，
@@ -2544,7 +2602,7 @@ WAIT_TIMEOUT 于 WaitNamedPipeW  3 秒内没等到 → FMT-601 / 8
 声明者：CLI
   用 GetModuleFileNameW 取自身路径的父目录 → 作为 root
   连接时用 hello 帧 / 每个请求的 "root" 字段声明（见 13.9.3）
-  CLI 只读不建目录（4.4.4）
+  CLI 只读不建业务目录（4.4.4；log/ 例外，见 11.12）
 
 持有者：Service
   维护「当前数据根」；root 与当前根不同 → 切换
@@ -2645,7 +2703,7 @@ if (GetLastError() == ERROR_ALREADY_EXISTS) {
        ├─ 已存在 → 激活已有窗口（EnumWindows → SetForegroundWindow /
        │           FlashWindowEx）→ 退出码 0，结束
        └─ 否则继续
- 3. 计算 root：GetModuleFileNameW → 父目录（只用于声明，不建目录）
+ 3. 计算 root：GetModuleFileNameW → 父目录（只用于声明；日志目录 log/ 是唯一例外，见 11.12）
  4. 查 SCM（**查询不需要提权**）
        OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT)
        OpenServiceW(hSCM, L"FMT", SERVICE_QUERY_STATUS)
@@ -2663,7 +2721,7 @@ if (GetLastError() == ERROR_ALREADY_EXISTS) {
        │      （说明服务宿主是另一份 exe；本进程声明自己的 root 连管道）
        └─ 不同且该文件已丢失 → 提示「服务宿主已不存在，请重新执行 service install」
               → 不再尝试连管道
- 6. 连管道 \\.\pipe\fmt.control（超时 3 秒，13.9.4）
+ 6. 连管道 \\.\pipe\fmt.control（管道不存在时最多重试 5 秒，13.9.4）
        + hello 声明 root（13.10）
        ├─ 连接失败 → 「无法连接 FMT Service，请先执行 service install」
        │              FMT-601 / 退出码 8
@@ -2716,8 +2774,23 @@ FMT_ROOT/log/
 
 日志**不是业务数据**，因此与 `data/` 分离。
 
-**只有 Service 写日志文件。** CLI 不写 `fmt.log`，只输出到控制台——避免两个进程
-争抢同一个日志文件。
+**Service 与 CLI 都写日志文件，两个进程追加同一个文件：**
+`<数据根>/log/fmt.log`（全部）与 `error.log`（仅 ERROR）由两个进程都以「追加」方式打开，
+每行一次写入；MSVC 文件流是共享模式，因此不存在两个进程争抢同一个日志文件的问题。
+
+旧口径是「只有 Service 写日志文件，CLI 不写 `fmt.log`」，已被推翻：用户在 CLI 里敲
+`service stop`，服务随即被停掉，旧口径下这次操作在日志里**一个字都没有**——日志跟不上
+用户做过什么。日志要能回答「谁在什么时候对服务做了什么、结果如何」，因此 CLI 也写。
+
+CLI 侧的三条边界（完整清单与字段见 11.12）：
+
+```text
+1. CLI 只允许创建 <数据根>/log/ 这一个目录（日志不是业务数据）；
+   repository / data / config 一概不碰，CLI 仍然不改任何业务数据。
+2. --help 与 --version 不写日志、不创建任何目录。
+3. 两个进程的数据根可能不同（服务可能被别人启动在另一个目录）：各写各自数据根下的
+   log/fmt.log；这种情况下 CLI 会额外写一行 WARN，指明服务当前数据根与服务侧日志的位置。
+```
 
 ### 14.3 格式
 
@@ -2739,7 +2812,7 @@ FMT_ROOT/log/
 |---|---|
 | 时间 | `YYYY-MM-DD HH:MM:SS`，本地时间 |
 | 级别 | INFO / WARN / ERROR |
-| 模块 | 短名：`Main`、`Config`、`File`、`Share`、`Trash`、`Bucket`、`Storage`、`Http` |
+| 模块 | 短名：`Main`、`Config`、`File`、`Share`、`Trash`、`Bucket`、`Storage`、`Http`、`Service`、`Ipc`；CLI 侧另有 `Cli`（CLI 本体）、`Elevated`（提权副本，见 11.12） |
 | 消息 | 内容，可含补充数据 |
 
 ERROR 级同时写入 `fmt.log` 与 `error.log`。
@@ -2764,6 +2837,8 @@ public:
 
 - 线程安全（内部 mutex）——HTTP 请求可能来自多个线程
 - 追加写入，open 时创建文件（不存在则建）
+- **两个进程共用同一份实现**：Service 与 CLI 各自用同一个 `log_dir` open 同一个文件，
+  一律以追加方式打开（11.12）；CLI 只负责创建 `log/` 目录本身，不建任何业务目录
 - 打开失败不得导致程序崩溃，降级为仅控制台输出
 - **不得污染正常 CLI 输出**
 
@@ -2785,7 +2860,9 @@ HTTP 请求（方法、路径、状态码）
 ### 15.1 线程模型
 
 **只有 Service 一个进程写数据。** CLI 不写任何业务数据（它是管道客户端），
-因此不存在跨进程并发。
+因此不存在跨进程并发——**唯一的例外是日志**：CLI 与 Service 追加同一个
+`<数据根>/log/fmt.log`（见 11.12、14.2），它是追加写、每行一次写入，
+不参与任何业务事务，也不需要跨进程锁。
 
 Service 内部：
 
@@ -3279,7 +3356,8 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 - `common/text` 的 UTF-8 ↔ `fs::path` 转换：不遵守会静默写出乱码目录名；
 - `PathManager` 作为路径唯一出口：不遵守会绕过 `text` 转换；
 - 只有 Service 写业务数据：现在 CLI 走命名管道（11.1），这条纪律反而更硬了——
-  CLI 连数据文件都不再打开。
+  CLI 连数据文件都不再打开。**日志除外**：CLI 与 Service 追加同一个
+  `<数据根>/log/fmt.log`（见 11.12、14.2）。
 
 ### 18.9 阶段 5～8 完成明细（历史记录）
 

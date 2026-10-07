@@ -43,7 +43,7 @@ CLI 与服务之间的唯一通道是 `127.0.0.1:4122`，数据根固定为「�
 | 3 | 每条 service 命令都走 UAC 提权（不做「已满足状态就免提权」的优化） |
 | 4 | CLI ↔ 服务：命名管道 `\\.\pipe\fmt.control`；浏览器 ↔ 服务：HTTP `127.0.0.1:4122`；两者进同一个 service 层 |
 | 5 | 数据根（`FMT_ROOT`）由 CLI 连接时声明，服务维护「当前数据根」；切换不删旧数据 |
-| 6 | 初始化（建目录 + 默认 JSON）**由服务执行，CLI 只读不建目录** |
+| 6 | 初始化（建目录 + 默认 JSON）**由服务执行，CLI 只读不建业务目录**（写日志用的 `log/` 是唯一例外，见第 8 节） |
 | 7 | 服务自身状态写在 `%ProgramData%\FMT\service.json`，不属于业务数据 |
 | 8 | 服务：名 `FMT`，显示名 `FMT File Management Service`，`SERVICE_AUTO_START`，`LocalSystem`，Recovery 5s/10s/30s、失败计数 1 天重置 |
 | 9 | 服务不声明 `SERVICE_ACCEPT_PAUSE_CONTINUE`；`HandlerEx` 只处理 `STOP` / `SHUTDOWN` / `INTERROGATE` |
@@ -72,7 +72,7 @@ CLI 窗口 ──命名管道────→│        ▼                      
                                  ↑ 同一个 fmt.exe 的 Service 形态
                                  └ 由 SCM 启动，开机自启，全局唯一一个
 
-CLI 形态：不碰 core、不建目录、不写 JSON；只解析命令 + 走管道
+CLI 形态：不碰 core、不建业务目录、不写 JSON（只允许建 `log/`）；只解析命令 + 走管道 + 写日志
 service 命令：本机直连 SCM + UAC 提权（不走管道、不走 HTTP）
 ```
 
@@ -121,7 +121,7 @@ wmain
    `D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`
 2. **强制完整性级别（MIC）**：高完整性进程创建的对象带高完整性标签，中完整性的普通 CLI 会被「禁止向上写」挡住。必须再给管道加 MIC 标签 `S:(ML;;NW;;;ME)`，否则非提权 CLI 连接报 `ERROR_ACCESS_DENIED`。
 
-超时：连接 3 秒、普通命令 30 秒。连不上（`ERROR_FILE_NOT_FOUND`）→「无法连接 FMT Service，请先执行 service install」+ 退出码 8（`FMT-601`）。
+超时：连接时管道不存在最多重试 **5 秒**（权限类错误不重试）、普通命令 **30 秒**。连不上（`ERROR_FILE_NOT_FOUND`）→「无法连接 FMT Service，请先执行 service install」+ 退出码 8（`FMT-601`）。
 
 ### 4.3 浏览器 ↔ 服务：HTTP
 
@@ -181,9 +181,10 @@ CLI 启动
 ### 5.2 初始化职责
 
 `repository/`、`trash/`、`config/`、`data/`、`log/` 与默认 JSON 全部由**服务**创建；CLI 只读。
+唯一例外是写日志：CLI 在真要写日志时会创建 `log/` 目录本身（见第 8 节）。
 规则沿用旧文档冻结项：不存在则创建，已存在保持原样，**绝不删除、清空、覆盖**；关键 JSON 一律 `.tmp` 写完再替换。
 
-这条同时修掉了旧文档的内部矛盾：旧 §4.4 说「CLI 只读不建目录」，旧 §18.2 实测却说首次运行创建了五个目录。现在的口径唯一：**服务建，CLI 只读**。
+这条同时修掉了旧文档的内部矛盾：旧 §4.4 说「CLI 只读不建目录」，旧 §18.2 实测却说首次运行创建了五个目录。现在的口径唯一：**服务建，CLI 只读**——后来只加了一条例外：CLI 为写日志可以创建 `log/`（见第 8 节）。
 
 ### 5.3 服务状态文件
 
@@ -264,11 +265,21 @@ RegisterServiceCtrlHandlerExW
 │   ├── share.json           {"version":1,"shares":[]}
 │   └── trash.json           {"version":1,"trash":[]}
 └── log/
-    ├── fmt.log              只有 Service 写
+    ├── fmt.log              Service 与 CLI 追加同一个文件
     └── error.log            仅 ERROR 级
 
 %ProgramData%\FMT\service.json  ← 服务自身状态，不属于业务数据
 ```
+
+`log/` 是唯一由**两个进程共同追加**的目录：Service 与 CLI 都以「追加」方式打开同一个
+`<数据根>/log/fmt.log`（`error.log` 仅 ERROR 级），每行一次写入，MSVC 文件流是共享模式，
+因此不会争抢。这条口径推翻过旧写法「只有 Service 写日志文件」——用户在 CLI 里敲
+`service stop`，服务随即被停掉，旧写法下这次操作在日志里一个字都没有，日志跟不上用户
+做过什么；日志要能回答「谁在什么时候对服务做了什么、结果如何」。三条边界：CLI 只允许创建
+`log/` 这一个目录（`repository` / `data` / `config` 一概不碰）；`--help` 与 `--version`
+不写日志、不创建任何目录；两个进程的数据根可能不同时，各写各自数据根下的 `log/fmt.log`，
+CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位置。CLI 侧模块短名为 `Cli`
+与 `Elevated`。CLI 连管道时若管道还不存在，最多重试 5 秒（权限类错误不重试）。
 
 ---
 
