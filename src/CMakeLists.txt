@@ -19,5 +19,11 @@ add_subdirectory(config)
 # CLI 与服务之间的命令通道
 add_subdirectory(ipc)
 
+# Windows Service：SCM 四条命令与服务端运行体
+add_subdirectory(service)
+
+# 命令行界面（两条入口中的 CLI 一侧）
+add_subdirectory(cli)
+
 # 路径计算与应用生命周期
 add_subdirectory(core)

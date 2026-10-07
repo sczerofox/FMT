@@ -1,0 +1,26 @@
+<!--
+  FMT 应用程序清单
+
+  关键一条：requestedExecutionLevel 必须是 asInvoker。
+  如果写成 requireAdministrator，双击每次都会弹 UAC，CLI 也会长期以管理员身份
+  运行，而「service 命令按需提权」的设计就失去意义了（docx/FMT 技术文档.md §1.6）。
+-->
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity type="win32" name="FMT" version="1.0.0.0" processorArchitecture="amd64"/>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>

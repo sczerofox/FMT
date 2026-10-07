@@ -105,6 +105,10 @@ target_link_libraries(fmt_core PRIVATE fmt_project_options)
 
 add_executable(fmt src/main.cpp)
 
+# 应用程序清单：requestedExecutionLevel = asInvoker。
+# 写成 requireAdministrator 会让双击每次都弹 UAC，按需提权也就没意义了。
+target_sources(fmt PRIVATE "${CMAKE_SOURCE_DIR}/resources/fmt.manifest")
+
 target_link_libraries(fmt PRIVATE fmt_core fmt_project_options)
 
 # 各模块在这里登记源文件。

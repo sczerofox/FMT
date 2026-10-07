@@ -13,6 +13,8 @@ add_executable(fmt_tests
     config_test.cpp
     app_test.cpp
     ipc_test.cpp
+    service_test.cpp
+    cli_test.cpp
 )
 
 target_link_libraries(fmt_tests
