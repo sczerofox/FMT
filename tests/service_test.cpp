@@ -116,6 +116,26 @@ FMT_TEST(Service, 运行体声明数据根并幂等初始化) {
     FMT_CHECK(again.ok);
 }
 
+FMT_TEST(Service, 运行体把控制事件写进日志) {
+    fmt_test::TempDir temp("service-log");
+    const auto root = temp / "root";
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    // SCM 控制线程收到 STOP / SHUTDOWN 时走的就是这两个调用。
+    runtime.log_event("Service", "收到停止控制 STOP");
+    runtime.log_event("Service", "服务已停止");
+
+    const auto log = fmt::read_text_file(root / "log" / "fmt.log");
+    FMT_CHECK(fmt::ok(log));
+    const std::string& text = std::get<std::string>(log);
+    FMT_CHECK(text.find("[Service] 收到停止控制 STOP") != std::string::npos);
+    FMT_CHECK(text.find("[Service] 服务已停止") != std::string::npos);
+    // 服务启动那几行也在同一个文件里
+    FMT_CHECK(text.find("服务已启动") != std::string::npos);
+}
+
 FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {
     fmt_test::TempDir temp("service-ops");
     fmt::service::ServerRuntime runtime(temp / "root", temp / "state");
