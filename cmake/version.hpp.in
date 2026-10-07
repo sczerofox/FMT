@@ -11,4 +11,7 @@ inline constexpr std::string_view PATCH = "@PROJECT_VERSION_PATCH@";
 
 inline constexpr std::string_view STRING = "@PROJECT_VERSION@";
 
+// 构建日期（配置时生成），横幅里显示成 build 2026.10.08。
+inline constexpr std::string_view BUILD_DATE = "@FMT_BUILD_DATE@";
+
 }  // namespace fmt::version

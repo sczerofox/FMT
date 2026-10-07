@@ -80,32 +80,100 @@ void note_service_root(const Options& options) {
                         "本进程日志写在本目录的 log/fmt.log");
 }
 
-void print_version() {
-    std::printf("%.*s\n", static_cast<int>(version::STRING.size()), version::STRING.data());
+std::string banner_text() {
+    return "File Manager Tool  v" + std::string(version::MAJOR) + "." +
+           std::string(version::MINOR) + "  ( build  " + std::string(version::BUILD_DATE) + " )";
+}
+
+void print_version() { std::printf("%s\n", banner_text().c_str()); }
+
+// 命令总览：只列命令、不加描述；细节用 help <命令>。
+void print_command_list() {
+    std::printf("可用命令：\n");
+    std::printf("  (service)  install  uninstall  start  stop  status\n");
+    std::printf("  (help)     help [命令]\n");
+    std::printf("  (exit)     exit  quit\n");
+    std::printf("\n业务命令（服务端尚未实现，现在会返回 FMT-602）：\n");
+    std::printf("  (bucket)   create  list  get  use  delete\n");
+    std::printf("  (file)     upload  list  get  delete\n");
+    std::printf("  (share)    create  get  list  delete\n");
+    std::printf("  (trash)    list  get  restore  delete\n");
+}
+
+// help <命令>：某一组命令的详细说明。
+bool print_command_help(const std::string& topic) {
+    if (topic == "service") {
+        std::printf(
+            "service —— Windows 服务管理\n"
+            "  install    安装并启动服务；需要管理员权限，弹一次 UAC\n"
+            "  uninstall  停止并删除服务；需要管理员权限\n"
+            "             不删除 repository / trash / config / data / log / temp\n"
+            "  start      启动服务；需要管理员权限\n"
+            "  stop       停止服务；需要管理员权限\n"
+            "  status     查询服务状态；不需要管理员权限\n"
+            "\n"
+            "说明：启动类型为自动启动，运行账户为 LocalSystem；异常退出由 Windows\n"
+            "      服务恢复策略自动重启（第一次 5 秒、第二次 10 秒、之后 30 秒）。\n");
+        return true;
+    }
+    if (topic == "exit" || topic == "quit") {
+        std::printf("exit / quit —— 退出命令行窗口\n");
+        return true;
+    }
+    if (topic == "help") {
+        std::printf("help [命令] —— 不带参数列出所有命令；带命令名看该命令的详细说明\n");
+        return true;
+    }
+    if (topic == "bucket") {
+        std::printf(
+            "bucket —— 存储空间（服务端尚未实现，现在返回 FMT-602）\n"
+            "  create <名称>   创建\n"
+            "  list            列出\n"
+            "  get <名称>      查看\n"
+            "  use <名称>      切换当前 Bucket\n"
+            "  delete <名称>   删除到回收站\n");
+        return true;
+    }
+    if (topic == "file") {
+        std::printf(
+            "file —— 文件（服务端尚未实现，现在返回 FMT-602）\n"
+            "  upload <URL>            从 http/https 下载入库\n"
+            "  list                    列出当前用户在当前 Bucket 的文件\n"
+            "  get <file_id|文件名>    查看文件信息\n"
+            "  delete <file_id>        软删除到回收站\n");
+        return true;
+    }
+    if (topic == "share") {
+        std::printf(
+            "share —— 分享（服务端尚未实现，现在返回 FMT-602）\n"
+            "  create <file_id>    创建分享\n"
+            "  get <share_id>      查看\n"
+            "  list <file_id>      列出某个文件的分享\n"
+            "  delete <share_id>   取消分享\n");
+        return true;
+    }
+    if (topic == "trash") {
+        std::printf(
+            "trash —— 回收站（服务端尚未实现，现在返回 FMT-602）\n"
+            "  list             列出\n"
+            "  get <id>         查看\n"
+            "  restore <id>     还原到原位置\n"
+            "  delete <id>      永久删除\n");
+        return true;
+    }
+
+    std::fprintf(stderr, "没有 %s 的帮助；输入 help 查看命令列表\n", topic.c_str());
+    return false;
 }
 
 void print_usage() {
-    std::printf(
-        "FMT %.*s - Windows 文件管理系统\n"
-        "\n"
-        "用法：\n"
-        "  fmt.exe --help               显示本帮助\n"
-        "  fmt.exe --version            显示版本\n"
-        "  fmt.exe service install      安装并启动服务（需要管理员权限）\n"
-        "  fmt.exe service uninstall    停止并删除服务（需要管理员权限）\n"
-        "  fmt.exe service start        启动服务（需要管理员权限）\n"
-        "  fmt.exe service stop         停止服务（需要管理员权限）\n"
-        "  fmt.exe service status       查询服务状态（不需要管理员权限）\n"
-        "\n"
-        "直接双击进入交互式命令行：\n"
-        "  fmt> service status\n"
-        "  fmt> service stop\n"
-        "  fmt> file list\n"
-        "  fmt> exit\n"
-        "\n"
-        "退出码：0 成功  1 通用错误  2 参数错误  3 对象不存在  4 冲突\n"
-        "        5 权限/访问  6 数据一致性  7 配置错误  8 Service 错误\n",
-        static_cast<int>(version::STRING.size()), version::STRING.data());
+    std::printf("%s\n\n", banner_text().c_str());
+    std::printf("用法：fmt.exe [命令]\n");
+    std::printf("  不带参数直接双击：创建/检查数据根、确保服务在运行，然后进入交互式命令行。\n\n");
+    print_command_list();
+    std::printf("\n退出码：0 成功  1 通用错误  2 参数错误  3 对象不存在  4 冲突\n");
+    std::printf("        5 权限/访问  6 数据一致性  7 配置错误  8 Service 错误\n");
+    std::printf("\n详细说明：help <命令>，例如 help service\n");
 }
 
 std::string service_state_line(service::State state) {
@@ -293,46 +361,47 @@ std::string join(const std::vector<std::string>& parts) {
 // 只补缺失的目录与文件，已存在的一律不动；损坏的 JSON 只报告、绝不重置
 // （冻结规则：JSON 损坏不能静默重置）。
 //
+// **控制台不打印常规结果**（建了什么、完不完整）：那是日志的活，CLI 窗口只留
+// 交互。只有异常（补不齐、文件损坏）才打到 stderr。
+//
 // 必须在打开日志器**之前**调用：日志目录 log/ 也归这一步建，否则
 // 「新建目录」的清单会少一个 log（日志器自己把它建掉了）。
-// 打印出来的每一行同时收进 notes，日志器打开后再补记进日志。
 void prepare_data_root(const Options& options, std::vector<std::string>* notes) {
     const PathManager paths{path_from_utf8(options.data_root)};
     const RootReport report = check_root(paths);
     const std::string root_text = to_forward_slashes(options.data_root);
 
-    const auto emit = [notes](const std::string& line) {
-        std::printf("  %s\n", line.c_str());
+    const auto note = [notes](const std::string& line) {
         if (notes != nullptr) {
             notes->push_back("数据根" + line);
         }
     };
 
-    std::printf("数据根：%s\n", root_text.c_str());
-    if (notes != nullptr) {
-        notes->push_back("数据根检查：" + root_text);
-    }
+    note("检查：" + root_text);
 
     Result<RootRepair> repaired = ensure_root(paths);
     if (!ok(repaired)) {
         const Error& error = *error_of(repaired);
-        emit("无法补齐：" + code_string(error.code) + " " + error.message);
+        note("无法补齐：" + code_string(error.code) + " " + error.message);
+        std::fprintf(stderr, "数据根无法补齐：%s %s\n", code_string(error.code).c_str(),
+                     error.message.c_str());
         return;  // 不阻断：服务自己启动时还会再试一次
     }
 
     const RootRepair& done = std::get<RootRepair>(repaired);
     if (!done.created_directories.empty()) {
-        emit("新建目录：" + join(done.created_directories));
+        note("新建目录：" + join(done.created_directories));
     }
     if (!done.created_files.empty()) {
-        emit("新建文件：" + join(done.created_files));
+        note("新建文件：" + join(done.created_files));
     }
     if (done.created_directories.empty() && done.created_files.empty()) {
-        emit("数据根完整");
+        note("完整");
     }
 
     for (const std::string& broken : report.broken_files) {
-        emit("损坏（未自动修复）：" + broken);
+        note("损坏（未自动修复）：" + broken);
+        std::fprintf(stderr, "数据根文件损坏（未自动修复）：%s\n", broken.c_str());
     }
 }
 
@@ -443,7 +512,7 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
 
 // ---- 交互循环 ----
 int run_interactive(const Options& options, service::State state, Session& session) {
-    std::printf("FMT %.*s\n", static_cast<int>(version::STRING.size()), version::STRING.data());
+    std::printf("%s\n", banner_text().c_str());
     std::printf("%s\n", service_state_line(state).c_str());
     log_info("Cli", "进入交互循环，数据根：" + to_forward_slashes(options.data_root));
 
@@ -476,7 +545,11 @@ int run_interactive(const Options& options, service::State state, Session& sessi
             break;
         }
         if (head == "help" || head == "--help") {
-            print_usage();
+            if (parts.size() >= 2) {
+                print_command_help(parts[1]);  // help service 看某一组命令的详情
+            } else {
+                print_command_list();
+            }
             continue;
         }
         if (head == "service") {
@@ -571,7 +644,6 @@ int bootstrap_and_run(const Options& options) {
     // 2. 服务状态
     service::State state = service::query_state();
     log_info("Service", "当前状态：" + std::string(service::state_name(state)));
-    std::printf("服务状态：%s\n", std::string(service::state_name(state)).c_str());
 
     if (state == service::State::NotInstalled) {
         log_info("Service", "服务未安装 -> 安装并启动");
@@ -618,6 +690,13 @@ int bootstrap_and_run(const Options& options) {
 int dispatch_command(const std::vector<std::string>& args, const Options& options) {
     // 一次性命令不参与单实例：已经开着一个窗口时，别的脚本仍然要能停服务。
     if (!args.empty()) {
+        if (args[0] == "help") {
+            if (args.size() >= 2) {
+                return print_command_help(args[1]) ? 0 : exit_code(ErrorCode::InvalidArgument);
+            }
+            print_command_list();
+            return 0;
+        }
         if (args[0] == "service") {
             if (args.size() >= 2 && args[1] == "status") {
                 return show_service_status();  // 查询不需要提权

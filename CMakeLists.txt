@@ -84,7 +84,11 @@ endif()
 
 # ---------------------------------------------------------------------------
 # 版本头（生成，请勿手工修改）
+#
+# 构建日期进横幅：File Manager Tool  v1.0  ( build 2026.10.08 )
 # ---------------------------------------------------------------------------
+string(TIMESTAMP FMT_BUILD_DATE "%Y.%m.%d")
+
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/version.hpp.in"
     "${CMAKE_CURRENT_BINARY_DIR}/generated/fmt/version.hpp"
