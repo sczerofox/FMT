@@ -103,6 +103,13 @@ bool activate_existing_window() {
     return context.activated;
 }
 
+// 用户可以直接键入的 service 命令；reinstall 是引导流程内部使用的，
+// 不在命令集里（文档冻结的是四条命令）。
+bool is_user_service_command(const std::string& operation) {
+    return operation == "install" || operation == "uninstall" || operation == "start" ||
+           operation == "stop";
+}
+
 // ---- service 四条命令：每条都提权 ----
 int run_service_command(const std::string& operation, const Options& options) {
     std::printf("需要管理员权限\n");
@@ -247,7 +254,7 @@ int run_interactive(const Options& options, service::State state) {
             continue;
         }
         if (head == "service") {
-            if (parts.size() < 2) {
+            if (parts.size() < 2 || !is_user_service_command(parts[1])) {
                 std::fprintf(stderr, "用法：service install | uninstall | start | stop\n");
                 continue;
             }
@@ -315,7 +322,7 @@ int run(const std::vector<std::string>& args, const Options& options) {
     // 一次性命令不参与单实例：已经开着一个窗口时，别的脚本仍然要能停服务。
     if (!args.empty()) {
         if (args[0] == "service") {
-            if (args.size() < 2) {
+            if (args.size() < 2 || !is_user_service_command(args[1])) {
                 std::fprintf(stderr, "用法：service install | uninstall | start | stop\n");
                 return exit_code(ErrorCode::InvalidArgument);
             }

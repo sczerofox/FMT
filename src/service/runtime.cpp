@@ -120,8 +120,34 @@ Status ServerRuntime::start() {
         context_->logger->warn("Service", "写入服务状态失败：" + error_of(saved)->message);
     }
 
+    apply_http_locked();
     context_->logger->info("Service", "服务已启动，当前数据根：" + state.current_root);
     return std::monostate{};
+}
+
+void ServerRuntime::apply_http_locked() {
+    if (http_ != nullptr) {
+        http_->stop();
+        http_.reset();
+    }
+    if (context_ == nullptr || !context_->server_config.enabled) {
+        return;
+    }
+
+    auto created = std::make_unique<server::HttpServer>();
+    const std::string root = to_forward_slashes(path_to_utf8(context_->paths->root()));
+    const Status started = created->start(context_->server_config.host,
+                                          context_->server_config.port, root,
+                                          context_->logger.get());
+    if (!ok(started)) {
+        // 端口被占用等：记 ERROR 日志，但**不中断**服务的其他功能。
+        context_->logger->error("Http", error_of(started)->message);
+        return;
+    }
+
+    context_->logger->info("Http", "HTTP 监听 " + created->host() + ":" +
+                                       std::to_string(created->port()));
+    http_ = std::move(created);
 }
 
 Status ServerRuntime::apply_root(const std::string& requested_root, std::string* effective_root) {
@@ -166,6 +192,8 @@ Status ServerRuntime::apply_root(const std::string& requested_root, std::string*
     if (const Status saved = save_state_to(state_directory_, state); !ok(saved)) {
         context_->logger->warn("Service", "写入服务状态失败：" + error_of(saved)->message);
     }
+
+    apply_http_locked();
 
     if (effective_root != nullptr) {
         *effective_root = target;
@@ -213,7 +241,16 @@ std::filesystem::path ServerRuntime::current_root() const {
     return context_ != nullptr ? context_->paths->root() : std::filesystem::path{};
 }
 
-void ServerRuntime::request_stop() { stop_requested_ = true; }
+void ServerRuntime::request_stop() {
+    stop_requested_ = true;
+
+    // 停止接受新请求后立刻停 HTTP：听不到新请求，进行中的事务由调用方等待。
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (http_ != nullptr) {
+        http_->stop();
+        http_.reset();
+    }
+}
 
 void ServerRuntime::serve(ipc::PipeConnection connection) {
     while (!stop_requested_.load()) {

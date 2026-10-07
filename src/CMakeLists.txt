@@ -25,5 +25,8 @@ add_subdirectory(service)
 # 命令行界面（两条入口中的 CLI 一侧）
 add_subdirectory(cli)
 
+# 浏览器入口：HTTP
+add_subdirectory(server)
+
 # 路径计算与应用生命周期
 add_subdirectory(core)

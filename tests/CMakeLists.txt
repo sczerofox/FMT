@@ -15,12 +15,14 @@ add_executable(fmt_tests
     ipc_test.cpp
     service_test.cpp
     cli_test.cpp
+    server_test.cpp
 )
 
 target_link_libraries(fmt_tests
     PRIVATE
         fmt_core
         fmt_project_options
+        fmt_cpp_httplib   # server 测试要用 HTTP 客户端打自己的接口
 )
 
 target_include_directories(fmt_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

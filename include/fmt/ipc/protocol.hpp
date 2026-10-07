@@ -55,7 +55,4 @@ std::string encode_frame(const nlohmann::json& value);
 // false 且不动 buffer；长度越界或 JSON 非法返回错误（调用方应断开连接）。
 Result<bool> take_frame(std::string& buffer, nlohmann::json* out);
 
-// 把错误码转成响应信封里的 error 对象。
-nlohmann::json error_to_json(const Error& error);
-
 }  // namespace fmt::ipc

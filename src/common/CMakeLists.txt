@@ -8,4 +8,5 @@ target_sources(fmt_core PRIVATE
     time.cpp
     string.cpp
     logger.cpp
+    envelope.cpp
 )

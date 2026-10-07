@@ -44,6 +44,14 @@ if(MSVC)
     add_compile_options(/utf-8)
 endif()
 
+# Windows 头文件纪律：
+#   WIN32_LEAN_AND_MEAN 阻止 windows.h 拉进 winsock v1，否则它与 cpp-httplib
+#   使用的 winsock2.h 会撞成「struct 类型重定义」。
+#   NOMINMAX 避免 min/max 宏污染标准库调用。
+if(WIN32)
+    add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
 # 产物集中到 <build>/bin，便于定位 fmt.exe。
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 

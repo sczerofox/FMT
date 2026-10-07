@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "fmt/common/envelope.hpp"
+
 namespace fmt::ipc {
 namespace {
 
@@ -36,21 +38,10 @@ nlohmann::json to_json(const Request& request) {
 }
 
 nlohmann::json to_json(const Response& response) {
-    nlohmann::json value = nlohmann::json::object();
+    // 信封与 HTTP 共用一份实现（common/envelope.hpp），管道只多一个 id。
+    nlohmann::json value =
+        response.ok ? envelope_ok(response.data) : envelope_error(response.error);
     value["id"] = response.id;
-    value["ok"] = response.ok;
-    if (response.ok) {
-        value["data"] = response.data;
-    } else {
-        value["error"] = error_to_json(response.error);
-    }
-    return value;
-}
-
-nlohmann::json error_to_json(const Error& error) {
-    nlohmann::json value = nlohmann::json::object();
-    value["code"] = code_string(error.code);
-    value["message"] = error.message;
     return value;
 }
 

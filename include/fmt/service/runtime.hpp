@@ -16,6 +16,7 @@
 #include "fmt/common/error.hpp"
 #include "fmt/core/app.hpp"
 #include "fmt/ipc/pipe.hpp"
+#include "fmt/server/server.hpp"
 #include "fmt/service/service.hpp"
 
 namespace fmt::service {
@@ -60,9 +61,12 @@ private:
 
     Status apply_root(const std::string& requested_root, std::string* effective_root);
     void serve(ipc::PipeConnection connection);
+    // 按当前根的 server.json 决定是否（重新）启动 HTTP 监听；调用时必须持有 mutex_。
+    void apply_http_locked();
 
     mutable std::mutex mutex_;
     std::unique_ptr<AppContext> context_;
+    std::unique_ptr<server::HttpServer> http_;
     std::filesystem::path fallback_root_;
     std::filesystem::path state_directory_;
     std::atomic<bool> stop_requested_{false};
