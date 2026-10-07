@@ -687,12 +687,42 @@ Result<std::filesystem::path> FileService::trash_path_of(const FileRecord& recor
                              record.file_name);
 }
 
-Result<FileRecord> FileService::remove(std::string_view file_id) {
+Result<std::size_t> FileService::locate_record(const std::vector<FileRecord>& records,
+                                               std::string_view key) const {
+    // ① 先当 file_id：全局唯一，形状固定（fmt-YYYYMMDD-N），先查不会误伤名字。
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (records[i].file_id == key) {
+            return i;
+        }
+    }
+
+    // ② 再当文件名：当前用户 + 正常文件。
+    //    名字在同用户范围内唯一（重名上传会被 FMT-105 拒绝），所以不会撞出歧义。
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (records[i].user == config_.current_user && !records[i].is_trash &&
+            records[i].file_name == key) {
+            return i;
+        }
+    }
+
+    // ③ 名字存在、但已经在回收站里：说清楚是哪一条，别让用户以为文件没了。
+    for (const FileRecord& record : records) {
+        if (record.user == config_.current_user && record.is_trash && record.file_name == key) {
+            return make_error(ErrorCode::InvalidArgument,
+                              "该文件已经在回收站里：" + std::string(key) + "（file_id " +
+                                  record.file_id + "）");
+        }
+    }
+
+    return make_error(ErrorCode::FileNotFound, "文件不存在：" + std::string(key));
+}
+
+Result<FileRecord> FileService::remove(std::string_view file_id_or_name) {
     if (config_.current_user.empty()) {
         return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
     }
-    if (file_id.empty()) {
-        return make_error(ErrorCode::InvalidArgument, "缺少 file_id");
+    if (file_id_or_name.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少 file_id 或文件名");
     }
 
     Result<std::vector<FileRecord>> loaded = load_records();
@@ -701,22 +731,18 @@ Result<FileRecord> FileService::remove(std::string_view file_id) {
     }
     std::vector<FileRecord> records = std::get<std::vector<FileRecord>>(loaded);
 
-    std::size_t index = records.size();
-    for (std::size_t i = 0; i < records.size(); ++i) {
-        if (records[i].file_id == file_id) {
-            index = i;
-            break;
-        }
+    Result<std::size_t> located = locate_record(records, file_id_or_name);
+    if (!ok(located)) {
+        return *error_of(located);
     }
-    if (index == records.size()) {
-        return make_error(ErrorCode::FileNotFound, "文件不存在：" + std::string(file_id));
-    }
+    const std::size_t index = std::get<std::size_t>(located);
+
     if (records[index].user != config_.current_user) {
         return make_error(ErrorCode::PermissionDenied, "这个文件不属于当前用户");
     }
     if (records[index].is_trash) {
         return make_error(ErrorCode::InvalidArgument,
-                          "该文件已经在回收站里：" + std::string(file_id));
+                          "该文件已经在回收站里：" + records[index].file_id);
     }
 
     Result<std::filesystem::path> source = resolve_path(records[index]);
@@ -752,7 +778,7 @@ Result<FileRecord> FileService::remove(std::string_view file_id) {
     records[index].trash_reason = kTrashReasonFile;
     if (const Status status = save_records(records); !ok(status)) {
         // 回滚：先撤掉 trash 记录，再把文件搬回仓库
-        const Status undone = remove_trash_record(paths_, file_id);
+        const Status undone = remove_trash_record(paths_, records[index].file_id);
         std::error_code ignored;
         std::filesystem::rename(to, from, ignored);
         if (logger_ != nullptr) {

@@ -146,7 +146,7 @@ bool print_command_help(const std::string& topic) {
             "                           不重复入库。大小上限取 config.json 的 max_upload_size。\n"
             "  list                     列出当前 Bucket 的正常文件\n"
             "  get <file_id|文件名>     查看文件信息与磁盘路径\n"
-            "  delete <file_id>         软删除进回收站，file_id 不变\n"
+            "  delete <file_id|文件名>  软删除进回收站，file_id 不变\n"
             "                           （文件级回收站目前只能写、还不能从 trash 查回，待阶段 7）\n"
             "\n"
             "文件落在 repository/<用户>/<Bucket>/YYYY/MM/DD/ 下；上传先写 temp/，\n"

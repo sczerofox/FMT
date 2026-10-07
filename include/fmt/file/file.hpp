@@ -74,7 +74,8 @@ public:
     // 按名字查：当前用户 + 正常文件。
     Result<FileRecord> get_by_name(std::string_view file_name);
     // 软删除进回收站，file_id 不变（第 43 节）。
-    Result<FileRecord> remove(std::string_view file_id);
+    // 参数与 file get 一致：先当 file_id 查，再当文件名查（当前用户 + 正常文件）。
+    Result<FileRecord> remove(std::string_view file_id_or_name);
 
     // 仓库里的实际路径；回收站里的实际路径。
     Result<std::filesystem::path> resolve_path(const FileRecord& record) const;
@@ -84,6 +85,10 @@ private:
     Result<std::vector<FileRecord>> load_records() const;
     Status save_records(const std::vector<FileRecord>& records) const;
     std::string next_file_id(const std::vector<FileRecord>& records) const;
+    // 按 file_id 或文件名定位一条记录，并给出**准确**的失败原因
+    // （「名字存在但已在回收站」不能报成「文件不存在」）。
+    Result<std::size_t> locate_record(const std::vector<FileRecord>& records,
+                                      std::string_view key) const;
     std::filesystem::path bucket_path() const;
 
     const PathManager& paths_;

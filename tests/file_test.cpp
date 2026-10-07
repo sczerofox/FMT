@@ -310,6 +310,74 @@ FMT_TEST(File, 软删除进回收站) {
     FMT_CHECK(fmt::error_of(again)->code == fmt::ErrorCode::InvalidArgument);
 }
 
+FMT_TEST(File, 按文件名也能软删除) {
+    Fixture f;
+    const auto uploaded = upload_local(f, "doc.txt");
+    FMT_CHECK(fmt::ok(uploaded));
+    if (!fmt::ok(uploaded)) {
+        return;
+    }
+    const fmt::FileRecord record = std::get<fmt::FileRecord>(uploaded);
+
+    fmt::FileService files(*f.paths, f.config, nullptr);
+
+    // 名字根本不存在 -> FMT-002（不是「参数错误」：确实没这个文件）
+    const auto unknown = files.remove("没有这个文件.txt");
+    FMT_CHECK(!fmt::ok(unknown));
+    FMT_CHECK(fmt::error_of(unknown)->code == fmt::ErrorCode::FileNotFound);
+    FMT_CHECK(fmt::error_of(unknown)->message.find("文件不存在") != std::string::npos);
+
+    // 按名字删除与按 id 删除等价
+    const auto removed = files.remove("doc.txt");
+    FMT_CHECK(fmt::ok(removed));
+    if (fmt::ok(removed)) {
+        FMT_CHECK_EQ(std::get<fmt::FileRecord>(removed).file_id, record.file_id);
+        FMT_CHECK(std::get<fmt::FileRecord>(removed).is_trash);
+    }
+    const auto trash_path = files.trash_path_of(record);
+    FMT_CHECK(fmt::ok(trash_path));
+    FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(trash_path)));
+
+    // 再按名字删一次：必须说清「已经在回收站里」并给出 file_id，
+    // 不能报成「文件不存在」——文件明明还在回收站里。
+    const auto again = files.remove("doc.txt");
+    FMT_CHECK(!fmt::ok(again));
+    FMT_CHECK(fmt::error_of(again)->code == fmt::ErrorCode::InvalidArgument);
+    FMT_CHECK(fmt::error_of(again)->message.find("回收站") != std::string::npos);
+    FMT_CHECK(fmt::error_of(again)->message.find(record.file_id) != std::string::npos);
+}
+
+FMT_TEST(File, 按名字删除用的是记录自己的Bucket) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(buckets.create("生活")));  // 第二个桶（第一个「工作」已是当前）
+    FMT_CHECK(fmt::ok(buckets.use("工作")));
+
+    const auto uploaded = upload_local(f, "跨桶.txt");
+    FMT_CHECK(fmt::ok(uploaded));
+    if (!fmt::ok(uploaded)) {
+        return;
+    }
+    FMT_CHECK_EQ(std::get<fmt::FileRecord>(uploaded).bucket, std::string("工作"));
+
+    // 名字的作用域是「同用户跨 Bucket」，所以切到别的桶也能按名字删到它；
+    // 关键是回收站落点要用**记录自己的桶**，不是当前桶。
+    FMT_CHECK(fmt::ok(buckets.use("生活")));
+    fmt::FileService files(*f.paths, f.config, nullptr);
+
+    const auto removed = files.remove("跨桶.txt");
+    FMT_CHECK(fmt::ok(removed));
+    if (!fmt::ok(removed)) {
+        return;
+    }
+    const auto trash_path = files.trash_path_of(std::get<fmt::FileRecord>(removed));
+    FMT_CHECK(fmt::ok(trash_path));
+    const std::string text =
+        fmt::to_forward_slashes(fmt::path_to_utf8(std::get<std::filesystem::path>(trash_path)));
+    FMT_CHECK(text.find("/工作/") != std::string::npos);
+    FMT_CHECK(text.find("/生活/") == std::string::npos);
+}
+
 FMT_TEST(File, 从HTTP下载入库) {
     Fixture f;
 
