@@ -178,6 +178,19 @@ FMT_TEST(Service, 管道能执行Bucket命令) {
     }
     FMT_CHECK(fmt::directory_exists(root / "repository" / "user" / "work"));
 
+    // 规范化后的名字要贯穿到 path：`bucket get WORK` 不能打印 .../WORK
+    fmt::ipc::Request get_upper;
+    get_upper.id = 16;
+    get_upper.op = "bucket.get";
+    get_upper.args["argv"] = nlohmann::json::array({"WORK"});
+    const fmt::ipc::Response got_upper = runtime.handle(get_upper);
+    FMT_CHECK(got_upper.ok);
+    if (got_upper.ok) {
+        FMT_CHECK_EQ(got_upper.data.value("bucket", std::string{}), std::string("work"));
+        FMT_CHECK_EQ(got_upper.data.value("path", std::string{}),
+                     std::string("repository/user/work"));
+    }
+
     // 已登记但没实现的模块仍然是 FMT-602，而不是「未知操作」
     fmt::ipc::Request pending;
     pending.id = 15;

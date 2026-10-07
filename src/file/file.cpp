@@ -622,9 +622,10 @@ Result<FileRecord> FileService::get_by_id(std::string_view file_id) {
     if (!ok(loaded)) {
         return *error_of(loaded);
     }
-    // 第 42 节：按 file_id 查是全局唯一，不限当前用户/Bucket
+    // 第 42 节：按 file_id 查是全局唯一，不限当前用户/Bucket。
+    // 比较不区分大小写（与 delete 的定位口径一致——同一个标识不该因为大小写两种结果）。
     for (const FileRecord& record : std::get<std::vector<FileRecord>>(loaded)) {
-        if (record.file_id == file_id) {
+        if (iequals(record.file_id, file_id)) {
             return record;
         }
     }

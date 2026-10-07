@@ -247,6 +247,16 @@ FMT_TEST(File, 列表与查询) {
     FMT_CHECK(fmt::ok(files.get_by_id(id)));
     FMT_CHECK(fmt::ok(files.get_by_name("b.txt")));
 
+    // 标识比较不区分大小写：大写 file_id 也要查得到（与 delete 的定位口径一致）
+    std::string upper = id;
+    for (char& ch : upper) {
+        if (ch >= 'a' && ch <= 'z') {
+            ch = static_cast<char>(ch - 'a' + 'A');
+        }
+    }
+    FMT_CHECK(upper != id);
+    FMT_CHECK(fmt::ok(files.get_by_id(upper)));
+
     const auto unknown = files.get_by_id("fmt-20260101-9");
     FMT_CHECK(!fmt::ok(unknown));
     FMT_CHECK(fmt::error_of(unknown)->code == fmt::ErrorCode::FileNotFound);

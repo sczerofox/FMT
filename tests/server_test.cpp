@@ -319,6 +319,18 @@ FMT_TEST(Server, File路由与上传) {
                      std::string("FMT-001"));
     }
 
+    // 与 file_id 同形的文件名 -> 400 + FMT-106（不能落到 default 的 500）
+    const nlohmann::json bad_name{{"path", fmt::path_to_utf8(source)},
+                                  {"file_name", "fmt-20261008-0"}};
+    const auto rejected_name = client.Post("/api/file", bad_name.dump(), "application/json");
+    FMT_CHECK(rejected_name != nullptr);
+    if (rejected_name != nullptr) {
+        FMT_CHECK_EQ(rejected_name->status, 400);
+        FMT_CHECK_EQ(
+            nlohmann::json::parse(rejected_name->body)["error"]["code"].get<std::string>(),
+            std::string("FMT-106"));
+    }
+
     // 上传：CLI 传来源，不传内容
     std::string file_id;
     const nlohmann::json body{{"path", fmt::path_to_utf8(source)}, {"file_name", "doc.bin"}};

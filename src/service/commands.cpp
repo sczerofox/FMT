@@ -87,9 +87,12 @@ Result<nlohmann::json> bucket_command(AppContext& context, const std::string& op
         }
 
         nlohmann::json data = nlohmann::json::object();
-        data["bucket"] = std::get<BucketInfo>(info).name;
-        data["is_current"] = std::get<BucketInfo>(info).is_current;
-        data["path"] = relative_path_text(context.paths->root(), buckets.directory_of(value));
+        const BucketInfo& found = std::get<BucketInfo>(info);
+        data["bucket"] = found.name;
+        data["is_current"] = found.is_current;
+        // 路径也用**规范化后的名字**：否则 `bucket get WORK` 会打印 .../WORK，
+        // 而同一个响应里的 bucket 字段是 work，自相矛盾。
+        data["path"] = relative_path_text(context.paths->root(), buckets.directory_of(found.name));
         return data;
     }
 

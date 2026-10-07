@@ -43,6 +43,7 @@ int http_status_for(ErrorCode code) {
         case ErrorCode::FileNameSeparator:
         case ErrorCode::FileNameReserved:
         case ErrorCode::FileNameTooLong:
+        case ErrorCode::FileNameLikeFileId:
         case ErrorCode::BucketNameInvalid:
         case ErrorCode::UrlInvalid:
         case ErrorCode::SizeLimitExceeded:
