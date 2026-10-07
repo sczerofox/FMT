@@ -151,6 +151,7 @@ FMT_TEST(Server, Bucket路由与状态码) {
     }
 
     // delete
+    std::string trashed;
     const auto removed = client.Delete("/api/bucket/" + fmt::url_encode("工作"));
     FMT_CHECK(removed != nullptr);
     if (removed != nullptr) {
@@ -158,6 +159,37 @@ FMT_TEST(Server, Bucket路由与状态码) {
         const nlohmann::json body = nlohmann::json::parse(removed->body);
         FMT_CHECK(body["ok"].get<bool>());
         FMT_CHECK_EQ(body["data"]["moved_to"].get<std::string>().rfind("trash/", 0), std::size_t{0});
+        // 回收站里的名字一律带时间戳
+        trashed = body["data"]["trashed_name"].get<std::string>();
+        FMT_CHECK_EQ(trashed.rfind("工作_", 0), std::size_t{0});
+    }
+
+    // 回收站：GET /api/trash
+    const auto trash = client.Get("/api/trash");
+    FMT_CHECK(trash != nullptr);
+    if (trash != nullptr) {
+        FMT_CHECK_EQ(trash->status, 200);
+        const nlohmann::json body = nlohmann::json::parse(trash->body);
+        FMT_CHECK_EQ(body["data"]["deleted_buckets"].size(), std::size_t{1});
+        FMT_CHECK_EQ(body["data"]["deleted_buckets"][0].value("original", std::string{}),
+                     std::string("工作"));
+    }
+
+    // POST /api/trash/<名字>/restore：回退后桶回到 repository
+    if (!trashed.empty()) {
+        const auto restored =
+            client.Post("/api/trash/" + fmt::url_encode(trashed) + "/restore", "", "application/json");
+        FMT_CHECK(restored != nullptr);
+        if (restored != nullptr) {
+            FMT_CHECK_EQ(restored->status, 200);
+            const nlohmann::json body = nlohmann::json::parse(restored->body);
+            FMT_CHECK_EQ(body["data"]["original"].get<std::string>(), std::string("工作"));
+        }
+    }
+    const auto back = client.Get("/api/bucket/" + fmt::url_encode("工作"));
+    FMT_CHECK(back != nullptr);
+    if (back != nullptr) {
+        FMT_CHECK_EQ(back->status, 200);
     }
 
     server.stop();

@@ -92,12 +92,13 @@ void print_command_list() {
     std::printf("可用命令：\n");
     std::printf("  (service)  install  uninstall  start  stop  status\n");
     std::printf("  (bucket)   create  list  get  use  delete\n");
+    std::printf("  (trash)    list  restore        ← Bucket 级；文件级待阶段 5/7\n");
     std::printf("  (help)     help [命令]\n");
     std::printf("  (exit)     exit  quit\n");
     std::printf("\n业务命令（服务端尚未实现，现在会返回 FMT-602）：\n");
     std::printf("  (file)     upload  list  get  delete\n");
     std::printf("  (share)    create  get  list  delete\n");
-    std::printf("  (trash)    list  get  restore  delete\n");
+    std::printf("  (trash)    get  delete          ← 永久删除待阶段 7\n");
 }
 
 // help <命令>：某一组命令的详细说明。
@@ -131,7 +132,10 @@ bool print_command_help(const std::string& topic) {
             "  list            列出所有 Bucket；当前的那个前面标 *\n"
             "  get <名称>      查看名称、是否当前、目录路径\n"
             "  use <名称>      切换当前 Bucket（只改 current_bucket，不动数据）\n"
-            "  delete <名称>   移到回收站；删的是当前 Bucket 时置空，不自动切换\n");
+            "  delete <名称>   移到回收站，名字变成 <名称>_<时间戳>；\n"
+            "                  删的是当前 Bucket 时置空，不自动切换\n"
+            "\n"
+            "回收站的桶级记录在 trash/<用户>/.original 里，回退用 trash restore。\n");
         return true;
     }
     if (topic == "file") {
@@ -154,11 +158,17 @@ bool print_command_help(const std::string& topic) {
     }
     if (topic == "trash") {
         std::printf(
-            "trash —— 回收站（服务端尚未实现，现在返回 FMT-602）\n"
-            "  list             列出\n"
-            "  get <id>         查看\n"
-            "  restore <id>     还原到原位置\n"
-            "  delete <id>      永久删除\n");
+            "trash —— 回收站\n"
+            "  list             列出回收站里的条目（桶级）\n"
+            "  restore <名称>   回退一个被删除的 Bucket；名称可以是回收站里的名字\n"
+            "                   （lazy-fox_20261008012233），也可以是原桶名（同名只\n"
+            "                   有一个时）。原位置已有同名 Bucket 就整单拒绝，\n"
+            "                   不覆盖、不改名、不做部分恢复。\n"
+            "  get <id>         尚未实现（阶段 7）\n"
+            "  delete <id>      尚未实现（阶段 7，永久删除）\n"
+            "\n"
+            "文件级条目（file delete 产生的）随阶段 5/7 一起进来。\n"
+            "桶级记录写在 trash/<用户>/.original，目录名一律带删除时间戳。\n");
         return true;
     }
 
@@ -478,6 +488,27 @@ void print_business_data(const nlohmann::json& data) {
                         current ? "  (当前)" : "");
         }
         std::printf("共 %zu 个 Bucket\n", items->size());
+        return;
+    }
+
+    // 回收站列表：deleted_buckets: [{trashed, original, deleted_at, present}, …]
+    if (const auto items = data.find("deleted_buckets");
+        items != data.end() && items->is_array()) {
+        for (const nlohmann::json& item : *items) {
+            const std::string trashed = item.value("trashed", std::string{});
+            const std::string original = item.value("original", std::string{});
+            std::string note;
+            if (original.empty()) {
+                note = "  (原名称未记录，无法回退)";
+            } else {
+                note = "  ->  " + original;
+            }
+            if (!item.value("present", true)) {
+                note += "  (目录已不存在)";
+            }
+            std::printf("  %s%s\n", trashed.c_str(), note.c_str());
+        }
+        std::printf("共 %zu 个已删除的 Bucket\n", items->size());
         return;
     }
 

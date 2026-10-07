@@ -173,6 +173,71 @@ FMT_TEST(Service, 管道能执行Bucket命令) {
     FMT_CHECK_EQ(fmt::exit_code(not_yet.error.code), 8);
 }
 
+FMT_TEST(Service, 管道能执行回收站命令) {
+    fmt_test::TempDir temp("service-trash");
+    const auto root = temp / "root";
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    fmt::ipc::Request create;
+    create.id = 20;
+    create.op = "bucket.create";
+    create.args["argv"] = nlohmann::json::array({"工作"});
+    FMT_CHECK(runtime.handle(create).ok);
+
+    fmt::ipc::Request remove;
+    remove.id = 21;
+    remove.op = "bucket.delete";
+    remove.args["argv"] = nlohmann::json::array({"工作"});
+    const fmt::ipc::Response removed = runtime.handle(remove);
+    FMT_CHECK(removed.ok);
+    const std::string trashed = removed.data.value("trashed_name", std::string{});
+    FMT_CHECK(!trashed.empty());
+
+    fmt::ipc::Request list;
+    list.id = 22;
+    list.op = "trash.list";
+    const fmt::ipc::Response listed = runtime.handle(list);
+    FMT_CHECK(listed.ok);
+    if (listed.ok) {
+        FMT_CHECK_EQ(listed.data["deleted_buckets"].size(), std::size_t{1});
+        FMT_CHECK_EQ(listed.data["deleted_buckets"][0].value("original", std::string{}),
+                     std::string("工作"));
+        FMT_CHECK(listed.data["deleted_buckets"][0].value("present", false));
+    }
+
+    // 回退：桶回到 repository/<user>/工作
+    fmt::ipc::Request restore;
+    restore.id = 23;
+    restore.op = "trash.restore";
+    restore.args["argv"] = nlohmann::json::array({trashed});
+    const fmt::ipc::Response restored = runtime.handle(restore);
+    FMT_CHECK(restored.ok);
+    if (restored.ok) {
+        FMT_CHECK_EQ(restored.data.value("original", std::string{}), std::string("工作"));
+    }
+    FMT_CHECK(fmt::directory_exists(root / "repository" / "user" / fmt::path_from_utf8("工作")));
+
+    // 已经回退过的条目再回退一次：找不到，不再是「尚未实现」
+    fmt::ipc::Request again;
+    again.id = 24;
+    again.op = "trash.restore";
+    again.args["argv"] = nlohmann::json::array({trashed});
+    const fmt::ipc::Response missing = runtime.handle(again);
+    FMT_CHECK(!missing.ok);
+    FMT_CHECK(missing.error.code == fmt::ErrorCode::TrashEntryNotFound);
+
+    // trash get / trash delete 仍未实现 -> FMT-602
+    fmt::ipc::Request pending;
+    pending.id = 25;
+    pending.op = "trash.delete";
+    pending.args["argv"] = nlohmann::json::array({trashed});
+    const fmt::ipc::Response not_yet = runtime.handle(pending);
+    FMT_CHECK(!not_yet.ok);
+    FMT_CHECK(not_yet.error.code == fmt::ErrorCode::ServiceOperationFailed);
+}
+
 FMT_TEST(Service, 运行体声明数据根并幂等初始化) {
     fmt_test::TempDir temp("service-runtime");
     const auto root_a = temp / "A";

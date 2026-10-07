@@ -122,14 +122,69 @@ Result<nlohmann::json> bucket_command(AppContext& context, const std::string& op
         nlohmann::json data = nlohmann::json::object();
         data["bucket"] = value;
         data["moved_to"] = relative_path_text(context.paths->root(), result.moved_to);
+        data["trashed_name"] = result.trashed_name;
         data["files_affected"] = result.files_affected;
         data["was_current"] = result.was_current;
         data["current_bucket"] = context.config.current_bucket;
-        data["message"] = "Bucket 已删除（移入回收站）：" + value;
+        data["message"] =
+            "Bucket 已删除（移入回收站）：" + value + "  ->  " + result.trashed_name;
         return data;
     }
 
     return make_error(ErrorCode::InvalidArgument, "未知的 Bucket 操作：" + operation);
+}
+
+// 回收站：桶级条目。文件级条目随阶段 5/7 一起进来。
+Result<nlohmann::json> trash_command(AppContext& context, const std::string& operation,
+                                     const nlohmann::json& args) {
+    BucketService buckets(*context.paths, context.config, context.logger.get());
+
+    if (operation == "trash.list") {
+        const Result<std::vector<TrashBucket>> items = buckets.list_trashed();
+        if (!ok(items)) {
+            return *error_of(items);
+        }
+
+        nlohmann::json array = nlohmann::json::array();
+        for (const TrashBucket& entry : std::get<std::vector<TrashBucket>>(items)) {
+            nlohmann::json item = nlohmann::json::object();
+            item["trashed"] = entry.trashed_name;
+            item["original"] = entry.original_name;
+            item["deleted_at"] = entry.deleted_at;
+            item["present"] = entry.directory_present;
+            array.push_back(std::move(item));
+        }
+
+        nlohmann::json data = nlohmann::json::object();
+        data["deleted_buckets"] = std::move(array);
+        data["count"] = data["deleted_buckets"].size();
+        return data;
+    }
+
+    if (operation == "trash.restore") {
+        const Result<std::string> name = argument(args, 0, "回收站条目名称");
+        if (!ok(name)) {
+            return *error_of(name);
+        }
+        const std::string value = std::get<std::string>(name);
+
+        const Result<TrashBucket> restored = buckets.restore(value);
+        if (!ok(restored)) {
+            return *error_of(restored);
+        }
+        const TrashBucket& entry = std::get<TrashBucket>(restored);
+
+        nlohmann::json data = nlohmann::json::object();
+        data["trashed"] = entry.trashed_name;
+        data["original"] = entry.original_name;
+        data["restored_to"] =
+            relative_path_text(context.paths->root(), buckets.directory_of(entry.original_name));
+        data["message"] = "Bucket 已回退：" + entry.original_name;
+        return data;
+    }
+
+    // trash get / trash delete（永久删除）随阶段 7 一起做。
+    return make_error(ErrorCode::ServiceOperationFailed, "操作尚未实现：" + operation);
 }
 
 }  // namespace
@@ -154,7 +209,11 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
         return bucket_command(context, operation, args);
     }
 
-    // 已经登记、还没实现的模块（file / share / trash / config / server）。
+    if (starts_with(operation, "trash.")) {
+        return trash_command(context, operation, args);
+    }
+
+    // 已经登记、还没实现的模块（file / share / config / server）。
     return make_error(ErrorCode::ServiceOperationFailed, "操作尚未实现：" + operation);
 }
 

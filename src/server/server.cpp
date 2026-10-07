@@ -160,6 +160,15 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler) 
                    [run](const httplib::Request& request, httplib::Response& response) {
                        run("bucket.delete", args_with_encoded_name(request.matches[1]), response);
                    });
+
+    // 回收站（桶级）：GET /api/trash 列条目、POST /api/trash/<名字>/restore 回退。
+    server->Get("/api/trash", [run](const httplib::Request&, httplib::Response& response) {
+        run("trash.list", nlohmann::json::object(), response);
+    });
+    server->Post(R"(/api/trash/([^/]+)/restore)",
+                 [run](const httplib::Request& request, httplib::Response& response) {
+                     run("trash.restore", args_with_encoded_name(request.matches[1]), response);
+                 });
 }
 
 }  // namespace
