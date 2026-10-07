@@ -24,4 +24,9 @@ std::string path_to_utf8(const std::filesystem::path& path);
 // UTF-8 文本转路径。
 std::filesystem::path path_from_utf8(const std::string& text);
 
+// 相对数据根、正斜杠的路径文本：写进 JSON 用（trash.json 的 original_path 等）。
+// 传进来的是根之外的路径时退回完整路径，不抛异常。
+std::string relative_path_text(const std::filesystem::path& root,
+                               const std::filesystem::path& path);
+
 }  // namespace fmt

@@ -132,4 +132,69 @@ std::string to_forward_slashes(std::string text) {
     return text;
 }
 
+namespace {
+
+int hex_value(char ch) {
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return ch - 'a' + 10;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return ch - 'A' + 10;
+    }
+    return -1;
+}
+
+bool is_unreserved(char ch) {
+    const auto value = static_cast<unsigned char>(ch);
+    if ((value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
+        (value >= '0' && value <= '9')) {
+        return true;
+    }
+    return ch == '-' || ch == '_' || ch == '.' || ch == '~';
+}
+
+}  // namespace
+
+std::string url_decode(std::string_view text) {
+    std::string result;
+    result.reserve(text.size());
+
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        if (text[i] != '%' || i + 2 >= text.size()) {
+            result.push_back(text[i]);
+            continue;
+        }
+        const int high = hex_value(text[i + 1]);
+        const int low = hex_value(text[i + 2]);
+        if (high < 0 || low < 0) {
+            result.push_back(text[i]);  // 非法转义原样保留，不猜
+            continue;
+        }
+        result.push_back(static_cast<char>((high << 4) | low));
+        i += 2;
+    }
+    return result;
+}
+
+std::string url_encode(std::string_view text) {
+    constexpr char kHex[] = "0123456789ABCDEF";
+
+    std::string result;
+    result.reserve(text.size());
+    for (const char ch : text) {
+        if (is_unreserved(ch)) {
+            result.push_back(ch);
+            continue;
+        }
+        const auto value = static_cast<unsigned char>(ch);
+        result.push_back('%');
+        result.push_back(kHex[value >> 4]);
+        result.push_back(kHex[value & 0x0F]);
+    }
+    return result;
+}
+
 }  // namespace fmt

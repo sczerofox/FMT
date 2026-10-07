@@ -9,6 +9,7 @@
 target_sources(fmt_core PRIVATE
     service.cpp
     runtime.cpp
+    commands.cpp
 )
 
 if(WIN32)

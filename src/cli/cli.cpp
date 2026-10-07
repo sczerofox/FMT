@@ -459,6 +459,49 @@ void print_failure(const Error& error) {
     std::fprintf(stderr, "错误码：%d\n", exit_code(error.code));
 }
 
+// 业务命令的结果按形状打印：Bucket 列表、单条信息、或服务给的 message。
+// 服务端返回结构化数据，怎么展示放在 CLI 这一侧。
+void print_business_data(const nlohmann::json& data) {
+    if (!data.is_object()) {
+        if (!data.is_null()) {
+            std::printf("%s\n", data.dump(2).c_str());
+        }
+        return;
+    }
+
+    // 列表：buckets: [{name, is_current}, …]
+    if (const auto items = data.find("buckets"); items != data.end() && items->is_array()) {
+        for (const nlohmann::json& item : *items) {
+            const std::string name = item.value("name", std::string{});
+            const bool current = item.value("is_current", false);
+            std::printf("%s%s%s\n", current ? "* " : "  ", name.c_str(),
+                        current ? "  (当前)" : "");
+        }
+        std::printf("共 %zu 个 Bucket\n", items->size());
+        return;
+    }
+
+    // 单条 Bucket 信息
+    if (data.contains("bucket") && data.contains("is_current")) {
+        std::printf("Bucket：%s\n", data.value("bucket", std::string{}).c_str());
+        std::printf("当前：%s\n", data.value("is_current", false) ? "是" : "否");
+        if (data.contains("path")) {
+            std::printf("路径：%s\n", data.value("path", std::string{}).c_str());
+        }
+        return;
+    }
+
+    if (const auto message = data.find("message");
+        message != data.end() && message->is_string()) {
+        std::printf("%s\n", message->get<std::string>().c_str());
+        return;
+    }
+
+    if (!data.empty()) {
+        std::printf("%s\n", data.dump(2).c_str());
+    }
+}
+
 int run_business_command(const std::vector<std::string>& parts, Session& session,
                          const Options& options) {
     const std::string operation = parts[0] + "." + parts[1];
@@ -496,9 +539,7 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     const ipc::Response& value = std::get<ipc::Response>(response);
     if (value.ok) {
         log_info("Cli", "命令 " + operation + " 执行成功（错误码 0）");
-        if (!value.data.is_null() && !(value.data.is_object() && value.data.empty())) {
-            std::printf("%s\n", value.data.dump(2).c_str());
-        }
+        print_business_data(value.data);
         std::printf("执行成功...\n");
         std::printf("错误码：0\n");
         return 0;

@@ -8,10 +8,12 @@ add_executable(fmt_tests
     time_test.cpp
     string_test.cpp
     logger_test.cpp
+    validation_test.cpp
     path_manager_test.cpp
     storage_test.cpp
     config_test.cpp
     app_test.cpp
+    bucket_test.cpp
     ipc_test.cpp
     service_test.cpp
     cli_test.cpp

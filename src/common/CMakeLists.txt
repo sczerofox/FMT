@@ -9,4 +9,5 @@ target_sources(fmt_core PRIVATE
     string.cpp
     logger.cpp
     envelope.cpp
+    validation.cpp
 )

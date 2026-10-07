@@ -7,6 +7,7 @@
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/ipc/protocol.hpp"
+#include "fmt/service/commands.hpp"
 
 namespace fmt::service {
 namespace {
@@ -59,17 +60,6 @@ int clean_temp_directory(const PathManager& paths) {
         }
     }
     return removed;
-}
-
-// 业务操作前缀：阶段 4/5 逐个实现。
-bool is_business_operation(const std::string& op) {
-    for (const std::string_view prefix :
-         {"bucket.", "file.", "share.", "trash.", "config.", "server."}) {
-        if (starts_with(op, prefix)) {
-            return true;
-        }
-    }
-    return false;
 }
 
 }  // namespace
@@ -142,55 +132,96 @@ Status ServerRuntime::start() {
         return *error_of(context);
     }
 
-    std::lock_guard<std::mutex> guard(mutex_);
-    context_ = std::move(std::get<std::unique_ptr<AppContext>>(context));
+    PathManager* paths = nullptr;
+    Logger* logger = nullptr;
+    std::string root_text;
 
-    ServiceState state;
-    if (Result<ServiceState> loaded = load_state_from(state_directory_); ok(loaded)) {
-        state = std::get<ServiceState>(loaded);
-    }
-    state.current_root = to_forward_slashes(path_to_utf8(context_->paths->root()));
-    if (state.host_path.empty()) {
-        state.host_path = to_forward_slashes(path_to_utf8(executable_path()));
-    }
-    if (const Status saved = save_state_to(state_directory_, state); !ok(saved)) {
-        context_->logger->warn("Service", "写入服务状态失败：" + error_of(saved)->message);
-    }
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        context_ = std::move(std::get<std::unique_ptr<AppContext>>(context));
 
-    apply_http_locked();
+        ServiceState state;
+        if (Result<ServiceState> loaded = load_state_from(state_directory_); ok(loaded)) {
+            state = std::get<ServiceState>(loaded);
+        }
+        state.current_root = to_forward_slashes(path_to_utf8(context_->paths->root()));
+        if (state.host_path.empty()) {
+            state.host_path = to_forward_slashes(path_to_utf8(executable_path()));
+        }
+        if (const Status saved = save_state_to(state_directory_, state); !ok(saved)) {
+            context_->logger->warn("Service", "写入服务状态失败：" + error_of(saved)->message);
+        }
+
+        paths = context_->paths.get();
+        logger = context_->logger.get();
+        root_text = state.current_root;
+    }
 
     // 上次异常退出可能留下提权结果之类的临时文件，启动时顺手清掉。
-    if (const int cleaned = clean_temp_directory(*context_->paths); cleaned > 0) {
-        context_->logger->info("Service",
-                               "清理 temp/ 中 " + std::to_string(cleaned) + " 个遗留临时文件");
+    if (const int cleaned = clean_temp_directory(*paths); cleaned > 0) {
+        logger->info("Service", "清理 temp/ 中 " + std::to_string(cleaned) + " 个遗留临时文件");
     }
 
-    context_->logger->info("Service", "服务已启动，当前数据根：" + state.current_root);
+    // 必须在锁外：restart_http 会 join HTTP 工作线程（见其注释）。
+    restart_http();
+
+    logger->info("Service", "服务已启动，当前数据根：" + root_text);
     return std::monostate{};
 }
 
-void ServerRuntime::apply_http_locked() {
-    if (http_ != nullptr) {
-        http_->stop();
-        http_.reset();
+void ServerRuntime::restart_http() {
+    // 先把配置与旧实例摘出来（持锁），停旧实例放到锁外。
+    std::unique_ptr<server::HttpServer> previous;
+    std::string host;
+    std::string root;
+    int port = 0;
+    bool enabled = false;
+    Logger* logger = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        previous = std::move(http_);
+        if (context_ != nullptr) {
+            host = context_->server_config.host;
+            port = context_->server_config.port;
+            enabled = context_->server_config.enabled;
+            root = to_forward_slashes(path_to_utf8(context_->paths->root()));
+            logger = context_->logger.get();
+        }
     }
-    if (context_ == nullptr || !context_->server_config.enabled) {
+
+    // stop() 会 join HTTP 工作线程，而处理器要拿 mutex_ —— 必须在锁外做。
+    if (previous != nullptr) {
+        previous->stop();
+    }
+    if (!enabled) {
         return;
     }
+
+    // 浏览器与 CLI 走同一份业务实现。
+    server::BusinessHandler handler =
+        [this](const std::string& operation, const nlohmann::json& args) -> Result<nlohmann::json> {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (context_ == nullptr) {
+            return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+        }
+        return execute_business(*context_, operation, args);
+    };
 
     auto created = std::make_unique<server::HttpServer>();
-    const std::string root = to_forward_slashes(path_to_utf8(context_->paths->root()));
-    const Status started = created->start(context_->server_config.host,
-                                          context_->server_config.port, root,
-                                          context_->logger.get());
+    const Status started = created->start(host, port, root, logger, std::move(handler));
     if (!ok(started)) {
         // 端口被占用等：记 ERROR 日志，但**不中断**服务的其他功能。
-        context_->logger->error("Http", error_of(started)->message);
+        if (logger != nullptr) {
+            logger->error("Http", error_of(started)->message);
+        }
         return;
     }
+    if (logger != nullptr) {
+        logger->info("Http", "HTTP 监听 " + created->host() + ":" +
+                                 std::to_string(created->port()));
+    }
 
-    context_->logger->info("Http", "HTTP 监听 " + created->host() + ":" +
-                                       std::to_string(created->port()));
+    std::lock_guard<std::mutex> guard(mutex_);
     http_ = std::move(created);
 }
 
@@ -205,44 +236,49 @@ Status ServerRuntime::apply_root(const std::string& requested_root, std::string*
         return make_error(ErrorCode::ConfigError, "没有可用的数据根");
     }
 
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::string previous;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
 
-    if (context_ != nullptr) {
-        const std::string current =
-            to_forward_slashes(path_to_utf8(context_->paths->root()));
-        if (same_root(current, target)) {
-            if (effective_root != nullptr) {
-                *effective_root = current;
+        if (context_ != nullptr) {
+            const std::string current = to_forward_slashes(path_to_utf8(context_->paths->root()));
+            if (same_root(current, target)) {
+                if (effective_root != nullptr) {
+                    *effective_root = current;
+                }
+                return std::monostate{};
             }
-            return std::monostate{};
+        }
+
+        // 切换：新根初始化失败就保持原根不动（旧根数据也一个字节都不删）。
+        Result<std::unique_ptr<AppContext>> created =
+            initialize_service_context(path_from_utf8(target));
+        if (!ok(created)) {
+            return *error_of(created);
+        }
+
+        previous = context_ != nullptr ? to_forward_slashes(path_to_utf8(context_->paths->root()))
+                                       : std::string{};
+        context_ = std::move(std::get<std::unique_ptr<AppContext>>(created));
+        context_->logger->info("Main", "数据根切换: " +
+                                           (previous.empty() ? std::string("(无)") : previous) +
+                                           " -> " + target);
+
+        ServiceState state;
+        if (Result<ServiceState> loaded = load_state_from(state_directory_); ok(loaded)) {
+            state = std::get<ServiceState>(loaded);
+        }
+        state.current_root = target;
+        if (state.host_path.empty()) {
+            state.host_path = to_forward_slashes(path_to_utf8(executable_path()));
+        }
+        if (const Status saved = save_state_to(state_directory_, state); !ok(saved)) {
+            context_->logger->warn("Service", "写入服务状态失败：" + error_of(saved)->message);
         }
     }
 
-    // 切换：新根初始化失败就保持原根不动（旧根数据也一个字节都不删）。
-    Result<std::unique_ptr<AppContext>> created = initialize_service_context(path_from_utf8(target));
-    if (!ok(created)) {
-        return *error_of(created);
-    }
-
-    const std::string previous =
-        context_ != nullptr ? to_forward_slashes(path_to_utf8(context_->paths->root())) : std::string{};
-    context_ = std::move(std::get<std::unique_ptr<AppContext>>(created));
-    context_->logger->info("Main", "数据根切换: " + (previous.empty() ? std::string("(无)") : previous) +
-                                       " -> " + target);
-
-    ServiceState state;
-    if (Result<ServiceState> loaded = load_state_from(state_directory_); ok(loaded)) {
-        state = std::get<ServiceState>(loaded);
-    }
-    state.current_root = target;
-    if (state.host_path.empty()) {
-        state.host_path = to_forward_slashes(path_to_utf8(executable_path()));
-    }
-    if (const Status saved = save_state_to(state_directory_, state); !ok(saved)) {
-        context_->logger->warn("Service", "写入服务状态失败：" + error_of(saved)->message);
-    }
-
-    apply_http_locked();
+    // 换根后重新评估 server.json；必须在锁外（见 restart_http 注释）。
+    restart_http();
 
     if (effective_root != nullptr) {
         *effective_root = target;
@@ -281,21 +317,34 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
         return response;
     }
 
-    if (is_business_operation(request.op)) {
-        {
-            std::lock_guard<std::mutex> guard(mutex_);
-            if (context_ != nullptr && context_->logger != nullptr) {
-                context_->logger->warn("Ipc", "尚未实现的操作：" + request.op);
-            }
-        }
+    if (!is_known_business(request.op)) {
         response.ok = false;
-        response.error = make_error(ErrorCode::ServiceOperationFailed,
-                                    "操作尚未实现：" + request.op);
+        response.error = make_error(ErrorCode::InvalidArgument, "未知操作：" + request.op);
+        return response;
+    }
+
+    // 业务命令在 runtime 的锁下串行执行：同一时刻只有服务在写数据根，
+    // 命令之间也不会互相踩（V1 只有一个 CLI 窗口，串行足够）。
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (context_ == nullptr) {
+        response.ok = false;
+        response.error = make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+        return response;
+    }
+
+    Result<nlohmann::json> result = execute_business(*context_, request.op, request.args);
+    if (ok(result)) {
+        response.ok = true;
+        response.data = std::get<nlohmann::json>(result);
         return response;
     }
 
     response.ok = false;
-    response.error = make_error(ErrorCode::InvalidArgument, "未知操作：" + request.op);
+    response.error = *error_of(result);
+    if (context_->logger != nullptr) {
+        context_->logger->warn("Ipc", request.op + " 失败：" + code_string(response.error.code) +
+                                          " " + response.error.message);
+    }
     return response;
 }
 
@@ -314,11 +363,15 @@ void ServerRuntime::log_event(std::string_view module, const std::string& messag
 void ServerRuntime::request_stop() {
     stop_requested_ = true;
 
-    // 停止接受新请求后立刻停 HTTP：听不到新请求，进行中的事务由调用方等待。
-    std::lock_guard<std::mutex> guard(mutex_);
-    if (http_ != nullptr) {
-        http_->stop();
-        http_.reset();
+    // 停止接受新请求后立刻停 HTTP。**必须在锁外**：HTTP 的请求处理器要拿
+    // mutex_，持锁去 join 它的工作线程会互相等待。
+    std::unique_ptr<server::HttpServer> http;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        http = std::move(http_);
+    }
+    if (http != nullptr) {
+        http->stop();
     }
 }
 

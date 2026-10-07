@@ -72,3 +72,22 @@ FMT_TEST(String, 路径分隔符归一) {
                  std::string("repository/小谷/工作/test.txt"));
     FMT_CHECK_EQ(fmt::to_forward_slashes("already/fine"), std::string("already/fine"));
 }
+
+FMT_TEST(String, URL百分号编解码) {
+    // 中文名走 HTTP 路径时必须能被还原
+    FMT_CHECK_EQ(fmt::url_encode("工作"), std::string("%E5%B7%A5%E4%BD%9C"));
+    FMT_CHECK_EQ(fmt::url_decode("%E5%B7%A5%E4%BD%9C"), std::string("工作"));
+    FMT_CHECK_EQ(fmt::url_decode(fmt::url_encode("小谷姐姐麻辣烫")), std::string("小谷姐姐麻辣烫"));
+
+    // unreserved 字符保持原样
+    FMT_CHECK_EQ(fmt::url_encode("a-b_c.d~e"), std::string("a-b_c.d~e"));
+    FMT_CHECK_EQ(fmt::url_encode("a b"), std::string("a%20b"));
+    FMT_CHECK_EQ(fmt::url_encode("/"), std::string("%2F"));
+
+    // 非法转义原样保留，不猜
+    FMT_CHECK_EQ(fmt::url_decode("100%"), std::string("100%"));
+    FMT_CHECK_EQ(fmt::url_decode("%ZZ"), std::string("%ZZ"));
+    FMT_CHECK_EQ(fmt::url_decode("%2"), std::string("%2"));
+    // 路径里的 '+' 不是空格
+    FMT_CHECK_EQ(fmt::url_decode("a+b"), std::string("a+b"));
+}

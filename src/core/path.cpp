@@ -50,4 +50,11 @@ std::filesystem::path path_from_utf8(const std::string& text) {
     return std::filesystem::path(to_wide(text));
 }
 
+std::string relative_path_text(const std::filesystem::path& root,
+                               const std::filesystem::path& path) {
+    std::error_code code;
+    const std::filesystem::path relative = std::filesystem::relative(path, root, code);
+    return to_forward_slashes(path_to_utf8(code ? path : relative));
+}
+
 }  // namespace fmt

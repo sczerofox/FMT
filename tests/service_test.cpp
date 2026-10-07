@@ -88,6 +88,57 @@ FMT_TEST(Service, 状态查询与状态名一致) {
     }
 }
 
+FMT_TEST(Service, 管道能执行Bucket命令) {
+    fmt_test::TempDir temp("service-bucket");
+    const auto root = temp / "root";
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    fmt::ipc::Request create;
+    create.id = 10;
+    create.op = "bucket.create";
+    create.args["argv"] = nlohmann::json::array({"工作"});
+
+    const fmt::ipc::Response created = runtime.handle(create);
+    FMT_CHECK(created.ok);
+    if (created.ok) {
+        FMT_CHECK_EQ(created.data.value("bucket", std::string{}), std::string("工作"));
+        FMT_CHECK_EQ(created.data.value("current_bucket", std::string{}), std::string("工作"));
+    }
+    // 目录真的建出来了，用的是占位用户名 user。
+    // 中文路径分量必须走 path_from_utf8：直接拼窄字符串会按 ANSI 代码页转换。
+    FMT_CHECK(fmt::directory_exists(root / "repository" / "user" / fmt::path_from_utf8("工作")));
+
+    fmt::ipc::Request list;
+    list.id = 11;
+    list.op = "bucket.list";
+    const fmt::ipc::Response listed = runtime.handle(list);
+    FMT_CHECK(listed.ok);
+    if (listed.ok) {
+        FMT_CHECK_EQ(listed.data["buckets"].size(), std::size_t{1});
+        FMT_CHECK_EQ(listed.data["buckets"][0].value("name", std::string{}), std::string("工作"));
+        FMT_CHECK(listed.data["buckets"][0].value("is_current", false));
+    }
+
+    // 缺参数 -> FMT-001（参数错误）
+    fmt::ipc::Request bare;
+    bare.id = 12;
+    bare.op = "bucket.get";
+    const fmt::ipc::Response rejected = runtime.handle(bare);
+    FMT_CHECK(!rejected.ok);
+    FMT_CHECK(rejected.error.code == fmt::ErrorCode::InvalidArgument);
+
+    // 已登记但没实现的模块仍然是 FMT-602，而不是「未知操作」
+    fmt::ipc::Request pending;
+    pending.id = 13;
+    pending.op = "file.list";
+    const fmt::ipc::Response not_yet = runtime.handle(pending);
+    FMT_CHECK(!not_yet.ok);
+    FMT_CHECK(not_yet.error.code == fmt::ErrorCode::ServiceOperationFailed);
+    FMT_CHECK_EQ(fmt::exit_code(not_yet.error.code), 8);
+}
+
 FMT_TEST(Service, 运行体声明数据根并幂等初始化) {
     fmt_test::TempDir temp("service-runtime");
     const auto root_a = temp / "A";

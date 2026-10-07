@@ -30,6 +30,138 @@ struct SharedState {
 
 std::string dump(const nlohmann::json& value) { return value.dump(2); }
 
+// 错误码 -> HTTP 状态码。映射表见技术文档 12.5：
+// 400 参数错误 / 403 权限与不可用 / 404 不存在 / 409 冲突 / 500 内部错误。
+int http_status_for(ErrorCode code) {
+    switch (code) {
+        case ErrorCode::InvalidArgument:
+        case ErrorCode::PathTooLong:
+        case ErrorCode::PathEscape:
+        case ErrorCode::FileNameEmpty:
+        case ErrorCode::FileNameInvalidChar:
+        case ErrorCode::FileNameSeparator:
+        case ErrorCode::FileNameReserved:
+        case ErrorCode::FileNameTooLong:
+        case ErrorCode::BucketNameInvalid:
+        case ErrorCode::UrlInvalid:
+        case ErrorCode::SizeLimitExceeded:
+        case ErrorCode::HttpRequestInvalid:
+        case ErrorCode::PreviewUnsupported:
+            return 400;
+        case ErrorCode::PermissionDenied:
+        case ErrorCode::ShareExpired:
+        case ErrorCode::ShareDownloadLimitReached:
+        case ErrorCode::ShareFileUnavailable:
+            return 403;
+        case ErrorCode::FileNotFound:
+        case ErrorCode::BucketNotFound:
+        case ErrorCode::TrashEntryNotFound:
+        case ErrorCode::ShareNotFound:
+        case ErrorCode::NoCurrentBucket:
+        case ErrorCode::RestoreBucketMissing:
+            return 404;
+        case ErrorCode::FileAlreadyExists:
+        case ErrorCode::FileNameConflict:
+        case ErrorCode::BucketAlreadyExists:
+        case ErrorCode::BucketInUse:
+        case ErrorCode::Md5Duplicate:
+        case ErrorCode::RestoreConflict:
+            return 409;
+        default:
+            return 500;
+    }
+}
+
+// 位置参数：管道与 HTTP 用同一套编码，参数都放在 args.argv 里。
+// 路径里的中文会被客户端百分号编码，这里负责解码回 UTF-8。
+nlohmann::json args_with_name(std::string name) {
+    nlohmann::json args = nlohmann::json::object();
+    args["argv"] = nlohmann::json::array({std::move(name)});
+    return args;
+}
+
+nlohmann::json args_with_encoded_name(const std::string& encoded) {
+    return args_with_name(url_decode(encoded));
+}
+
+// 请求体：接受 {"name":"工作"}，也接受与管道一致的 {"argv":["工作"]}。
+Result<nlohmann::json> args_from_body(const httplib::Request& request) {
+    if (request.body.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "请求体不能为空");
+    }
+
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(request.body);
+    } catch (const nlohmann::json::exception& error) {
+        return make_error(ErrorCode::JsonParseError,
+                          std::string("请求体不是合法 JSON：") + error.what());
+    }
+    if (!body.is_object()) {
+        return make_error(ErrorCode::InvalidArgument, "请求体必须是 JSON 对象");
+    }
+    if (const auto iterator = body.find("argv");
+        iterator != body.end() && iterator->is_array() && !iterator->empty() &&
+        (*iterator)[0].is_string()) {
+        return body;
+    }
+    if (const auto iterator = body.find("name");
+        iterator != body.end() && iterator->is_string()) {
+        return args_with_name(iterator->get<std::string>());
+    }
+    return make_error(ErrorCode::InvalidArgument, "请求体缺少 name 字段");
+}
+
+void respond(httplib::Response& response, const Result<nlohmann::json>& result) {
+    if (ok(result)) {
+        response.status = 200;
+        response.set_content(dump(envelope_ok(std::get<nlohmann::json>(result))),
+                             kJsonContentType);
+        return;
+    }
+    const Error& error = *error_of(result);
+    response.status = http_status_for(error.code);
+    response.set_content(dump(envelope_error(error)), kJsonContentType);
+}
+
+// 业务路由表见技术文档 12.3；这里只做「路径 -> op + 参数」的翻译。
+void register_business_routes(httplib::Server* server, BusinessHandler handler) {
+    const auto run = [handler](const std::string& operation, const nlohmann::json& args,
+                               httplib::Response& response) {
+        if (!handler) {
+            respond(response, make_error(ErrorCode::ServiceOperationFailed,
+                                         "HTTP 未接入业务处理"));
+            return;
+        }
+        respond(response, handler(operation, args));
+    };
+
+    server->Get("/api/bucket", [run](const httplib::Request&, httplib::Response& response) {
+        run("bucket.list", nlohmann::json::object(), response);
+    });
+    server->Post("/api/bucket", [run](const httplib::Request& request,
+                                      httplib::Response& response) {
+        const Result<nlohmann::json> args = args_from_body(request);
+        if (!ok(args)) {
+            respond(response, *error_of(args));
+            return;
+        }
+        run("bucket.create", std::get<nlohmann::json>(args), response);
+    });
+    server->Post(R"(/api/bucket/([^/]+)/use)",
+                 [run](const httplib::Request& request, httplib::Response& response) {
+                     run("bucket.use", args_with_encoded_name(request.matches[1]), response);
+                 });
+    server->Get(R"(/api/bucket/([^/]+))",
+                [run](const httplib::Request& request, httplib::Response& response) {
+                    run("bucket.get", args_with_encoded_name(request.matches[1]), response);
+                });
+    server->Delete(R"(/api/bucket/([^/]+))",
+                   [run](const httplib::Request& request, httplib::Response& response) {
+                       run("bucket.delete", args_with_encoded_name(request.matches[1]), response);
+                   });
+}
+
 }  // namespace
 
 struct HttpServer::Impl {
@@ -45,7 +177,8 @@ HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
 
 HttpServer::~HttpServer() { stop(); }
 
-Status HttpServer::start(const std::string& host, int port, std::string data_root, Logger* logger) {
+Status HttpServer::start(const std::string& host, int port, std::string data_root, Logger* logger,
+                         BusinessHandler handler) {
     if (impl_->running.load()) {
         return make_error(ErrorCode::InvalidArgument, "HTTP 服务已经在运行");
     }
@@ -71,7 +204,10 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
                            response.set_content(dump(envelope_ok(data)), kJsonContentType);
                        });
 
-    // 业务路由（bucket / file / share / trash）随阶段 4/5 一起接入。
+    // 业务路由：与命名管道共用同一份实现（见 register_business_routes）。
+    register_business_routes(impl_->server.get(), std::move(handler));
+
+    // 兜底：已经登记的模块里还没实现的操作。
     impl_->server->Get(R"(/api/.*)", [](const httplib::Request& request,
                                         httplib::Response& response) {
         response.status = 500;

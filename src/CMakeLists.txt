@@ -22,6 +22,9 @@ add_subdirectory(ipc)
 # Windows Service：SCM 四条命令与服务端运行体
 add_subdirectory(service)
 
+# 业务模块
+add_subdirectory(bucket)
+
 # 命令行界面（两条入口中的 CLI 一侧）
 add_subdirectory(cli)
 

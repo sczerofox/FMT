@@ -10,6 +10,9 @@
 namespace fmt {
 namespace {
 
+// V1 的占位用户名（没有用户系统）。
+constexpr std::string_view kDefaultUser = "user";
+
 struct ExpectedFile {
     std::filesystem::path path;
     nlohmann::json value;
@@ -115,9 +118,21 @@ Result<std::unique_ptr<PathManager>> initialize_root(const std::filesystem::path
     }
 
     // 配置必须能读出来：损坏时报错让调用方决定怎么办，绝不悄悄重置。
-    if (auto config = load_config(*paths); !ok(config)) {
+    Result<Config> config = load_config(*paths);
+    if (!ok(config)) {
         return *error_of(config);
     }
+
+    // V1 没有用户系统：current_user 为空时用占位名顶上（需求：「不做用户先用 user
+    // 代替」）。正式用户系统以后再做，这里只是让 Bucket 有地方落。
+    Config loaded = std::get<Config>(config);
+    if (loaded.current_user.empty()) {
+        loaded.current_user = kDefaultUser;
+        if (const Status status = save_config(*paths, loaded); !ok(status)) {
+            return *error_of(status);
+        }
+    }
+
     if (auto server = load_server_config(*paths); !ok(server)) {
         return *error_of(server);
     }
