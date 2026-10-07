@@ -3,6 +3,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/storage/storage.hpp"
 
@@ -147,6 +148,34 @@ Status save_server_config(const PathManager& paths, const ServerConfig& config) 
         return status;
     }
     return write_json_file(paths.server_file(), to_json(config));
+}
+
+Status ensure_default_config_files(const PathManager& paths, std::vector<std::string>* created) {
+    if (const Status status = ensure_directory(paths.config()); !ok(status)) {
+        return status;
+    }
+
+    if (!file_exists(paths.config_file())) {
+        if (const Status status = write_json_file(paths.config_file(), to_json(Config{}));
+            !ok(status)) {
+            return status;
+        }
+        if (created != nullptr) {
+            created->push_back(to_forward_slashes(path_to_utf8(paths.config_file())));
+        }
+    }
+
+    if (!file_exists(paths.server_file())) {
+        if (const Status status = write_json_file(paths.server_file(), to_json(ServerConfig{}));
+            !ok(status)) {
+            return status;
+        }
+        if (created != nullptr) {
+            created->push_back(to_forward_slashes(path_to_utf8(paths.server_file())));
+        }
+    }
+
+    return std::monostate{};
 }
 
 }  // namespace fmt

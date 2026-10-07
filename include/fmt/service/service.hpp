@@ -65,6 +65,12 @@ State query_state();
 // 已安装服务注册的可执行文件路径（去掉引号）；未安装返回空字符串。
 Result<std::string> installed_binary_path();
 
+// 服务最近一次启动失败的原因。
+// ServiceMain 初始化失败时会把 **FMT 编号** 写进 dwServiceSpecificExitCode
+// （不是退出码），CLI 据此能说出「FMT-008 配置错误」，而不是盲目重装服务。
+// 没有失败信息时返回错误。
+Result<ErrorCode> last_start_failure();
+
 // ---- 四条命令：需要管理员权限 ----
 // install：创建服务（自动启动、LocalSystem）-> 配 Recovery -> 可选立即启动。
 //          已存在返回 FMT-600。

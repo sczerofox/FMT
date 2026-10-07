@@ -97,6 +97,9 @@ FMT_TEST(Service, 运行体声明数据根并幂等初始化) {
     const fmt::ipc::Response switched = runtime.handle(hello);
     FMT_CHECK(switched.ok);
     FMT_CHECK_EQ(switched.id, 1);
+    // hello 要告诉 CLI「换根了没有、从哪换过来的」，双击时才好提示
+    FMT_CHECK(switched.data["switched"].get<bool>());
+    FMT_CHECK(switched.data.contains("previous_root"));
     FMT_CHECK(fmt::directory_exists(root_b / "repository"));
     FMT_CHECK(fmt::directory_exists(root_b / "data"));
     FMT_CHECK(fmt::file_exists(root_b / "config" / "config.json"));
@@ -111,9 +114,10 @@ FMT_TEST(Service, 运行体声明数据根并幂等初始化) {
     FMT_CHECK(std::get<fmt::service::ServiceState>(state).current_root.find("B") !=
               std::string::npos);
 
-    // 再声明同一个根：不重复切换，仍然成功
+    // 再声明同一个根：不重复切换，但仍然成功
     const fmt::ipc::Response again = runtime.handle(hello);
     FMT_CHECK(again.ok);
+    FMT_CHECK(!again.data["switched"].get<bool>());
 }
 
 FMT_TEST(Service, 运行体把控制事件写进日志) {

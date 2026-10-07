@@ -62,7 +62,8 @@ public:
 private:
     static std::filesystem::path state_directory_default();
 
-    Status apply_root(const std::string& requested_root, std::string* effective_root);
+    Status apply_root(const std::string& requested_root, std::string* effective_root,
+                      std::string* previous_root, bool* switched);
     void serve(ipc::PipeConnection connection);
     // 按当前根的 server.json 决定是否（重新）启动 HTTP 监听；调用时必须持有 mutex_。
     void apply_http_locked();

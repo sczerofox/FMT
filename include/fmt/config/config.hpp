@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "fmt/common/error.hpp"
 #include "fmt/core/path_manager.hpp"
@@ -44,5 +45,10 @@ Status save_config(const PathManager& paths, const Config& config);
 
 Result<ServerConfig> load_server_config(const PathManager& paths);
 Status save_server_config(const PathManager& paths, const ServerConfig& config);
+
+// 缺失时写出默认的 config.json / server.json（已存在一律不动）。
+// 默认值只定义在本模块，数据根初始化只调用，不重复一份字段表。
+// 写出的文件路径追加进 created（UTF-8、正斜杠），便于调用方报告。
+Status ensure_default_config_files(const PathManager& paths, std::vector<std::string>* created);
 
 }  // namespace fmt

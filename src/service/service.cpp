@@ -77,8 +77,10 @@ void WINAPI service_main(DWORD, LPWSTR*) {
     }
     if (!ok(initialized)) {
         const Error& error = *error_of(initialized);
+        // dwServiceSpecificExitCode 存 FMT 编号（不是退出码）：CLI 查得到，
+        // 于是能打印「FMT-008 配置错误」，而不是只会说「启动失败」。
         report(SERVICE_STOPPED, ERROR_SERVICE_SPECIFIC_ERROR, 0,
-               static_cast<DWORD>(exit_code(error.code)));
+               static_cast<DWORD>(static_cast<int>(error.code)));
         return;
     }
 
@@ -288,6 +290,51 @@ Result<std::string> installed_binary_path() {
         path = path.substr(1, path.size() - 2);
     }
     return path;
+}
+
+Result<ErrorCode> last_start_failure() {
+    Result<SC_HANDLE> manager = open_manager(SC_MANAGER_CONNECT);
+    if (!ok(manager)) {
+        return *error_of(manager);
+    }
+    const SC_HANDLE manager_handle = std::get<SC_HANDLE>(manager);
+
+    SC_HANDLE service = OpenServiceW(manager_handle, kServiceName, SERVICE_QUERY_STATUS);
+    if (service == nullptr) {
+        const DWORD error = GetLastError();
+        CloseServiceHandle(manager_handle);
+        if (error == ERROR_SERVICE_DOES_NOT_EXIST) {
+            return make_error(ErrorCode::ServiceNotInstalled, "服务未安装");
+        }
+        return make_error(ErrorCode::ServiceOperationFailed,
+                          "打开服务失败（Win32 " + std::to_string(error) + "）");
+    }
+
+    SERVICE_STATUS_PROCESS status{};
+    DWORD needed = 0;
+    const BOOL queried = QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                                              reinterpret_cast<LPBYTE>(&status), sizeof(status),
+                                              &needed);
+    CloseServiceHandle(service);
+    CloseServiceHandle(manager_handle);
+
+    if (!queried) {
+        return make_error(ErrorCode::ServiceOperationFailed, "查询服务状态失败");
+    }
+    if (status.dwWin32ExitCode != ERROR_SERVICE_SPECIFIC_ERROR ||
+        status.dwServiceSpecificExitCode == 0) {
+        return make_error(ErrorCode::ServiceOperationFailed,
+                          "服务没有留下失败编号（Win32 " + std::to_string(status.dwWin32ExitCode) +
+                              "）");
+    }
+
+    const std::string number = std::to_string(status.dwServiceSpecificExitCode);
+    bool known = false;
+    const ErrorCode code = code_from_string(number, &known);
+    if (!known) {
+        return make_error(ErrorCode::ServiceOperationFailed, "无法识别的失败编号：" + number);
+    }
+    return code;
 }
 
 Status install(const std::string& binary_path, bool start_after_install) {

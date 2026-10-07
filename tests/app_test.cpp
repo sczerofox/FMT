@@ -9,7 +9,6 @@
 #include "fmt/storage/storage.hpp"
 #include "fmt_test.hpp"
 #include "temp_dir.hpp"
-
 FMT_TEST(App, 初始化建出六个目录与默认JSON) {
     fmt_test::TempDir temp("app-init");
     const auto root = temp / "FMT";
@@ -71,6 +70,63 @@ FMT_TEST(App, 初始化幂等且不碰已有数据) {
     FMT_CHECK_EQ(std::get<fmt::Config>(reloaded).current_user, std::string("小谷"));
     FMT_CHECK_EQ(std::get<fmt::Config>(reloaded).current_bucket, std::string("工作"));
     FMT_CHECK_EQ(std::get<fmt::Config>(reloaded).max_upload_size, std::uint64_t{10485760});
+}
+
+FMT_TEST(App, 检查能报出缺失的目录与文件) {
+    fmt_test::TempDir temp("app-check");
+    const fmt::PathManager paths{temp / "FMT"};
+
+    const fmt::RootReport report = fmt::check_root(paths);
+    FMT_CHECK(!report.complete());
+    FMT_CHECK_EQ(report.missing_directories.size(), std::size_t{6});
+    // 四个集合文件 + config.json + server.json
+    FMT_CHECK_EQ(report.missing_files.size(), std::size_t{6});
+    FMT_CHECK(report.broken_files.empty());
+}
+
+FMT_TEST(App, 补齐只补缺失且幂等) {
+    fmt_test::TempDir temp("app-ensure");
+    const auto root = temp / "FMT";
+    const fmt::PathManager paths{root};
+
+    const auto first = fmt::ensure_root(paths);
+    FMT_CHECK(fmt::ok(first));
+    FMT_CHECK_EQ(std::get<fmt::RootRepair>(first).created_directories.size(), std::size_t{6});
+    FMT_CHECK_EQ(std::get<fmt::RootRepair>(first).created_files.size(), std::size_t{6});
+    FMT_CHECK(fmt::check_root(paths).complete());
+
+    // 再补一次：什么都不该再建
+    const auto second = fmt::ensure_root(paths);
+    FMT_CHECK(fmt::ok(second));
+    FMT_CHECK(std::get<fmt::RootRepair>(second).created_directories.empty());
+    FMT_CHECK(std::get<fmt::RootRepair>(second).created_files.empty());
+
+    // 用户自己放的文件不受影响
+    const auto mine = root / fmt::path_from_utf8("说明.txt");
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(mine, "别删我")));
+    FMT_CHECK(fmt::ok(fmt::ensure_root(paths)));
+    FMT_CHECK(fmt::file_exists(mine));
+}
+
+FMT_TEST(App, 损坏的JSON只报告不修复) {
+    fmt_test::TempDir temp("app-broken-check");
+    const auto root = temp / "FMT";
+    const fmt::PathManager paths{root};
+    FMT_CHECK(fmt::ok(fmt::ensure_root(paths)));
+
+    const std::string broken = "{\"version\":1,\"files\":[}";
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(paths.file_data(), broken)));
+
+    const fmt::RootReport report = fmt::check_root(paths);
+    FMT_CHECK(!report.complete());
+    FMT_CHECK(report.missing_files.empty());
+    FMT_CHECK_EQ(report.broken_files.size(), std::size_t{1});
+    FMT_CHECK(report.broken_files[0].find("FMT-006") != std::string::npos);
+
+    // 补齐不会碰它：冻结规则是「损坏的 JSON 不静默重置」
+    FMT_CHECK(fmt::ok(fmt::ensure_root(paths)));
+    FMT_CHECK_EQ(std::get<std::string>(fmt::read_text_file(paths.file_data())), broken);
+    FMT_CHECK_EQ(fmt::check_root(paths).broken_files.size(), std::size_t{1});
 }
 
 FMT_TEST(App, 服务上下文打开日志并加载配置) {

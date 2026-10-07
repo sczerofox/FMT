@@ -1,6 +1,7 @@
 #include "fmt/core/app.hpp"
 
 #include <utility>
+#include <vector>
 
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
@@ -9,46 +10,111 @@
 namespace fmt {
 namespace {
 
-// 缺失的 JSON 文件补上默认内容；已存在的一律不碰。
-Status ensure_default_files(const PathManager& paths) {
-    const struct {
-        std::filesystem::path path;
-        nlohmann::json value;
-    } defaults[] = {
+struct ExpectedFile {
+    std::filesystem::path path;
+    nlohmann::json value;
+};
+
+// 集合型默认文件；与 PathManager 的路径一一对应。
+std::vector<ExpectedFile> default_data_files(const PathManager& paths) {
+    return {
         {paths.file_data(), make_collection(1, "files")},
         {paths.share_data(), make_collection(1, "shares")},
         {paths.trash_data(), make_collection(1, "trash")},
         {paths.user_data(), make_collection(1, "users")},
     };
+}
 
-    for (const auto& entry : defaults) {
-        if (file_exists(entry.path)) {
-            continue;
-        }
-        if (const Status status = write_json_file(entry.path, entry.value); !ok(status)) {
-            return status;
-        }
-    }
-    return std::monostate{};
+// 单例型配置文件：默认值的唯一来源在 config 模块，这里只关心「缺不缺」。
+std::vector<std::filesystem::path> default_config_files(const PathManager& paths) {
+    return {paths.config_file(), paths.server_file()};
+}
+
+std::string describe(const std::filesystem::path& path, const Error& error) {
+    return to_forward_slashes(path_to_utf8(path)) + "（" + code_string(error.code) + " " +
+           error.message + "）";
 }
 
 }  // namespace
 
-Result<std::unique_ptr<PathManager>> initialize_root(const std::filesystem::path& root) {
-    auto paths = std::make_unique<PathManager>(root);
+RootReport check_root(const PathManager& paths) {
+    RootReport report;
 
     for (const std::string& name : PathManager::required_directories()) {
-        const Status status = ensure_directory(root / path_from_utf8(name));
-        if (!ok(status)) {
-            return *error_of(status);
+        if (!directory_exists(paths.root() / path_from_utf8(name))) {
+            report.missing_directories.push_back(name);
         }
     }
 
-    if (const Status status = ensure_default_files(*paths); !ok(status)) {
+    // 存在就必须读得出来、版本必须受支持——这就是「打开读取确认完整性」。
+    const auto inspect = [&report](const std::filesystem::path& path) {
+        if (!file_exists(path)) {
+            report.missing_files.push_back(to_forward_slashes(path_to_utf8(path)));
+            return;
+        }
+
+        Result<nlohmann::json> parsed = read_json_file(path);
+        if (!ok(parsed)) {
+            report.broken_files.push_back(describe(path, *error_of(parsed)));
+            return;
+        }
+
+        const Status version = check_version(std::get<nlohmann::json>(parsed), 1);
+        if (!ok(version)) {
+            report.broken_files.push_back(describe(path, *error_of(version)));
+        }
+    };
+
+    for (const ExpectedFile& expected : default_data_files(paths)) {
+        inspect(expected.path);
+    }
+    for (const std::filesystem::path& path : default_config_files(paths)) {
+        inspect(path);
+    }
+
+    return report;
+}
+
+Result<RootRepair> ensure_root(const PathManager& paths) {
+    RootRepair repair;
+
+    for (const std::string& name : PathManager::required_directories()) {
+        const std::filesystem::path directory = paths.root() / path_from_utf8(name);
+        if (directory_exists(directory)) {
+            continue;
+        }
+        if (const Status status = ensure_directory(directory); !ok(status)) {
+            return *error_of(status);
+        }
+        repair.created_directories.push_back(name);
+    }
+
+    for (const ExpectedFile& expected : default_data_files(paths)) {
+        if (file_exists(expected.path)) {
+            continue;  // 已存在一律不动，哪怕它损坏
+        }
+        if (const Status status = write_json_file(expected.path, expected.value); !ok(status)) {
+            return *error_of(status);
+        }
+        repair.created_files.push_back(to_forward_slashes(path_to_utf8(expected.path)));
+    }
+
+    if (const Status status = ensure_default_config_files(paths, &repair.created_files);
+        !ok(status)) {
         return *error_of(status);
     }
 
-    // 配置文件也走同一套「不存在则写默认」的规则。
+    return repair;
+}
+
+Result<std::unique_ptr<PathManager>> initialize_root(const std::filesystem::path& root) {
+    auto paths = std::make_unique<PathManager>(root);
+
+    if (Result<RootRepair> repaired = ensure_root(*paths); !ok(repaired)) {
+        return *error_of(repaired);
+    }
+
+    // 配置必须能读出来：损坏时报错让调用方决定怎么办，绝不悄悄重置。
     if (auto config = load_config(*paths); !ok(config)) {
         return *error_of(config);
     }

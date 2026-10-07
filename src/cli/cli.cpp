@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "fmt/common/string.hpp"
+#include "fmt/core/app.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/core/path_manager.hpp"
 #include "fmt/ipc/pipe.hpp"
@@ -91,8 +92,10 @@ void print_usage() {
         "  fmt.exe service uninstall    停止并删除服务（需要管理员权限）\n"
         "  fmt.exe service start        启动服务（需要管理员权限）\n"
         "  fmt.exe service stop         停止服务（需要管理员权限）\n"
+        "  fmt.exe service status       查询服务状态（不需要管理员权限）\n"
         "\n"
         "直接双击进入交互式命令行：\n"
+        "  fmt> service status\n"
         "  fmt> service stop\n"
         "  fmt> file list\n"
         "  fmt> exit\n"
@@ -206,6 +209,9 @@ struct Session {
     ipc::PipeClient client;
     bool connected = false;
     int next_id = 1;
+    // hello 的回复：服务是否因为我们的声明换了数据根。
+    bool root_switched = false;
+    std::string previous_root;
 };
 
 Status ensure_connected(Session& session, const Options& options) {
@@ -230,13 +236,124 @@ Status ensure_connected(Session& session, const Options& options) {
     if (!ok(response)) {
         return *error_of(response);
     }
-    if (!std::get<ipc::Response>(response).ok) {
-        return std::get<ipc::Response>(response).error;
+    const ipc::Response& hello_response = std::get<ipc::Response>(response);
+    if (!hello_response.ok) {
+        return hello_response.error;
     }
 
+    session.root_switched = hello_response.data.value("switched", false);
+    session.previous_root = hello_response.data.value("previous_root", std::string{});
     session.connected = true;
+
     log_info("Ipc", "已连接服务，数据根声明为：" + to_forward_slashes(options.data_root));
     return std::monostate{};
+}
+
+std::string join(const std::vector<std::string>& parts) {
+    std::string text;
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) {
+            text += "、";
+        }
+        text += parts[i];
+    }
+    return text;
+}
+
+// ---- 双击第 1 步：数据根的检查与补齐 ----
+//
+// 只补缺失的目录与文件，已存在的一律不动；损坏的 JSON 只报告、绝不重置
+// （冻结规则：JSON 损坏不能静默重置）。
+//
+// 必须在打开日志器**之前**调用：日志目录 log/ 也归这一步建，否则
+// 「新建目录」的清单会少一个 log（日志器自己把它建掉了）。
+// 打印出来的每一行同时收进 notes，日志器打开后再补记进日志。
+void prepare_data_root(const Options& options, std::vector<std::string>* notes) {
+    const PathManager paths{path_from_utf8(options.data_root)};
+    const RootReport report = check_root(paths);
+    const std::string root_text = to_forward_slashes(options.data_root);
+
+    const auto emit = [notes](const std::string& line) {
+        std::printf("  %s\n", line.c_str());
+        if (notes != nullptr) {
+            notes->push_back("数据根" + line);
+        }
+    };
+
+    std::printf("数据根：%s\n", root_text.c_str());
+    if (notes != nullptr) {
+        notes->push_back("数据根检查：" + root_text);
+    }
+
+    Result<RootRepair> repaired = ensure_root(paths);
+    if (!ok(repaired)) {
+        const Error& error = *error_of(repaired);
+        emit("无法补齐：" + code_string(error.code) + " " + error.message);
+        return;  // 不阻断：服务自己启动时还会再试一次
+    }
+
+    const RootRepair& done = std::get<RootRepair>(repaired);
+    if (!done.created_directories.empty()) {
+        emit("新建目录：" + join(done.created_directories));
+    }
+    if (!done.created_files.empty()) {
+        emit("新建文件：" + join(done.created_files));
+    }
+    if (done.created_directories.empty() && done.created_files.empty()) {
+        emit("数据根完整");
+    }
+
+    for (const std::string& broken : report.broken_files) {
+        emit("损坏（未自动修复）：" + broken);
+    }
+}
+
+// ---- service status：查状态，不需要管理员权限，也就不该弹 UAC ----
+int show_service_status() {
+    const service::State state = service::query_state();
+    const std::string name(service::state_name(state));
+
+    std::printf("服务状态：%s\n", name.c_str());
+    log_info("Cli", "service status：" + name);
+
+    if (state == service::State::NotInstalled) {
+        log_error("Cli", "service status：服务未安装（FMT-601）");
+        std::fprintf(stderr, "错误码：%d\n", exit_code(ErrorCode::ServiceNotInstalled));
+        return exit_code(ErrorCode::ServiceNotInstalled);
+    }
+
+    if (Result<std::string> host = service::installed_binary_path(); ok(host)) {
+        const std::string path = to_forward_slashes(std::get<std::string>(host));
+        std::printf("服务宿主：%s\n", path.c_str());
+        log_info("Cli", "服务宿主：" + path);
+    }
+    if (Result<service::ServiceState> recorded = service::load_state(); ok(recorded)) {
+        const std::string root = std::get<service::ServiceState>(recorded).current_root;
+        if (!root.empty()) {
+            std::printf("服务数据根：%s\n", root.c_str());
+            log_info("Cli", "服务数据根：" + root);
+        }
+    }
+
+    std::printf("错误码：0\n");
+    return 0;
+}
+
+// 数据根/配置类的问题靠重装服务解决不了，别白弹一次 UAC。
+bool is_data_root_problem(ErrorCode code) {
+    switch (code) {
+        case ErrorCode::JsonParseError:
+        case ErrorCode::JsonWriteError:
+        case ErrorCode::JsonUnsupportedVersion:
+        case ErrorCode::ConfigError:
+        case ErrorCode::DirectoryCreateFailed:
+        case ErrorCode::StorageError:
+        case ErrorCode::IoError:
+        case ErrorCode::PathEscape:
+            return true;
+        default:
+            return false;
+    }
 }
 
 void print_failure(const Error& error) {
@@ -297,12 +414,11 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
 }
 
 // ---- 交互循环 ----
-int run_interactive(const Options& options, service::State state) {
+int run_interactive(const Options& options, service::State state, Session& session) {
     std::printf("FMT %.*s\n", static_cast<int>(version::STRING.size()), version::STRING.data());
     std::printf("%s\n", service_state_line(state).c_str());
     log_info("Cli", "进入交互循环，数据根：" + to_forward_slashes(options.data_root));
 
-    Session session;
     bool blank_before_prompt = true;  // 横幅之后先空一行，输出不会和提示符挤在一起
     while (true) {
         if (blank_before_prompt) {
@@ -336,8 +452,12 @@ int run_interactive(const Options& options, service::State state) {
             continue;
         }
         if (head == "service") {
+            if (parts.size() >= 2 && parts[1] == "status") {
+                show_service_status();  // 查询不需要提权
+                continue;
+            }
             if (parts.size() < 2 || !is_user_service_command(parts[1])) {
-                std::fprintf(stderr, "用法：service install | uninstall | start | stop\n");
+                std::fprintf(stderr, "用法：service install | uninstall | start | stop | status\n");
                 continue;
             }
             run_service_command(parts[1], options);
@@ -354,46 +474,115 @@ int run_interactive(const Options& options, service::State state) {
     return 0;
 }
 
-// ---- 双击引导：查 SCM -> 需要时提权 -> 进循环 ----
+// ---- 双击引导 ----
+//
+//   1. 数据根：检查完整性 + 补齐缺失（只补不缺）
+//   2. 服务：未安装 -> 安装并启动；已安装未运行 -> 启动；运行中 -> 不动、不弹 UAC
+//      启动失败 -> 先读 SCM 留下的失败编号；数据根/配置类问题不重装（重装也解决不了），
+//                  其它情况重装一次（卸载 + 安装，一次 UAC）
+//   3. 服务宿主 exe 丢失 -> 询问是否重装指向当前目录
+//   4. 服务在跑就把数据根声明过去，然后进交互循环
+service::State recover_from_start_failure(const Options& options, service::State current) {
+    ErrorCode failure = ErrorCode::ServiceOperationFailed;
+    bool known = false;
+
+    if (Result<ErrorCode> reported = service::last_start_failure(); ok(reported)) {
+        failure = std::get<ErrorCode>(reported);
+        known = true;
+    }
+
+    const std::string reason = code_string(failure) + " " + std::string(default_message(failure));
+    std::printf("服务启动失败：%s\n", reason.c_str());
+    log_error("Service", "服务启动失败：" + reason);
+
+    if (known && is_data_root_problem(failure)) {
+        std::printf("这是数据根或配置的问题，重新安装服务解决不了；请先处理上面的错误\n");
+        log_error("Service", "判定为数据根/配置问题，跳过重装");
+        return current;
+    }
+
+    std::printf("尝试重新安装服务（卸载 + 安装，一次 UAC）\n");
+    log_info("Service", "启动失败，尝试 reinstall");
+    run_service_command("reinstall", options);
+
+    const service::State after = settle_state(service::query_state(), 8000);
+    if (after != service::State::Running) {
+        std::printf("重新安装后服务仍未运行，请查看 log/fmt.log\n");
+        log_error("Service", "reinstall 之后服务仍未运行");
+    }
+    return after;
+}
+
+// 服务宿主 exe 是不是还在：不在就得重装指向当前目录。
+void check_service_host(const Options& options) {
+    Result<std::string> host = service::installed_binary_path();
+    if (!ok(host)) {
+        return;
+    }
+    const std::string path = std::get<std::string>(host);
+    if (iequals(path, options.self_path) || std::filesystem::exists(path_from_utf8(path))) {
+        return;
+    }
+
+    log_warn("Service", "服务宿主 exe 已丢失：" + path);
+    std::printf("服务指向的可执行文件已丢失：%s\n", path.c_str());
+    std::printf("是否重新安装服务并指向当前目录？(y/N) ");
+    std::fflush(stdout);
+
+    std::string answer;
+    std::getline(std::cin, answer);
+    if (!answer.empty() && (answer[0] == 'y' || answer[0] == 'Y')) {
+        run_service_command("reinstall", options);
+    } else {
+        log_info("Service", "用户放弃重新安装");
+    }
+}
+
 int bootstrap_and_run(const Options& options) {
+    // 数据根已经在 run() 里补过了（那一步要在日志器之前做）。
+    // 2. 服务状态
     service::State state = service::query_state();
     log_info("Service", "当前状态：" + std::string(service::state_name(state)));
+    std::printf("服务状态：%s\n", std::string(service::state_name(state)).c_str());
 
     if (state == service::State::NotInstalled) {
-        log_info("Service", "服务未安装 -> 首次安装并启动");
-        run_service_command("install", options);  // 首次双击：一次 UAC，装 + 启动
-        state = service::query_state();
-    } else if (state == service::State::Stopped) {
-        log_info("Service", "服务已停止 -> 启动");
-        run_service_command("start", options);
-        state = service::query_state();
-    } else {
+        log_info("Service", "服务未安装 -> 安装并启动");
+        run_service_command("install", options);  // 一次 UAC：装 + 启动
+        state = settle_state(service::query_state(), 8000);
+    } else if (state == service::State::Running) {
         log_info("Service", "服务运行中，不重复安装、不弹 UAC");
+    } else {
+        // 已安装但没在运行（已停止 / 正在停止 / 正在启动）：先尝试启动
+        log_info("Service", "服务未在运行 -> 尝试启动");
+        run_service_command("start", options);
+        state = settle_state(service::query_state(), 8000);
+
+        if (state != service::State::Running) {
+            state = recover_from_start_failure(options, state);
+        }
     }
-    // 运行中就不动它，也不弹 UAC。
-    state = settle_state(state, 5000);
     log_info("Service", "落定后的状态：" + std::string(service::state_name(state)));
 
-    // 宿主 exe 是不是还在：不在就得重新安装指向当前目录。
-    if (Result<std::string> host = service::installed_binary_path(); ok(host)) {
-        const std::string path = std::get<std::string>(host);
-        if (!iequals(path, options.self_path) && !std::filesystem::exists(path_from_utf8(path))) {
-            log_warn("Service", "服务宿主 exe 已丢失：" + path);
-            std::printf("服务指向的可执行文件已丢失：%s\n", path.c_str());
-            std::printf("是否重新安装服务并指向当前目录？(y/N) ");
-            std::fflush(stdout);
+    // 3. 宿主 exe
+    check_service_host(options);
 
-            std::string answer;
-            std::getline(std::cin, answer);
-            if (!answer.empty() && (answer[0] == 'y' || answer[0] == 'Y')) {
-                run_service_command("reinstall", options);
-            } else {
-                log_info("Service", "用户放弃重新安装");
-            }
+    // 4. 服务在跑就把数据根声明过去：这正是「数据根跟着 exe 走」。
+    Session session;
+    if (state == service::State::Running) {
+        if (const Status status = ensure_connected(session, options); !ok(status)) {
+            log_warn("Cli", "暂时无法把数据根声明给服务：" + error_of(status)->message);
+        } else if (session.root_switched) {
+            const std::string root_text = to_forward_slashes(options.data_root);
+            std::printf("服务数据根已切换：%s -> %s\n", session.previous_root.c_str(),
+                        root_text.c_str());
+            log_info("Service", "数据根切换：" + session.previous_root + " -> " + root_text);
+        } else {
+            log_info("Service",
+                     "服务数据根已经是：" + to_forward_slashes(options.data_root));
         }
     }
 
-    return run_interactive(options, state);
+    return run_interactive(options, state, session);
 }
 
 }  // namespace
@@ -402,8 +591,11 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
     // 一次性命令不参与单实例：已经开着一个窗口时，别的脚本仍然要能停服务。
     if (!args.empty()) {
         if (args[0] == "service") {
+            if (args.size() >= 2 && args[1] == "status") {
+                return show_service_status();  // 查询不需要提权
+            }
             if (args.size() < 2 || !is_user_service_command(args[1])) {
-                std::fprintf(stderr, "用法：service install | uninstall | start | stop\n");
+                std::fprintf(stderr, "用法：service install | uninstall | start | stop | status\n");
                 return exit_code(ErrorCode::InvalidArgument);
             }
             return run_service_command(args[1], options);
@@ -448,12 +640,23 @@ int run(const std::vector<std::string>& args, const Options& options) {
         return 0;
     }
 
+    // 双击：先把数据根补齐（含 log/），再开日志器——这样「新建目录」的清单是
+    // 完整的六个，这些行也不会因为日志器还没开而丢掉。
+    std::vector<std::string> root_notes;
+    if (args.empty()) {
+        prepare_data_root(options, &root_notes);
+    }
+
     // 从这里开始都是真的干活，才值得写日志：--help / --version 不该在磁盘上
     // 留下任何东西。日志与 Service 共用同一个 <数据根>/log/fmt.log。
     std::unique_ptr<Logger> file_logger;
     if (Result<std::unique_ptr<Logger>> opened = open_cli_logger(options.data_root); ok(opened)) {
         file_logger = std::move(std::get<std::unique_ptr<Logger>>(opened));
         set_logger(file_logger.get());
+    }
+
+    for (const std::string& note : root_notes) {
+        log_info("Cli", note);
     }
 
     std::string summary = "CLI 启动 v" + std::string(version::STRING) +

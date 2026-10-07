@@ -194,7 +194,12 @@ void ServerRuntime::apply_http_locked() {
     http_ = std::move(created);
 }
 
-Status ServerRuntime::apply_root(const std::string& requested_root, std::string* effective_root) {
+Status ServerRuntime::apply_root(const std::string& requested_root, std::string* effective_root,
+                                 std::string* previous_root, bool* switched) {
+    if (switched != nullptr) {
+        *switched = false;
+    }
+
     const std::string target = normalize_root(requested_root);
     if (target.empty()) {
         return make_error(ErrorCode::ConfigError, "没有可用的数据根");
@@ -242,6 +247,12 @@ Status ServerRuntime::apply_root(const std::string& requested_root, std::string*
     if (effective_root != nullptr) {
         *effective_root = target;
     }
+    if (previous_root != nullptr) {
+        *previous_root = previous;
+    }
+    if (switched != nullptr) {
+        *switched = true;
+    }
     return std::monostate{};
 }
 
@@ -251,7 +262,10 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
 
     if (request.op == "hello") {
         std::string effective;
-        const Status applied = apply_root(request.root, &effective);
+        std::string previous;
+        bool switched = false;
+
+        const Status applied = apply_root(request.root, &effective, &previous, &switched);
         if (!ok(applied)) {
             response.ok = false;
             response.error = *error_of(applied);
@@ -259,6 +273,11 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
         }
         response.ok = true;
         response.data["root"] = effective;
+        response.data["switched"] = switched;
+        if (switched) {
+            // CLI 据此打印「数据根已切换：旧 -> 新」，双击时就能看见服务跟过来了。
+            response.data["previous_root"] = previous;
+        }
         return response;
     }
 
