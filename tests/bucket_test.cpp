@@ -367,6 +367,137 @@ FMT_TEST(Bucket, 删空桶重建再删然后回退不会互相覆盖) {
     FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(listed).size(), std::size_t{1});
 }
 
+FMT_TEST(Bucket, 条目详情与永久删除) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(buckets.create("工作")));
+    seed_file_record(*f.paths, "工作", "a.txt");
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(f.repository("工作") / "a.txt", "hello")));
+
+    const auto removal = buckets.remove("工作");
+    FMT_CHECK(fmt::ok(removal));
+    const std::string trashed = std::get<fmt::BucketRemoval>(removal).trashed_name;
+
+    // ---- trash get ----
+    const auto detail = buckets.get_trashed(trashed);
+    FMT_CHECK(fmt::ok(detail));
+    const fmt::TrashBucketDetail& found = std::get<fmt::TrashBucketDetail>(detail);
+    FMT_CHECK_EQ(found.bucket.trashed_name, trashed);
+    FMT_CHECK_EQ(found.bucket.original_name, std::string("工作"));
+    FMT_CHECK(found.bucket.directory_present);
+    FMT_CHECK_EQ(found.file_count, std::size_t{1});
+    FMT_CHECK_EQ(found.byte_count, std::uintmax_t{5});
+
+    const auto missing = buckets.get_trashed("没有这个条目");
+    FMT_CHECK(!fmt::ok(missing));
+    FMT_CHECK(fmt::error_of(missing)->code == fmt::ErrorCode::TrashEntryNotFound);
+
+    // ---- 永久删除 ----
+    const auto purged = buckets.purge(trashed);
+    FMT_CHECK(fmt::ok(purged));
+    const fmt::TrashPurge& result = std::get<fmt::TrashPurge>(purged);
+    FMT_CHECK_EQ(result.trashed_name, trashed);
+    FMT_CHECK_EQ(result.original_name, std::string("工作"));
+    FMT_CHECK_EQ(result.removed_files, std::size_t{1});
+    FMT_CHECK_EQ(result.removed_records, std::size_t{1});
+
+    // 磁盘、索引、file.json 都干净了
+    FMT_CHECK(!fmt::directory_exists(f.root / "trash" / "user" / fmt::path_from_utf8(trashed)));
+    const auto after = buckets.list_trashed();
+    FMT_CHECK(fmt::ok(after));
+    FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(after).size(), std::size_t{0});
+    const auto files = fmt::read_json_file(f.paths->file_data());
+    FMT_CHECK(fmt::ok(files));
+    FMT_CHECK_EQ(std::get<nlohmann::json>(files)["files"].size(), std::size_t{0});
+
+    // 再删一次：条目没了
+    const auto again = buckets.purge(trashed);
+    FMT_CHECK(!fmt::ok(again));
+    FMT_CHECK(fmt::error_of(again)->code == fmt::ErrorCode::TrashEntryNotFound);
+}
+
+FMT_TEST(Bucket, 永久删除只清桶级记录) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(buckets.create("工作")));
+    // 一条「因桶被删」、一条「文件自己删的」
+    seed_file_record(*f.paths, "工作", "a.txt");
+    seed_file_record(*f.paths, "工作", "b.txt");
+
+    const auto removal = buckets.remove("工作");
+    FMT_CHECK(fmt::ok(removal));
+
+    // 手工把 b.txt 改成文件级删除：永久删除桶的时候不能把它一起清掉
+    {
+        const auto parsed = fmt::read_json_file(f.paths->file_data());
+        FMT_CHECK(fmt::ok(parsed));
+        nlohmann::json document = std::get<nlohmann::json>(parsed);
+        for (nlohmann::json& record : document["files"]) {
+            if (record.value("file_name", std::string{}) == "b.txt") {
+                record["trash_reason"] = "file";
+            }
+        }
+        FMT_CHECK(fmt::ok(fmt::write_json_file(f.paths->file_data(), document)));
+    }
+
+    const auto purged = buckets.purge(std::get<fmt::BucketRemoval>(removal).trashed_name);
+    FMT_CHECK(fmt::ok(purged));
+    FMT_CHECK_EQ(std::get<fmt::TrashPurge>(purged).removed_records, std::size_t{1});
+
+    const auto files = fmt::read_json_file(f.paths->file_data());
+    FMT_CHECK(fmt::ok(files));
+    const nlohmann::json& records = std::get<nlohmann::json>(files)["files"];
+    FMT_CHECK_EQ(records.size(), std::size_t{1});
+    FMT_CHECK_EQ(records[0].value("file_name", std::string{}), std::string("b.txt"));
+}
+
+FMT_TEST(Bucket, 回收站扫描只认桶级条目) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+
+    // 文件级条目的落点（点开头，必须跳过）
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(
+        f.root / "trash" / "user" / ".files" / fmt::path_from_utf8("工作") / "2026" / "10")));
+    // 不像桶级条目的目录（名字里没有 14 位时间戳）也要跳过
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(f.root / "trash" / "user" / fmt::path_from_utf8("杂物"))));
+    // 形状正确的手工目录：列出但原名称未知
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(
+        f.root / "trash" / "user" / fmt::path_from_utf8("孤儿_20260101000000"))));
+
+    const auto listed = buckets.list_trashed();
+    FMT_CHECK(fmt::ok(listed));
+    const std::vector<fmt::TrashBucket>& entries = std::get<std::vector<fmt::TrashBucket>>(listed);
+    FMT_CHECK_EQ(entries.size(), std::size_t{1});
+    FMT_CHECK_EQ(entries[0].trashed_name, std::string("孤儿_20260101000000"));
+    FMT_CHECK_EQ(entries[0].original_name, std::string{});
+}
+
+FMT_TEST(Bucket, 有索引没目录的条目可以永久删掉) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(buckets.create("工作")));
+    const auto removal = buckets.remove("工作");
+    FMT_CHECK(fmt::ok(removal));
+    const std::string trashed = std::get<fmt::BucketRemoval>(removal).trashed_name;
+
+    // 模拟「目录被外部删了、索引还在」：list 如实报告，purge 仍然可用（否则这条永远清不掉）
+    std::error_code code;
+    std::filesystem::remove_all(f.root / "trash" / "user" / fmt::path_from_utf8(trashed), code);
+    FMT_CHECK(!code);
+
+    const auto listed = buckets.list_trashed();
+    FMT_CHECK(fmt::ok(listed));
+    FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(listed).size(), std::size_t{1});
+    FMT_CHECK(!std::get<std::vector<fmt::TrashBucket>>(listed)[0].directory_present);
+
+    const auto purged = buckets.purge(trashed);
+    FMT_CHECK(fmt::ok(purged));
+    FMT_CHECK_EQ(std::get<fmt::TrashPurge>(purged).removed_files, std::size_t{0});
+    const auto after = buckets.list_trashed();
+    FMT_CHECK(fmt::ok(after));
+    FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(after).size(), std::size_t{0});
+}
+
 FMT_TEST(Bucket, 当前Bucket失效时置空) {
     Fixture f;
     fmt::BucketService buckets(*f.paths, f.config, nullptr);

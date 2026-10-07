@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -55,6 +56,22 @@ struct TrashBucket {
     bool directory_present = true;  // false = 索引里有、目录没了（异常，只报告）
 };
 
+// 单个回收站条目的详情（trash get 用）。
+struct TrashBucketDetail {
+    TrashBucket bucket;
+    std::filesystem::path directory;
+    std::size_t file_count = 0;
+    std::uintmax_t byte_count = 0;
+};
+
+// 永久删除之后的结果。
+struct TrashPurge {
+    std::string trashed_name;
+    std::string original_name;
+    std::size_t removed_files = 0;    // 真正删掉的磁盘文件数
+    std::size_t removed_records = 0;  // file.json 里清掉的记录数
+};
+
 class BucketService {
 public:
     BucketService(const PathManager& paths, Config& config, Logger* logger);
@@ -72,6 +89,14 @@ public:
     // identifier 可以是回收站里的名字，也可以是原桶名（同名多条时必须用前者）。
     Result<TrashBucket> restore(std::string_view identifier);
 
+    // 单个条目的详情：目录、文件数、占用字节数。索引里有、目录没了的如实报告。
+    Result<TrashBucketDetail> get_trashed(std::string_view identifier);
+
+    // **永久删除，不可恢复**：删掉回收站目录本身、清掉该桶的 file.json 记录、
+    // 摘掉索引条目。顺序刻意是「数据 → metadata → 索引」，中途失败都能重来。
+    // 调用方必须先取得用户确认（服务端另外要求请求里带 force）。
+    Result<TrashPurge> purge(std::string_view identifier);
+
     // Bucket 目录：repository/<user>/<bucket>。
     std::filesystem::path directory_of(std::string_view name) const;
 
@@ -79,6 +104,13 @@ public:
     Status refresh_current_bucket();
 
 private:
+    // 在索引里定位条目：先用回收站里的名字精确匹配，再用原桶名（必须唯一）。
+    // **找不到不算错**（found=false）——孤儿目录要能走到「按目录名处理」那条路。
+    struct TrashLookup {
+        bool found = false;
+        std::size_t index = 0;
+    };
+
     std::filesystem::path user_root() const;
     std::filesystem::path bucket_path(std::string_view name) const;
     std::filesystem::path trash_user_root() const;
@@ -96,6 +128,10 @@ private:
     Result<std::vector<TrashBucket>> load_original_index() const;
     Status save_original_index(const std::vector<TrashBucket>& entries) const;
     std::string unique_trashed_name(std::string_view name) const;
+    Result<TrashLookup> find_trashed(const std::vector<TrashBucket>& entries,
+                                     std::string_view identifier) const;
+    // 永久删除时清掉 file.json 里「因桶被删」的记录（只清那一种，不动文件级删除的）。
+    Status remove_bucket_file_records(std::string_view bucket_name, std::size_t* removed);
 
     const PathManager& paths_;
     Config& config_;

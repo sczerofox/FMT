@@ -169,6 +169,32 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler) 
                  [run](const httplib::Request& request, httplib::Response& response) {
                      run("trash.restore", args_with_encoded_name(request.matches[1]), response);
                  });
+    server->Get(R"(/api/trash/([^/]+))",
+                [run](const httplib::Request& request, httplib::Response& response) {
+                    run("trash.get", args_with_encoded_name(request.matches[1]), response);
+                });
+    server->Delete(R"(/api/trash/([^/]+))",
+                   [run](const httplib::Request& request, httplib::Response& response) {
+                       // 永久删除不可恢复：必须显式确认，?force=1 或请求体 {"force":true}。
+                       nlohmann::json args = args_with_encoded_name(request.matches[1]);
+                       bool force = false;
+                       if (request.has_param("force")) {
+                           const std::string value = request.get_param_value("force");
+                           force = (value == "1" || iequals(value, "true"));
+                       }
+                       if (!force && !request.body.empty()) {
+                           try {
+                               const nlohmann::json body = nlohmann::json::parse(request.body);
+                               force = body.is_object() && body.value("force", false);
+                           } catch (const nlohmann::json::exception&) {
+                               force = false;  // 请求体不是 JSON：当作没确认
+                           }
+                       }
+                       if (force) {
+                           args["force"] = true;
+                       }
+                       run("trash.delete", args, response);
+                   });
 }
 
 }  // namespace

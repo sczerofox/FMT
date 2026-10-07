@@ -183,8 +183,63 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
         return data;
     }
 
-    // trash get / trash delete（永久删除）随阶段 7 一起做。
-    return make_error(ErrorCode::ServiceOperationFailed, "操作尚未实现：" + operation);
+    if (operation == "trash.get") {
+        const Result<std::string> name = argument(args, 0, "回收站条目名称");
+        if (!ok(name)) {
+            return *error_of(name);
+        }
+        const std::string value = std::get<std::string>(name);
+
+        const Result<TrashBucketDetail> detail = buckets.get_trashed(value);
+        if (!ok(detail)) {
+            return *error_of(detail);
+        }
+        const TrashBucketDetail& found = std::get<TrashBucketDetail>(detail);
+
+        nlohmann::json data = nlohmann::json::object();
+        data["trashed"] = found.bucket.trashed_name;
+        data["original"] = found.bucket.original_name;
+        data["deleted_at"] = found.bucket.deleted_at;
+        data["present"] = found.bucket.directory_present;
+        data["path"] = relative_path_text(context.paths->root(), found.directory);
+        data["files"] = found.file_count;
+        data["bytes"] = found.byte_count;
+        return data;
+    }
+
+    if (operation == "trash.delete") {
+        // **永久删除不可恢复**：调用方必须显式确认（CLI 在用户回答 y 之后才置 force）。
+        // 少一次误操作就少一次数据丢失，宁可多要一个字段。
+        const auto force = args.find("force");
+        if (force == args.end() || !force->is_boolean() || !force->get<bool>()) {
+            return make_error(ErrorCode::InvalidArgument,
+                              "永久删除不可恢复，需要确认（force = true）");
+        }
+
+        const Result<std::string> name = argument(args, 0, "回收站条目名称");
+        if (!ok(name)) {
+            return *error_of(name);
+        }
+        const std::string value = std::get<std::string>(name);
+
+        const Result<TrashPurge> purged = buckets.purge(value);
+        if (!ok(purged)) {
+            return *error_of(purged);
+        }
+        const TrashPurge& result = std::get<TrashPurge>(purged);
+
+        nlohmann::json data = nlohmann::json::object();
+        data["trashed"] = result.trashed_name;
+        data["original"] = result.original_name;
+        data["removed_files"] = result.removed_files;
+        data["removed_records"] = result.removed_records;
+        data["message"] = "已永久删除：" + result.trashed_name + "（" +
+                          std::to_string(result.removed_files) + " 个文件，" +
+                          std::to_string(result.removed_records) + " 条记录）";
+        return data;
+    }
+
+    return make_error(ErrorCode::InvalidArgument, "未知的回收站操作：" + operation);
 }
 
 }  // namespace

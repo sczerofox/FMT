@@ -46,7 +46,8 @@ const std::vector<std::string>& PathManager::required_directories() {
 
 Result<std::filesystem::path> PathManager::build(std::filesystem::path base, std::string_view user,
                                                  std::string_view bucket, const DateParts& date,
-                                                 std::string_view file_name) const {
+                                                 std::string_view file_name,
+                                                 std::wstring_view inner) const {
     for (const auto& [value, label] :
          {std::pair<std::string_view, std::string_view>{user, "用户"},
           std::pair<std::string_view, std::string_view>{bucket, "Bucket"},
@@ -62,6 +63,9 @@ Result<std::filesystem::path> PathManager::build(std::filesystem::path base, std
 
     std::filesystem::path path = std::move(base);
     path /= path_from_utf8(std::string(user));
+    if (!inner.empty()) {
+        path /= std::filesystem::path(inner);
+    }
     path /= path_from_utf8(std::string(bucket));
     path /= date.year;
     path /= date.month;
@@ -81,7 +85,7 @@ Result<std::filesystem::path> PathManager::trash_file(std::string_view user,
                                                       std::string_view bucket,
                                                       const DateParts& date,
                                                       std::string_view file_name) const {
-    return build(trash(), user, bucket, date, file_name);
+    return build(trash(), user, bucket, date, file_name, L".files");
 }
 
 }  // namespace fmt

@@ -50,15 +50,22 @@ public:
                                                   const DateParts& date,
                                                   std::string_view file_name) const;
 
-    // trash/<user>/<bucket>/YYYY/MM/DD/<file_name>（保持原层级，便于恢复）
+    // trash/<user>/.files/<bucket>/YYYY/MM/DD/<file_name>（保持原层级，便于恢复）
+    //
+    // **中间那层 .files 是刻意的**：trash/<user>/ 的顶层留给桶级条目
+    // （trash/<user>/<桶名>_<时间戳>/），文件级条目收在 .files/ 下，两者不同层，
+    // 桶级扫描不会把文件级的桶目录误认成「孤儿桶」。桶级索引
+    // trash/<user>/.original 同样是点开头。
     Result<std::filesystem::path> trash_file(std::string_view user, std::string_view bucket,
                                              const DateParts& date,
                                              std::string_view file_name) const;
 
 private:
+    // base/user[/inner]/bucket/YYYY/MM/DD/file_name
     Result<std::filesystem::path> build(std::filesystem::path base, std::string_view user,
                                         std::string_view bucket, const DateParts& date,
-                                        std::string_view file_name) const;
+                                        std::string_view file_name,
+                                        std::wstring_view inner = {}) const;
 
     std::filesystem::path root_;
 };

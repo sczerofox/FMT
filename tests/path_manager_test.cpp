@@ -59,8 +59,10 @@ FMT_TEST(PathManager, 回收站保持原层级) {
     const fmt::PathManager paths{R"(D:\FMT)"};
     const auto result = paths.trash_file("小谷", "工作", fixed_date(), "小谷姐姐麻辣烫.jpg");
     FMT_CHECK(fmt::ok(result));
+    // 文件级条目收在保留的 .files/ 下：trash/<用户>/ 的顶层留给桶级条目
+    // （trash/<用户>/<桶名>_<时间戳>/），两者不同层，桶级扫描不会误认。
     FMT_CHECK_EQ(as_utf8(result),
-                 std::string("D:/FMT/trash/小谷/工作/2026/10/05/小谷姐姐麻辣烫.jpg"));
+                 std::string("D:/FMT/trash/小谷/.files/工作/2026/10/05/小谷姐姐麻辣烫.jpg"));
 }
 
 FMT_TEST(PathManager, 拒绝路径穿越与分隔符) {

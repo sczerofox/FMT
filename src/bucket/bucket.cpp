@@ -28,6 +28,41 @@ constexpr const char* kTrashReasonBucket = "bucket";
 
 bool is_dot_entry(const std::string& name) { return !name.empty() && name.front() == '.'; }
 
+bool is_digits(const std::string& text) {
+    if (text.empty()) {
+        return false;
+    }
+    for (const char ch : text) {
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 目录名是否符合桶级条目的形状：`<名字>_<14 位时间戳>` 或 `<名字>_<时间戳>_<序号>`。
+//
+// 文件级条目已经被收进 `trash/<user>/.files/`（点开头，扫描时跳过），
+// 这里再加一道形状检查是第二道保险：手工拷进来的、别的东西都不会被误当成桶级条目。
+bool looks_like_trashed_bucket(const std::string& name) {
+    const std::size_t last = name.rfind('_');
+    if (last == std::string::npos || last == 0) {
+        return false;
+    }
+    if (is_digits(name.substr(last + 1)) && name.size() - last - 1 == 14) {
+        return true;
+    }
+
+    // <名字>_<14 位时间戳>_<序号 1-3 位>
+    const std::size_t previous = name.rfind('_', last - 1);
+    if (previous == std::string::npos || previous == 0) {
+        return false;
+    }
+    const std::string stamp = name.substr(previous + 1, last - previous - 1);
+    const std::string suffix = name.substr(last + 1);
+    return stamp.size() == 14 && is_digits(stamp) && suffix.size() <= 3 && is_digits(suffix);
+}
+
 }  // namespace
 
 BucketService::BucketService(const PathManager& paths, Config& config, Logger* logger)
@@ -361,8 +396,8 @@ Result<std::vector<TrashBucket>> BucketService::list_trashed() {
                 continue;
             }
             const std::string name = path_to_utf8(item.path().filename());
-            if (is_dot_entry(name)) {
-                continue;
+            if (is_dot_entry(name) || !looks_like_trashed_bucket(name)) {
+                continue;  // .files/ 之类的点目录、以及不像桶级条目的东西都跳过
             }
             const bool known =
                 std::any_of(entries.begin(), entries.end(), [&name](const TrashBucket& entry) {
@@ -402,28 +437,13 @@ Result<TrashBucket> BucketService::restore(std::string_view identifier) {
     const std::vector<TrashBucket> entries = std::get<std::vector<TrashBucket>>(loaded);
 
     // 先用回收站里的名字找；找不到再按原桶名找，但必须唯一。
-    std::vector<std::size_t> matched;
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].trashed_name == identifier) {
-            matched.push_back(i);
-        }
+    Result<TrashLookup> lookup = find_trashed(entries, identifier);
+    if (!ok(lookup)) {
+        return *error_of(lookup);
     }
-    if (matched.empty()) {
-        for (std::size_t i = 0; i < entries.size(); ++i) {
-            if (!entries[i].original_name.empty() && entries[i].original_name == identifier) {
-                matched.push_back(i);
-            }
-        }
-        if (matched.size() > 1) {
-            std::string candidates;
-            for (const std::size_t index : matched) {
-                candidates += (candidates.empty() ? "" : "、") + entries[index].trashed_name;
-            }
-            return make_error(ErrorCode::InvalidArgument,
-                              "有多个同名 Bucket 被删除，请用回收站里的名字指定：" + candidates);
-        }
-    }
-    if (matched.empty()) {
+    const TrashLookup found = std::get<TrashLookup>(lookup);
+
+    if (!found.found) {
         // 目录在回收站里、但索引里没有它（手工拷进来的、旧版本留下的）：
         // 原桶名未知，猜名字不可靠，明确拒绝而不是随便找个位置放回去。
         if (directory_exists(trash_user_root() / path_from_utf8(std::string(identifier)))) {
@@ -435,7 +455,7 @@ Result<TrashBucket> BucketService::restore(std::string_view identifier) {
                           "回收站里没有这个 Bucket：" + std::string(identifier));
     }
 
-    const TrashBucket entry = entries[matched.front()];
+    const TrashBucket entry = entries[found.index];
     if (entry.original_name.empty()) {
         return make_error(ErrorCode::InvalidArgument,
                           "回收站条目缺少原桶名记录（" + std::string(kOriginalIndexName) +
@@ -470,7 +490,7 @@ Result<TrashBucket> BucketService::restore(std::string_view identifier) {
     // 索引先减掉这一条：写不进去就把目录退回去，别出现「目录已回退、索引还在」。
     std::vector<TrashBucket> remaining;
     for (std::size_t i = 0; i < entries.size(); ++i) {
-        if (i != matched.front()) {
+        if (i != found.index) {
             remaining.push_back(entries[i]);
         }
     }
@@ -494,6 +514,178 @@ Result<TrashBucket> BucketService::restore(std::string_view identifier) {
     TrashBucket restored = entry;
     restored.directory_present = true;
     return restored;
+}
+
+// ---------------------------------------------------------------------------
+// 定位 / 详情 / 永久删除
+// ---------------------------------------------------------------------------
+
+Result<BucketService::TrashLookup> BucketService::find_trashed(
+    const std::vector<TrashBucket>& entries, std::string_view identifier) const {
+    TrashLookup lookup;
+
+    // 回收站里的名字优先：它是精确的、不带歧义的。
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (entries[i].trashed_name == identifier) {
+            lookup.found = true;
+            lookup.index = i;
+            return lookup;
+        }
+    }
+
+    // 再用原桶名：同名多条时必须让调用方改用回收站里的名字。
+    std::vector<std::size_t> matched;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (!entries[i].original_name.empty() && entries[i].original_name == identifier) {
+            matched.push_back(i);
+        }
+    }
+    if (matched.size() > 1) {
+        std::string candidates;
+        for (const std::size_t index : matched) {
+            candidates += (candidates.empty() ? "" : "、") + entries[index].trashed_name;
+        }
+        return make_error(ErrorCode::InvalidArgument,
+                          "有多个同名 Bucket 被删除，请用回收站里的名字指定：" + candidates);
+    }
+    if (matched.size() == 1) {
+        lookup.found = true;
+        lookup.index = matched.front();
+    }
+    return lookup;
+}
+
+Result<TrashBucketDetail> BucketService::get_trashed(std::string_view identifier) {
+    if (const Status status = require_current_user(); !ok(status)) {
+        return *error_of(status);
+    }
+    if (identifier.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少回收站条目的名称");
+    }
+
+    Result<std::vector<TrashBucket>> loaded = load_original_index();
+    if (!ok(loaded)) {
+        return *error_of(loaded);
+    }
+    const std::vector<TrashBucket> entries = std::get<std::vector<TrashBucket>>(loaded);
+
+    Result<TrashLookup> lookup = find_trashed(entries, identifier);
+    if (!ok(lookup)) {
+        return *error_of(lookup);
+    }
+    const TrashLookup found = std::get<TrashLookup>(lookup);
+
+    TrashBucketDetail detail;
+    if (found.found) {
+        detail.bucket = entries[found.index];
+    } else {
+        detail.bucket.trashed_name = std::string(identifier);  // 孤儿目录：按目录名查
+    }
+
+    detail.directory = trash_user_root() / path_from_utf8(detail.bucket.trashed_name);
+    detail.bucket.directory_present = directory_exists(detail.directory);
+    if (!detail.bucket.directory_present) {
+        if (!found.found) {
+            return make_error(ErrorCode::TrashEntryNotFound,
+                              "回收站里没有这个条目：" + std::string(identifier));
+        }
+        return detail;  // 索引里有、目录没了：如实报告 present = false
+    }
+
+    // 单条查询，走一遍目录是可接受的成本（列表查询不做这件事）。
+    std::error_code code;
+    for (const auto& item :
+         std::filesystem::recursive_directory_iterator(detail.directory, code)) {
+        std::error_code type_code;
+        if (item.is_regular_file(type_code)) {
+            ++detail.file_count;
+            detail.byte_count += item.file_size(type_code);
+        }
+    }
+    return detail;
+}
+
+Result<TrashPurge> BucketService::purge(std::string_view identifier) {
+    if (const Status status = require_current_user(); !ok(status)) {
+        return *error_of(status);
+    }
+    if (identifier.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少回收站条目的名称");
+    }
+
+    Result<std::vector<TrashBucket>> loaded = load_original_index();
+    if (!ok(loaded)) {
+        return *error_of(loaded);
+    }
+    const std::vector<TrashBucket> entries = std::get<std::vector<TrashBucket>>(loaded);
+
+    Result<TrashLookup> lookup = find_trashed(entries, identifier);
+    if (!ok(lookup)) {
+        return *error_of(lookup);
+    }
+    const TrashLookup found = std::get<TrashLookup>(lookup);
+
+    TrashPurge result;
+    if (found.found) {
+        result.trashed_name = entries[found.index].trashed_name;
+        result.original_name = entries[found.index].original_name;
+    } else {
+        result.trashed_name = std::string(identifier);
+    }
+
+    const std::filesystem::path directory =
+        trash_user_root() / path_from_utf8(result.trashed_name);
+    const bool present = directory_exists(directory);
+    if (!present && !found.found) {
+        return make_error(ErrorCode::TrashEntryNotFound,
+                          "回收站里没有这个条目：" + std::string(identifier));
+    }
+
+    // ① 先删磁盘数据。失败就什么都没变（索引还在，可以再来一次）。
+    if (present) {
+        std::error_code code;
+        for (const auto& item : std::filesystem::recursive_directory_iterator(directory, code)) {
+            std::error_code type_code;
+            if (item.is_regular_file(type_code)) {
+                ++result.removed_files;
+            }
+        }
+        code.clear();
+        std::filesystem::remove_all(directory, code);
+        if (code) {
+            return make_error(ErrorCode::StorageError, "永久删除失败：" + path_to_utf8(directory) +
+                                                           "（" + code.message() + "）");
+        }
+    }
+
+    // ② 再清 metadata：只清「因桶被删」的记录，文件自己删过的不动。
+    if (!result.original_name.empty()) {
+        if (const Status status =
+                remove_bucket_file_records(result.original_name, &result.removed_records);
+            !ok(status)) {
+            return *error_of(status);
+        }
+    }
+
+    // ③ 最后摘索引：顺序刻意如此，中途任何失败都能重来。
+    if (found.found) {
+        std::vector<TrashBucket> remaining;
+        for (std::size_t i = 0; i < entries.size(); ++i) {
+            if (i != found.index) {
+                remaining.push_back(entries[i]);
+            }
+        }
+        if (const Status status = save_original_index(remaining); !ok(status)) {
+            return *error_of(status);
+        }
+    }
+
+    if (logger_ != nullptr) {
+        logger_->info("Trash", "永久删除回收站条目：" + result.trashed_name + "（" +
+                                   std::to_string(result.removed_files) + " 个文件、" +
+                                   std::to_string(result.removed_records) + " 条记录）");
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -566,6 +758,53 @@ Status BucketService::set_bucket_files_trash_flag(std::string_view name, bool tr
     return std::monostate{};
 }
 
+Status BucketService::remove_bucket_file_records(std::string_view bucket_name,
+                                                 std::size_t* removed) {
+    if (removed != nullptr) {
+        *removed = 0;
+    }
+    if (!file_exists(paths_.file_data())) {
+        return std::monostate{};
+    }
+
+    Result<nlohmann::json> parsed = read_json_file(paths_.file_data());
+    if (!ok(parsed)) {
+        return *error_of(parsed);
+    }
+    nlohmann::json& document = std::get<nlohmann::json>(parsed);
+
+    if (const Status version = check_version(document, 1); !ok(version)) {
+        return version;
+    }
+    const auto records = document.find("files");
+    if (records == document.end() || !records->is_array()) {
+        return make_error(ErrorCode::JsonParseError, "file.json 缺少 files 数组");
+    }
+
+    nlohmann::json kept = nlohmann::json::array();
+    std::size_t dropped = 0;
+    for (const nlohmann::json& record : *records) {
+        if (record.is_object() && record.value("user", std::string{}) == config_.current_user &&
+            record.value("bucket", std::string{}) == bucket_name &&
+            record.value("is_trash", false) &&
+            record.value("trash_reason", std::string{}) == kTrashReasonBucket) {
+            ++dropped;  // 它的数据就在刚删掉的那个回收站目录里
+            continue;
+        }
+        kept.push_back(record);
+    }
+
+    if (dropped > 0) {
+        document["files"] = std::move(kept);
+        if (const Status status = write_json_file(paths_.file_data(), document); !ok(status)) {
+            return status;
+        }
+    }
+    if (removed != nullptr) {
+        *removed = dropped;
+    }
+    return std::monostate{};
+}
 // ---------------------------------------------------------------------------
 // 当前 Bucket
 // ---------------------------------------------------------------------------

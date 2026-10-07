@@ -92,13 +92,12 @@ void print_command_list() {
     std::printf("可用命令：\n");
     std::printf("  (service)  install  uninstall  start  stop  status\n");
     std::printf("  (bucket)   create  list  get  use  delete\n");
-    std::printf("  (trash)    list  restore        ← Bucket 级；文件级待阶段 5/7\n");
+    std::printf("  (trash)    list  get  restore  delete\n");
     std::printf("  (help)     help [命令]\n");
     std::printf("  (exit)     exit  quit\n");
     std::printf("\n业务命令（服务端尚未实现，现在会返回 FMT-602）：\n");
     std::printf("  (file)     upload  list  get  delete\n");
     std::printf("  (share)    create  get  list  delete\n");
-    std::printf("  (trash)    get  delete          ← 永久删除待阶段 7\n");
 }
 
 // help <命令>：某一组命令的详细说明。
@@ -158,17 +157,19 @@ bool print_command_help(const std::string& topic) {
     }
     if (topic == "trash") {
         std::printf(
-            "trash —— 回收站\n"
-            "  list             列出回收站里的条目（桶级）\n"
-            "  restore <名称>   回退一个被删除的 Bucket；名称可以是回收站里的名字\n"
-            "                   （lazy-fox_20261008012233），也可以是原桶名（同名只\n"
-            "                   有一个时）。原位置已有同名 Bucket 就整单拒绝，\n"
-            "                   不覆盖、不改名、不做部分恢复。\n"
-            "  get <id>         尚未实现（阶段 7）\n"
-            "  delete <id>      尚未实现（阶段 7，永久删除）\n"
+            "trash —— 回收站（当前是桶级条目；文件级条目随阶段 5/7 进来）\n"
+            "  list             列出回收站里的条目\n"
+            "  get <名称>       查看单个条目：原桶名、删除时间、目录、文件数与占用\n"
+            "  restore <名称>   回退一个被删除的 Bucket。名称可以是回收站里的名字\n"
+            "                   （lazy-fox_20261008012233），也可以是原桶名（同名只有\n"
+            "                   一个时）。原位置已有同名 Bucket 就整单拒绝，不覆盖、\n"
+            "                   不改名、不做部分恢复。\n"
+            "  delete <名称>    **永久删除，不可恢复**：删掉数据与记录。\n"
+            "                   交互窗口里会问一次；一次性命令必须加 --yes，例如\n"
+            "                   fmt.exe trash delete lazy-fox_20261008012233 --yes\n"
             "\n"
-            "文件级条目（file delete 产生的）随阶段 5/7 一起进来。\n"
-            "桶级记录写在 trash/<用户>/.original，目录名一律带删除时间戳。\n");
+            "桶级记录写在 trash/<用户>/.original，目录名一律带删除时间戳；\n"
+            "文件级条目收在 trash/<用户>/.files/ 下，两者不会互相干扰。\n");
         return true;
     }
 
@@ -512,6 +513,20 @@ void print_business_data(const nlohmann::json& data) {
         return;
     }
 
+    // 单条回收站条目：trashed + original + files
+    if (data.contains("trashed") && data.contains("files")) {
+        std::printf("回收站条目：%s\n", data.value("trashed", std::string{}).c_str());
+        const std::string original = data.value("original", std::string{});
+        std::printf("原 Bucket：%s\n",
+                    original.empty() ? "（未记录，无法回退）" : original.c_str());
+        std::printf("删除时间：%s\n", data.value("deleted_at", std::string{}).c_str());
+        std::printf("目录：%s\n", data.value("path", std::string{}).c_str());
+        std::printf("状态：%s\n", data.value("present", false) ? "在" : "目录已不存在");
+        std::printf("文件数：%zu\n", data.value("files", std::size_t{0}));
+        std::printf("占用：%s\n", format_size(data.value("bytes", std::uintmax_t{0})).c_str());
+        return;
+    }
+
     // 单条 Bucket 信息
     if (data.contains("bucket") && data.contains("is_current")) {
         std::printf("Bucket：%s\n", data.value("bucket", std::string{}).c_str());
@@ -534,8 +549,43 @@ void print_business_data(const nlohmann::json& data) {
 }
 
 int run_business_command(const std::vector<std::string>& parts, Session& session,
-                         const Options& options) {
+                         const Options& options, bool interactive) {
     const std::string operation = parts[0] + "." + parts[1];
+
+    // 位置参数。--yes 是本地开关，不发给服务。
+    nlohmann::json arguments = nlohmann::json::array();
+    bool confirmed = false;
+    for (std::size_t i = 2; i < parts.size(); ++i) {
+        if (parts[i] == "--yes" || parts[i] == "-y") {
+            confirmed = true;
+            continue;
+        }
+        arguments.push_back(parts[i]);
+    }
+
+    // 永久删除不可恢复：交互窗口里问一句，一次性命令必须显式 --yes。
+    // 确认结果作为 force 发给服务端，服务端也会再检查一次。
+    if (operation == "trash.delete") {
+        const std::string target =
+            arguments.empty() ? std::string{} : arguments[0].get<std::string>();
+        if (interactive) {
+            std::printf("永久删除回收站条目 %s ？此操作不可恢复 (y/N) ", target.c_str());
+            std::fflush(stdout);
+            std::string answer;
+            std::getline(std::cin, answer);
+            if (answer.empty() || (answer[0] != 'y' && answer[0] != 'Y')) {
+                log_info("Cli", "用户取消永久删除：" + target);
+                std::printf("已取消\n");
+                return 0;
+            }
+            confirmed = true;
+        } else if (!confirmed) {
+            std::fprintf(stderr,
+                         "永久删除不可恢复：请加 --yes 明确确认，或在交互窗口里执行\n");
+            log_warn("Cli", "拒绝未确认的永久删除：" + target);
+            return exit_code(ErrorCode::InvalidArgument);
+        }
+    }
 
     if (const Status status = ensure_connected(session, options); !ok(status)) {
         log_error("Cli", "命令 " + operation + " 无法连接服务：" + error_of(status)->message);
@@ -549,12 +599,11 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     request.root = options.data_root;
     request.pid = GetCurrentProcessId();
 
-    nlohmann::json arguments = nlohmann::json::array();
-    for (std::size_t i = 2; i < parts.size(); ++i) {
-        arguments.push_back(parts[i]);
-    }
     if (!arguments.empty()) {
         request.args["argv"] = arguments;
+    }
+    if (confirmed) {
+        request.args["force"] = true;
     }
 
     log_info("Cli", "命令 " + operation + " 已发送（id " + std::to_string(request.id) + "）");
@@ -641,7 +690,7 @@ int run_interactive(const Options& options, service::State state, Session& sessi
             continue;
         }
 
-        run_business_command(parts, session, options);
+        run_business_command(parts, session, options, true);
     }
     log_info("Cli", "退出交互循环");
     return 0;
@@ -781,7 +830,7 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
         }
         if (args.size() >= 2) {
             Session session;
-            return run_business_command(args, session, options);
+            return run_business_command(args, session, options, false);
         }
         std::fprintf(stderr, "未知命令：%s\n\n", args[0].c_str());
         print_usage();

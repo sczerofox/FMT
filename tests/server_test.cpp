@@ -192,6 +192,52 @@ FMT_TEST(Server, Bucket路由与状态码) {
         FMT_CHECK_EQ(back->status, 200);
     }
 
+    // 再删一次，测 trash get 与永久删除（DELETE 需要显式 force）
+    const auto removed_again = client.Delete("/api/bucket/" + fmt::url_encode("工作"));
+    FMT_CHECK(removed_again != nullptr);
+    std::string second;
+    if (removed_again != nullptr && removed_again->status == 200) {
+        second = nlohmann::json::parse(removed_again->body)["data"]["trashed_name"]
+                     .get<std::string>();
+    }
+    FMT_CHECK(!second.empty());
+
+    if (!second.empty()) {
+        const auto detail = client.Get("/api/trash/" + fmt::url_encode(second));
+        FMT_CHECK(detail != nullptr);
+        if (detail != nullptr) {
+            FMT_CHECK_EQ(detail->status, 200);
+            const nlohmann::json body = nlohmann::json::parse(detail->body);
+            FMT_CHECK_EQ(body["data"]["original"].get<std::string>(), std::string("工作"));
+            FMT_CHECK(body["data"]["present"].get<bool>());
+        }
+
+        // 没确认 -> 400 + FMT-001
+        const auto refused = client.Delete("/api/trash/" + fmt::url_encode(second));
+        FMT_CHECK(refused != nullptr);
+        if (refused != nullptr) {
+            FMT_CHECK_EQ(refused->status, 400);
+            FMT_CHECK_EQ(
+                nlohmann::json::parse(refused->body)["error"]["code"].get<std::string>(),
+                std::string("FMT-001"));
+        }
+
+        // ?force=1 -> 真的删掉
+        const auto purged = client.Delete("/api/trash/" + fmt::url_encode(second) + "?force=1");
+        FMT_CHECK(purged != nullptr);
+        if (purged != nullptr) {
+            FMT_CHECK_EQ(purged->status, 200);
+        }
+
+        const auto empty_trash = client.Get("/api/trash");
+        FMT_CHECK(empty_trash != nullptr);
+        if (empty_trash != nullptr) {
+            FMT_CHECK_EQ(
+                nlohmann::json::parse(empty_trash->body)["data"]["deleted_buckets"].size(),
+                std::size_t{0});
+        }
+    }
+
     server.stop();
 }
 

@@ -228,14 +228,57 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     FMT_CHECK(!missing.ok);
     FMT_CHECK(missing.error.code == fmt::ErrorCode::TrashEntryNotFound);
 
-    // trash get / trash delete 仍未实现 -> FMT-602
-    fmt::ipc::Request pending;
-    pending.id = 25;
-    pending.op = "trash.delete";
-    pending.args["argv"] = nlohmann::json::array({trashed});
-    const fmt::ipc::Response not_yet = runtime.handle(pending);
-    FMT_CHECK(!not_yet.ok);
-    FMT_CHECK(not_yet.error.code == fmt::ErrorCode::ServiceOperationFailed);
+    // 再删一次：拿一个新的回收站条目来测 trash get 与永久删除
+    fmt::ipc::Request remove_again;
+    remove_again.id = 25;
+    remove_again.op = "bucket.delete";
+    remove_again.args["argv"] = nlohmann::json::array({"工作"});
+    const fmt::ipc::Response removed_again = runtime.handle(remove_again);
+    FMT_CHECK(removed_again.ok);
+    const std::string second = removed_again.data.value("trashed_name", std::string{});
+    FMT_CHECK(!second.empty());
+
+    // trash get：条目详情
+    fmt::ipc::Request get;
+    get.id = 26;
+    get.op = "trash.get";
+    get.args["argv"] = nlohmann::json::array({second});
+    const fmt::ipc::Response detail = runtime.handle(get);
+    FMT_CHECK(detail.ok);
+    if (detail.ok) {
+        FMT_CHECK_EQ(detail.data.value("original", std::string{}), std::string("工作"));
+        FMT_CHECK(detail.data.value("present", false));
+        FMT_CHECK_EQ(detail.data.value("files", std::size_t{9}), std::size_t{0});
+    }
+
+    // 永久删除必须先确认：不带 force 一律拒绝
+    fmt::ipc::Request unconfirmed;
+    unconfirmed.id = 27;
+    unconfirmed.op = "trash.delete";
+    unconfirmed.args["argv"] = nlohmann::json::array({second});
+    const fmt::ipc::Response refused = runtime.handle(unconfirmed);
+    FMT_CHECK(!refused.ok);
+    FMT_CHECK(refused.error.code == fmt::ErrorCode::InvalidArgument);
+    FMT_CHECK_EQ(fmt::exit_code(refused.error.code), 2);
+
+    // 带上 force：真的删掉，索引也一起清
+    fmt::ipc::Request forced;
+    forced.id = 28;
+    forced.op = "trash.delete";
+    forced.args["argv"] = nlohmann::json::array({second});
+    forced.args["force"] = true;
+    const fmt::ipc::Response purged = runtime.handle(forced);
+    FMT_CHECK(purged.ok);
+    if (purged.ok) {
+        FMT_CHECK_EQ(purged.data.value("trashed", std::string{}), second);
+    }
+
+    fmt::ipc::Request list_after;
+    list_after.id = 29;
+    list_after.op = "trash.list";
+    const fmt::ipc::Response after = runtime.handle(list_after);
+    FMT_CHECK(after.ok);
+    FMT_CHECK_EQ(after.data["deleted_buckets"].size(), std::size_t{0});
 }
 
 FMT_TEST(Service, 运行体声明数据根并幂等初始化) {
