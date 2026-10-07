@@ -140,17 +140,18 @@ bool print_command_help(const std::string& topic) {
     if (topic == "file") {
         std::printf(
             "file —— 文件（当前用户在当前 Bucket 里的文件）\n"
-            "  upload <来源> [文件名]   来源可以是 http:// 的 URL，也可以是本机路径。\n"
-            "                           v1 不支持 https（需要 OpenSSL）；同时只支持 http。\n"
+            "  upload <来源> [文件名]   来源可以是 http:// 或 https:// 的 URL，也可以是本机路径。\n"
             "                           文件名省略时取来源的最后一段；重名不会自动改名，\n"
-            "                           会提示换一个名字。相同内容的文件（MD5 相同）\n"
-            "                           会被拒绝，不重复入库。\n"
+            "                           会提示换一个名字；相同内容（MD5 相同）会被拒绝，\n"
+            "                           不重复入库。大小上限取 config.json 的 max_upload_size。\n"
             "  list                     列出当前 Bucket 的正常文件\n"
             "  get <file_id|文件名>     查看文件信息与磁盘路径\n"
-            "  delete <file_id>         软删除进回收站，file_id 不变（可用 trash 查回）\n"
+            "  delete <file_id>         软删除进回收站，file_id 不变\n"
+            "                           （文件级回收站目前只能写、还不能从 trash 查回，待阶段 7）\n"
             "\n"
             "文件落在 repository/<用户>/<Bucket>/YYYY/MM/DD/ 下；上传先写 temp/，\n"
-            "校验（大小上限、MD5、文件名）通过后才移动入库。\n");
+            "校验（大小上限、MD5、文件名）通过后才移动入库。\n"
+            "网络下载走系统组件（WinHTTP + Schannel），支持 https，不需要 OpenSSL。\n");
         return true;
     }
     if (topic == "share") {
@@ -812,25 +813,47 @@ void check_service_host(const Options& options) {
     }
 }
 
+// 双击引导里**唯一**的进度提示。
+//
+// 数据根体检的细节（建了哪些目录、服务状态）只进日志，不刷控制台——这是用户
+// 明确要求过的。但「等服务落定 + 连接并声明数据根」这段可能要几秒且完全静默，
+// 窗口看着像卡住，所以留这一行：它是提示，不是细节。
+void announce_initializing() {
+    std::printf("\n正在初始化配置...\n\n");
+    std::fflush(stdout);  // 后面就要开始等了，必须立刻显出来
+    log_info("Cli", "正在初始化配置（等服务落定、连接并声明数据根）");
+}
+
 int bootstrap_and_run(const Options& options) {
     // 数据根已经在 run() 里补过了（那一步要在日志器之前做）。
     // 2. 服务状态
     service::State state = service::query_state();
     log_info("Service", "当前状态：" + std::string(service::state_name(state)));
 
-    if (state == service::State::NotInstalled) {
+    const service::State initial = state;
+    const bool must_settle = (initial != service::State::Running);
+    // 未安装时装完不额外走一次「启动失败诊断」：一次 UAC 已经花掉了，
+    // 再自动重装就是第二次，不能不打商量。
+    const bool allow_recovery =
+        (initial != service::State::Running && initial != service::State::NotInstalled);
+
+    if (initial == service::State::NotInstalled) {
         log_info("Service", "服务未安装 -> 安装并启动");
         run_service_command("install", options);  // 一次 UAC：装 + 启动
-        state = settle_state(service::query_state(), kSettleCapMs);
-    } else if (state == service::State::Running) {
+    } else if (initial == service::State::Running) {
         log_info("Service", "服务运行中，不重复安装、不弹 UAC");
     } else {
         // 已安装但没在运行（已停止 / 正在停止 / 正在启动）：先尝试启动
         log_info("Service", "服务未在运行 -> 尝试启动");
         run_service_command("start", options);
-        state = settle_state(service::query_state(), kSettleCapMs);
+    }
 
-        if (state != service::State::Running) {
+    // 提权输出已经打完，接下来这一段才开始等待：提示打在两者之间。
+    announce_initializing();
+
+    if (must_settle) {
+        state = settle_state(service::query_state(), kSettleCapMs);
+        if (state != service::State::Running && allow_recovery) {
             state = recover_from_start_failure(options, state);
         }
     }
