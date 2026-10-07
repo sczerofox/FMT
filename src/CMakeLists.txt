@@ -11,3 +11,10 @@
 
 # 公共类型与工具：无业务依赖，最先引入
 add_subdirectory(common)
+
+# 底层数据访问与配置
+add_subdirectory(storage)
+add_subdirectory(config)
+
+# 路径计算与应用生命周期
+add_subdirectory(core)

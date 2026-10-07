@@ -5,6 +5,13 @@
 add_executable(fmt_tests
     fmt_test.cpp
     error_test.cpp
+    time_test.cpp
+    string_test.cpp
+    logger_test.cpp
+    path_manager_test.cpp
+    storage_test.cpp
+    config_test.cpp
+    app_test.cpp
 )
 
 target_link_libraries(fmt_tests

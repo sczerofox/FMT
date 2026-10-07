@@ -5,4 +5,7 @@
 
 target_sources(fmt_core PRIVATE
     error.cpp
+    time.cpp
+    string.cpp
+    logger.cpp
 )
