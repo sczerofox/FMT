@@ -112,6 +112,43 @@ Result<nlohmann::json> args_from_body(const httplib::Request& request) {
     return make_error(ErrorCode::InvalidArgument, "请求体缺少 name 字段");
 }
 
+// POST /api/file：{"url": "https://…"} 或 {"path": "D:/a.txt"}，可带 "file_name"。
+// 语义与管道一致（CLI 传来源，不传文件内容），只是包了一层 HTTP。
+Result<nlohmann::json> upload_args_from_body(const httplib::Request& request) {
+    if (request.body.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "请求体不能为空");
+    }
+
+    nlohmann::json body;
+    try {
+        body = nlohmann::json::parse(request.body);
+    } catch (const nlohmann::json::exception& error) {
+        return make_error(ErrorCode::JsonParseError,
+                          std::string("请求体不是合法 JSON：") + error.what());
+    }
+    if (!body.is_object()) {
+        return make_error(ErrorCode::InvalidArgument, "请求体必须是 JSON 对象");
+    }
+
+    std::string source;
+    if (const auto url = body.find("url"); url != body.end() && url->is_string()) {
+        source = url->get<std::string>();
+    } else if (const auto path = body.find("path"); path != body.end() && path->is_string()) {
+        source = path->get<std::string>();
+    }
+    if (source.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "请求体需要 url 或 path");
+    }
+
+    nlohmann::json args = nlohmann::json::object();
+    args["argv"] = nlohmann::json::array({source});
+    if (const auto iterator = body.find("file_name");
+        iterator != body.end() && iterator->is_string()) {
+        args["argv"].push_back(iterator->get<std::string>());
+    }
+    return args;
+}
+
 void respond(httplib::Response& response, const Result<nlohmann::json>& result) {
     if (ok(result)) {
         response.status = 200;
@@ -194,6 +231,28 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler) 
                            args["force"] = true;
                        }
                        run("trash.delete", args, response);
+                   });
+
+    // 文件（阶段 5）：upload 是长任务，服务端会走两段式（下载在锁外、登记在锁内）。
+    server->Get("/api/file", [run](const httplib::Request&, httplib::Response& response) {
+        run("file.list", nlohmann::json::object(), response);
+    });
+    server->Post("/api/file", [run](const httplib::Request& request,
+                                    httplib::Response& response) {
+        const Result<nlohmann::json> args = upload_args_from_body(request);
+        if (!ok(args)) {
+            respond(response, *error_of(args));
+            return;
+        }
+        run("file.upload", std::get<nlohmann::json>(args), response);
+    });
+    server->Get(R"(/api/file/([^/]+))",
+                [run](const httplib::Request& request, httplib::Response& response) {
+                    run("file.get", args_with_encoded_name(request.matches[1]), response);
+                });
+    server->Delete(R"(/api/file/([^/]+))",
+                   [run](const httplib::Request& request, httplib::Response& response) {
+                       run("file.delete", args_with_encoded_name(request.matches[1]), response);
                    });
 }
 

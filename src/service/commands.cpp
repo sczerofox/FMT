@@ -7,6 +7,7 @@
 #include "fmt/bucket/bucket.hpp"
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
+#include "fmt/file/file.hpp"
 
 namespace fmt::service {
 namespace {
@@ -242,6 +243,102 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
     return make_error(ErrorCode::InvalidArgument, "未知的回收站操作：" + operation);
 }
 
+// 文件：list / get / delete。**upload 不在这里**——它要边下载边写盘，属长任务，
+// 由运行体的两段式路径处理（下载在锁外、登记在锁内，见 file.hpp）。
+Result<nlohmann::json> file_command(AppContext& context, const std::string& operation,
+                                    const nlohmann::json& args) {
+    FileService files(*context.paths, context.config, context.logger.get());
+
+    if (operation == "file.list") {
+        const Result<std::vector<FileRecord>> items = files.list();
+        if (!ok(items)) {
+            return *error_of(items);
+        }
+
+        nlohmann::json array = nlohmann::json::array();
+        for (const FileRecord& record : std::get<std::vector<FileRecord>>(items)) {
+            nlohmann::json item = nlohmann::json::object();
+            item["file_id"] = record.file_id;
+            item["file_name"] = record.file_name;
+            item["extension"] = record.extension;
+            item["file_type"] = record.file_type;
+            item["size"] = record.size;
+            item["md5"] = record.md5;
+            array.push_back(std::move(item));
+        }
+
+        nlohmann::json data = nlohmann::json::object();
+        data["files"] = std::move(array);
+        data["count"] = data["files"].size();
+        data["current_bucket"] = context.config.current_bucket;
+        return data;
+    }
+
+    if (operation == "file.get") {
+        const Result<std::string> name = argument(args, 0, "file_id 或文件名");
+        if (!ok(name)) {
+            return *error_of(name);
+        }
+        const std::string value = std::get<std::string>(name);
+
+        // 先当 file_id 查（全局唯一），查不到再当文件名查（当前用户 + 正常文件）。
+        Result<FileRecord> record = files.get_by_id(value);
+        if (!ok(record)) {
+            record = files.get_by_name(value);
+        }
+        if (!ok(record)) {
+            return *error_of(record);
+        }
+
+        const FileRecord& found = std::get<FileRecord>(record);
+        nlohmann::json data = nlohmann::json::object();
+        data["file_id"] = found.file_id;
+        data["file_name"] = found.file_name;
+        data["bucket"] = found.bucket;
+        data["extension"] = found.extension;
+        data["file_type"] = found.file_type;
+        data["size"] = found.size;
+        data["md5"] = found.md5;
+        data["is_trash"] = found.is_trash;
+        data["trash_reason"] = found.trash_reason;
+
+        const Result<std::filesystem::path> path = files.resolve_path(found);
+        if (ok(path)) {
+            data["path"] =
+                relative_path_text(context.paths->root(), std::get<std::filesystem::path>(path));
+        }
+        return data;
+    }
+
+    if (operation == "file.delete") {
+        const Result<std::string> name = argument(args, 0, "file_id");
+        if (!ok(name)) {
+            return *error_of(name);
+        }
+        const std::string value = std::get<std::string>(name);
+
+        const Result<FileRecord> removed = files.remove(value);
+        if (!ok(removed)) {
+            return *error_of(removed);
+        }
+        const FileRecord& record = std::get<FileRecord>(removed);
+
+        nlohmann::json data = nlohmann::json::object();
+        data["file_id"] = record.file_id;
+        data["file_name"] = record.file_name;
+
+        const Result<std::filesystem::path> target = files.trash_path_of(record);
+        if (ok(target)) {
+            data["moved_to"] =
+                relative_path_text(context.paths->root(), std::get<std::filesystem::path>(target));
+        }
+        data["message"] = "文件已移入回收站：" + record.file_name;
+        return data;
+    }
+
+    return make_error(ErrorCode::ServiceOperationFailed, "操作尚未实现：" + operation);
+}
+
 }  // namespace
 
 bool is_known_business(const std::string& operation) {
@@ -268,7 +365,11 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
         return trash_command(context, operation, args);
     }
 
-    // 已经登记、还没实现的模块（file / share / config / server）。
+    if (starts_with(operation, "file.")) {
+        return file_command(context, operation, args);
+    }
+
+    // 已经登记、还没实现的模块（share / config / server）。
     return make_error(ErrorCode::ServiceOperationFailed, "操作尚未实现：" + operation);
 }
 

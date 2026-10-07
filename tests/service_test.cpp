@@ -166,7 +166,7 @@ FMT_TEST(Service, 管道能执行Bucket命令) {
     // 已登记但没实现的模块仍然是 FMT-602，而不是「未知操作」
     fmt::ipc::Request pending;
     pending.id = 13;
-    pending.op = "file.list";
+    pending.op = "share.list";  // share 还没做（file 已经能用了）
     const fmt::ipc::Response not_yet = runtime.handle(pending);
     FMT_CHECK(!not_yet.ok);
     FMT_CHECK(not_yet.error.code == fmt::ErrorCode::ServiceOperationFailed);
@@ -364,6 +364,99 @@ FMT_TEST(Service, 启动时清理temp里的遗留临时文件) {
     FMT_CHECK(fmt::file_exists(mine));
 }
 
+FMT_TEST(Service, 管道能上传与操作文件) {
+    fmt_test::TempDir temp("service-file");
+    const auto root = temp / "root";
+
+    // 上传来源：一个本地文件
+    const auto source = temp / "payload.txt";
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(source, "hello file")));
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    fmt::ipc::Request create;
+    create.id = 40;
+    create.op = "bucket.create";
+    create.args["argv"] = nlohmann::json::array({"工作"});
+    FMT_CHECK(runtime.handle(create).ok);
+
+    // 上传：运行体走两段式（下载/复制在锁外，登记在锁内）
+    fmt::ipc::Request upload;
+    upload.id = 41;
+    upload.op = "file.upload";
+    upload.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(source)});
+    const fmt::ipc::Response uploaded = runtime.handle(upload);
+    FMT_CHECK(uploaded.ok);
+    if (!uploaded.ok) {
+        return;
+    }
+    const std::string file_id = uploaded.data.value("file_id", std::string{});
+    FMT_CHECK(!file_id.empty());
+    FMT_CHECK_EQ(uploaded.data.value("file_name", std::string{}), std::string("payload.txt"));
+    FMT_CHECK_EQ(uploaded.data.value("size", std::uintmax_t{0}), std::uintmax_t{10});
+
+    // 列表
+    fmt::ipc::Request list;
+    list.id = 42;
+    list.op = "file.list";
+    const fmt::ipc::Response listed = runtime.handle(list);
+    FMT_CHECK(listed.ok);
+    if (listed.ok) {
+        FMT_CHECK_EQ(listed.data["files"].size(), std::size_t{1});
+        FMT_CHECK_EQ(listed.data["files"][0].value("file_name", std::string{}),
+                     std::string("payload.txt"));
+    }
+
+    // 按 file_id 与按文件名都能查
+    for (const std::string& key : {file_id, std::string("payload.txt")}) {
+        fmt::ipc::Request get;
+        get.id = 43;
+        get.op = "file.get";
+        get.args["argv"] = nlohmann::json::array({key});
+        const fmt::ipc::Response detail = runtime.handle(get);
+        FMT_CHECK(detail.ok);
+        if (detail.ok) {
+            FMT_CHECK_EQ(detail.data.value("file_id", std::string{}), file_id);
+            FMT_CHECK(detail.data.value("path", std::string{}).rfind("repository/user/", 0) == 0);
+        }
+    }
+
+    // 重复上传同一内容：MD5 去重
+    fmt::ipc::Request duplicate = upload;
+    duplicate.id = 44;
+    const fmt::ipc::Response rejected = runtime.handle(duplicate);
+    FMT_CHECK(!rejected.ok);
+    FMT_CHECK(rejected.error.code == fmt::ErrorCode::Md5Duplicate);
+
+    // 软删除
+    fmt::ipc::Request remove;
+    remove.id = 45;
+    remove.op = "file.delete";
+    remove.args["argv"] = nlohmann::json::array({file_id});
+    const fmt::ipc::Response removed = runtime.handle(remove);
+    FMT_CHECK(removed.ok);
+    if (removed.ok) {
+        FMT_CHECK(removed.data.value("moved_to", std::string{}).rfind("trash/user/.files/", 0) == 0);
+    }
+
+    // 删完列表空了，get 还能查到（记录仍在，只是 is_trash）
+    const fmt::ipc::Response after = runtime.handle(list);
+    FMT_CHECK(after.ok);
+    FMT_CHECK_EQ(after.data["files"].size(), std::size_t{0});
+
+    fmt::ipc::Request get_trashed;
+    get_trashed.id = 46;
+    get_trashed.op = "file.get";
+    get_trashed.args["argv"] = nlohmann::json::array({file_id});
+    const fmt::ipc::Response trashed = runtime.handle(get_trashed);
+    FMT_CHECK(trashed.ok);
+    if (trashed.ok) {
+        FMT_CHECK(trashed.data.value("is_trash", false));
+        FMT_CHECK_EQ(trashed.data.value("trash_reason", std::string{}), std::string("file"));
+    }
+}
+
 FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {
     fmt_test::TempDir temp("service-ops");
     fmt::service::ServerRuntime runtime(temp / "root", temp / "state");
@@ -371,7 +464,7 @@ FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {
 
     fmt::ipc::Request business;
     business.id = 2;
-    business.op = "file.list";
+    business.op = "share.create";  // share 还没做
     const fmt::ipc::Response not_implemented = runtime.handle(business);
     FMT_CHECK(!not_implemented.ok);
     FMT_CHECK(not_implemented.error.code == fmt::ErrorCode::ServiceOperationFailed);

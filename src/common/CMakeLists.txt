@@ -10,4 +10,10 @@ target_sources(fmt_core PRIVATE
     logger.cpp
     envelope.cpp
     validation.cpp
+    hash.cpp
 )
+
+# MD5 走 Windows CNG（bcrypt.dll），不引入第三方实现
+if(WIN32)
+    target_link_libraries(fmt_core PRIVATE bcrypt)
+endif()

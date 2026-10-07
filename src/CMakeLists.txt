@@ -24,6 +24,7 @@ add_subdirectory(service)
 
 # 业务模块
 add_subdirectory(bucket)
+add_subdirectory(file)
 
 # 命令行界面（两条入口中的 CLI 一侧）
 add_subdirectory(cli)

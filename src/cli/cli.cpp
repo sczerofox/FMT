@@ -92,11 +92,11 @@ void print_command_list() {
     std::printf("可用命令：\n");
     std::printf("  (service)  install  uninstall  start  stop  status\n");
     std::printf("  (bucket)   create  list  get  use  delete\n");
+    std::printf("  (file)     upload  list  get  delete\n");
     std::printf("  (trash)    list  get  restore  delete\n");
     std::printf("  (help)     help [命令]\n");
     std::printf("  (exit)     exit  quit\n");
     std::printf("\n业务命令（服务端尚未实现，现在会返回 FMT-602）：\n");
-    std::printf("  (file)     upload  list  get  delete\n");
     std::printf("  (share)    create  get  list  delete\n");
 }
 
@@ -139,11 +139,18 @@ bool print_command_help(const std::string& topic) {
     }
     if (topic == "file") {
         std::printf(
-            "file —— 文件（服务端尚未实现，现在返回 FMT-602）\n"
-            "  upload <URL>            从 http/https 下载入库\n"
-            "  list                    列出当前用户在当前 Bucket 的文件\n"
-            "  get <file_id|文件名>    查看文件信息\n"
-            "  delete <file_id>        软删除到回收站\n");
+            "file —— 文件（当前用户在当前 Bucket 里的文件）\n"
+            "  upload <来源> [文件名]   来源可以是 http:// 的 URL，也可以是本机路径。\n"
+            "                           v1 不支持 https（需要 OpenSSL）；同时只支持 http。\n"
+            "                           文件名省略时取来源的最后一段；重名不会自动改名，\n"
+            "                           会提示换一个名字。相同内容的文件（MD5 相同）\n"
+            "                           会被拒绝，不重复入库。\n"
+            "  list                     列出当前 Bucket 的正常文件\n"
+            "  get <file_id|文件名>     查看文件信息与磁盘路径\n"
+            "  delete <file_id>         软删除进回收站，file_id 不变（可用 trash 查回）\n"
+            "\n"
+            "文件落在 repository/<用户>/<Bucket>/YYYY/MM/DD/ 下；上传先写 temp/，\n"
+            "校验（大小上限、MD5、文件名）通过后才移动入库。\n");
         return true;
     }
     if (topic == "share") {
@@ -524,6 +531,37 @@ void print_business_data(const nlohmann::json& data) {
         std::printf("状态：%s\n", data.value("present", false) ? "在" : "目录已不存在");
         std::printf("文件数：%zu\n", data.value("files", std::size_t{0}));
         std::printf("占用：%s\n", format_size(data.value("bytes", std::uintmax_t{0})).c_str());
+        return;
+    }
+
+    // 文件列表：files: [{file_id, file_name, size}, …]
+    if (const auto items = data.find("files"); items != data.end() && items->is_array()) {
+        for (const nlohmann::json& item : *items) {
+            std::printf("  %s  %s\n", item.value("file_name", std::string{}).c_str(),
+                        format_size(item.value("size", std::uintmax_t{0})).c_str());
+        }
+        std::printf("共 %zu 个文件\n", items->size());
+        return;
+    }
+
+    // 单条文件信息：file_id + size
+    if (data.contains("file_id") && data.contains("size")) {
+        std::printf("文件：%s\n", data.value("file_name", std::string{}).c_str());
+        std::printf("file_id：%s\n", data.value("file_id", std::string{}).c_str());
+        std::printf("Bucket：%s\n", data.value("bucket", std::string{}).c_str());
+        std::printf("类型：%s%s\n", data.value("file_type", std::string{}).c_str(),
+                    data.value("extension", std::string{}).c_str());
+        std::printf("大小：%s\n", format_size(data.value("size", std::uintmax_t{0})).c_str());
+        std::printf("MD5：%s\n", data.value("md5", std::string{}).c_str());
+        if (data.contains("path")) {
+            std::printf("路径：%s\n", data.value("path", std::string{}).c_str());
+        }
+        if (data.value("is_trash", false)) {
+            std::printf("状态：在回收站（%s）\n",
+                        data.value("trash_reason", std::string{}).c_str());
+        } else {
+            std::printf("状态：正常\n");
+        }
         return;
     }
 

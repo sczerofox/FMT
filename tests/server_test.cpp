@@ -9,7 +9,10 @@
 #include "fmt/common/string.hpp"
 #include "fmt/core/app.hpp"
 #include "fmt/core/path.hpp"
+#include "fmt/file/file.hpp"
+#include "fmt/bucket/bucket.hpp"
 #include "fmt/service/commands.hpp"
+#include "fmt/storage/storage.hpp"
 #include "fmt_test.hpp"
 #include "temp_dir.hpp"
 
@@ -236,6 +239,132 @@ FMT_TEST(Server, Bucket路由与状态码) {
                 nlohmann::json::parse(empty_trash->body)["data"]["deleted_buckets"].size(),
                 std::size_t{0});
         }
+    }
+
+    server.stop();
+}
+
+FMT_TEST(Server, File路由与上传) {
+    fmt_test::TempDir temp("server-file");
+    const auto root = temp / "FMT";
+
+    auto context = fmt::initialize_service_context(root);
+    FMT_CHECK(fmt::ok(context));
+    fmt::AppContext& app = *std::get<std::unique_ptr<fmt::AppContext>>(context);
+
+    fmt::BucketService buckets(*app.paths, app.config, app.logger.get());
+    FMT_CHECK(fmt::ok(buckets.create("工作")));
+
+    const auto source = temp / "upload.bin";
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(source, "0123456789")));
+
+    // upload 在真实服务里由运行体做两段式；这里用同一对函数（prepare + commit）代跑。
+    auto handler = [&app](const std::string& operation,
+                          const nlohmann::json& args) -> fmt::Result<nlohmann::json> {
+        if (operation == "file.upload") {
+            std::string from;
+            std::string name;
+            if (args.contains("argv") && args["argv"].is_array()) {
+                if (!args["argv"].empty()) {
+                    from = args["argv"][0].get<std::string>();
+                }
+                if (args["argv"].size() > 1) {
+                    name = args["argv"][1].get<std::string>();
+                }
+            }
+            auto prepared = fmt::prepare_upload(*app.paths, from, name, app.config.max_upload_size,
+                                                app.logger.get());
+            if (!fmt::ok(prepared)) {
+                return *fmt::error_of(prepared);
+            }
+            fmt::PreparedUpload upload = std::get<fmt::PreparedUpload>(prepared);
+            fmt::FileService files(*app.paths, app.config, app.logger.get());
+            auto record = files.commit_upload(upload);
+            if (!fmt::ok(record)) {
+                return *fmt::error_of(record);
+            }
+            const fmt::FileRecord& stored = std::get<fmt::FileRecord>(record);
+            nlohmann::json data = nlohmann::json::object();
+            data["file_id"] = stored.file_id;
+            data["file_name"] = stored.file_name;
+            data["size"] = stored.size;
+            data["message"] = "文件已入库：" + stored.file_name;
+            return data;
+        }
+        return fmt::service::execute_business(app, operation, args);
+    };
+
+    fmt::server::HttpServer server;
+    FMT_CHECK(fmt::ok(server.start("127.0.0.1", 0, fmt::path_to_utf8(root), app.logger.get(),
+                                   handler)));
+    httplib::Client client("127.0.0.1", server.port());
+
+    // 空请求体 -> 400 + FMT-001
+    const auto empty_body = client.Post("/api/file", "", "application/json");
+    FMT_CHECK(empty_body != nullptr);
+    if (empty_body != nullptr) {
+        FMT_CHECK_EQ(empty_body->status, 400);
+        FMT_CHECK_EQ(nlohmann::json::parse(empty_body->body)["error"]["code"].get<std::string>(),
+                     std::string("FMT-001"));
+    }
+
+    // 上传：CLI 传来源，不传内容
+    std::string file_id;
+    const nlohmann::json body{{"path", fmt::path_to_utf8(source)}, {"file_name", "doc.bin"}};
+    const auto uploaded = client.Post("/api/file", body.dump(), "application/json");
+    FMT_CHECK(uploaded != nullptr);
+    if (uploaded != nullptr) {
+        FMT_CHECK_EQ(uploaded->status, 200);
+        const nlohmann::json parsed = nlohmann::json::parse(uploaded->body);
+        FMT_CHECK(parsed["ok"].get<bool>());
+        file_id = parsed["data"]["file_id"].get<std::string>();
+        FMT_CHECK_EQ(parsed["data"]["file_name"].get<std::string>(), std::string("doc.bin"));
+    }
+    FMT_CHECK(!file_id.empty());
+
+    // 列表
+    const auto listed = client.Get("/api/file");
+    FMT_CHECK(listed != nullptr);
+    if (listed != nullptr) {
+        FMT_CHECK_EQ(listed->status, 200);
+        FMT_CHECK_EQ(nlohmann::json::parse(listed->body)["data"]["files"].size(), std::size_t{1});
+    }
+
+    // 按 file_id 与按文件名都能查
+    for (const std::string& key : {file_id, std::string("doc.bin")}) {
+        const auto detail = client.Get("/api/file/" + fmt::url_encode(key));
+        FMT_CHECK(detail != nullptr);
+        if (detail != nullptr) {
+            FMT_CHECK_EQ(detail->status, 200);
+            FMT_CHECK_EQ(nlohmann::json::parse(detail->body)["data"]["file_id"].get<std::string>(),
+                         file_id);
+        }
+    }
+
+    // 不存在 -> 404 + FMT-002
+    const auto missing = client.Get("/api/file/nope.bin");
+    FMT_CHECK(missing != nullptr);
+    if (missing != nullptr) {
+        FMT_CHECK_EQ(missing->status, 404);
+        FMT_CHECK_EQ(nlohmann::json::parse(missing->body)["error"]["code"].get<std::string>(),
+                     std::string("FMT-002"));
+    }
+
+    // 软删除
+    const auto removed = client.Delete("/api/file/" + fmt::url_encode(file_id));
+    FMT_CHECK(removed != nullptr);
+    if (removed != nullptr) {
+        FMT_CHECK_EQ(removed->status, 200);
+        FMT_CHECK_EQ(nlohmann::json::parse(removed->body)["data"]["moved_to"]
+                         .get<std::string>()
+                         .rfind("trash/user/.files/", 0),
+                     std::size_t{0});
+    }
+
+    const auto after = client.Get("/api/file");
+    FMT_CHECK(after != nullptr);
+    if (after != nullptr) {
+        FMT_CHECK_EQ(nlohmann::json::parse(after->body)["data"]["files"].size(), std::size_t{0});
     }
 
     server.stop();

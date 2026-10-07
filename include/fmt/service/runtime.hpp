@@ -65,6 +65,8 @@ private:
     Status apply_root(const std::string& requested_root, std::string* effective_root,
                       std::string* previous_root, bool* switched);
     void serve(ipc::PipeConnection connection);
+    // 上传是两段式：下载/复制在锁外，登记在锁内（见 file.hpp 的注释）。
+    Result<nlohmann::json> run_upload(const nlohmann::json& args);
     // current_bucket 失效（目录不存在）时置空并落盘（开发文档第 61 节）。
     // 调用时必须持有 mutex_。
     void refresh_current_bucket_locked();

@@ -7,6 +7,7 @@
 #include "fmt/bucket/bucket.hpp"
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
+#include "fmt/file/file.hpp"
 #include "fmt/ipc/protocol.hpp"
 #include "fmt/service/commands.hpp"
 
@@ -173,6 +174,73 @@ Status ServerRuntime::start() {
     return std::monostate{};
 }
 
+Result<nlohmann::json> ServerRuntime::run_upload(const nlohmann::json& args) {
+    std::string source;
+    std::string name;
+    if (const auto argv = args.find("argv"); argv != args.end() && argv->is_array()) {
+        if (argv->size() > 0 && (*argv)[0].is_string()) {
+            source = (*argv)[0].get<std::string>();
+        }
+        if (argv->size() > 1 && (*argv)[1].is_string()) {
+            name = (*argv)[1].get<std::string>();
+        }
+    }
+    if (source.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少上传来源（http:// URL 或本地路径）");
+    }
+
+    // ① 锁下取快照。之后整段下载都在锁外跑，所以这里只拿必须的东西。
+    //
+    // 数据根在下载期间不会被换掉：换根只由 hello 触发，而管道的 accept/serve 是串行的，
+    // 我们此刻就在 handle() 里面，不会再处理第二个请求（技术文档并发一节）。
+    PathManager* paths = nullptr;
+    Logger* logger = nullptr;
+    std::uintmax_t size_limit = 0;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (context_ == nullptr) {
+            return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+        }
+        paths = context_->paths.get();
+        logger = context_->logger.get();
+        size_limit = context_->config.max_upload_size;
+    }
+
+    // ② 锁外：下载或复制到 temp/（长耗时，不能占着业务锁）。
+    Result<PreparedUpload> prepared = prepare_upload(*paths, source, name, size_limit, logger);
+    if (!ok(prepared)) {
+        return *error_of(prepared);
+    }
+    PreparedUpload upload = std::get<PreparedUpload>(prepared);
+
+    // ③ 锁内：登记。快，一次锁就够。
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (context_ == nullptr) {
+        std::error_code ignored;
+        std::filesystem::remove(upload.temp_path, ignored);
+        return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+    }
+
+    FileService files(*context_->paths, context_->config, context_->logger.get());
+    // 登记失败时由 commit_upload 负责清掉临时文件（见 file.hpp）。
+    Result<FileRecord> record = files.commit_upload(upload);
+    if (!ok(record)) {
+        return *error_of(record);
+    }
+
+    const FileRecord& stored = std::get<FileRecord>(record);
+    nlohmann::json data = nlohmann::json::object();
+    data["file_id"] = stored.file_id;
+    data["file_name"] = stored.file_name;
+    data["bucket"] = stored.bucket;
+    data["extension"] = stored.extension;
+    data["file_type"] = stored.file_type;
+    data["size"] = stored.size;
+    data["md5"] = stored.md5;
+    data["message"] = "文件已入库：" + stored.file_name + "（" + stored.file_id + "）";
+    return data;
+}
+
 void ServerRuntime::refresh_current_bucket_locked() {
     if (context_ == nullptr || context_->paths == nullptr) {
         return;
@@ -216,6 +284,10 @@ void ServerRuntime::restart_http() {
     // 浏览器与 CLI 走同一份业务实现。
     server::BusinessHandler handler =
         [this](const std::string& operation, const nlohmann::json& args) -> Result<nlohmann::json> {
+        // 上传同样走两段式：HTTP 与管道共用这一份实现。
+        if (operation == "file.upload") {
+            return run_upload(args);
+        }
         std::lock_guard<std::mutex> guard(mutex_);
         if (context_ == nullptr) {
             return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
@@ -339,6 +411,25 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
     if (!is_known_business(request.op)) {
         response.ok = false;
         response.error = make_error(ErrorCode::InvalidArgument, "未知操作：" + request.op);
+        return response;
+    }
+
+    // 上传是唯一的长任务：两段式，下载在锁外，登记在锁内。
+    if (request.op == "file.upload") {
+        Result<nlohmann::json> uploaded = run_upload(request.args);
+        if (ok(uploaded)) {
+            response.ok = true;
+            response.data = std::get<nlohmann::json>(uploaded);
+            return response;
+        }
+        response.ok = false;
+        response.error = *error_of(uploaded);
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (context_ != nullptr && context_->logger != nullptr) {
+            context_->logger->warn("Ipc", "file.upload 失败：" +
+                                              code_string(response.error.code) + " " +
+                                              response.error.message);
+        }
         return response;
     }
 
