@@ -667,15 +667,15 @@ int bootstrap_and_run(const Options& options) {
     check_service_host(options);
 
     // 4. 服务在跑就把数据根声明过去：这正是「数据根跟着 exe 走」。
+    //    换根这种例行状态变化只进日志，不往控制台刷（用户要看就看
+    //    service status，它会把「服务数据根」打出来）。
     Session session;
     if (state == service::State::Running) {
         if (const Status status = ensure_connected(session, options); !ok(status)) {
             log_warn("Cli", "暂时无法把数据根声明给服务：" + error_of(status)->message);
         } else if (session.root_switched) {
-            const std::string root_text = to_forward_slashes(options.data_root);
-            std::printf("服务数据根已切换：%s -> %s\n", session.previous_root.c_str(),
-                        root_text.c_str());
-            log_info("Service", "数据根切换：" + session.previous_root + " -> " + root_text);
+            log_info("Service", "数据根切换：" + session.previous_root + " -> " +
+                                    to_forward_slashes(options.data_root));
         } else {
             log_info("Service",
                      "服务数据根已经是：" + to_forward_slashes(options.data_root));
@@ -720,7 +720,11 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
     SetConsoleTitleW(kConsoleTitle);
     HANDLE singleton = CreateMutexW(nullptr, TRUE, kSingletonMutex);
     if (singleton != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
-        activate_existing_window();
+        // 已经有一个 FMT 窗口：把它拉到前面，本次静默退出（控制台不加噪音，
+        // 但日志里要看得出来「这次点击为什么什么都没发生」）。
+        const bool activated = activate_existing_window();
+        log_info("Cli", activated ? "已有 FMT 窗口，已激活它并退出（单实例）"
+                                  : "已有 FMT 窗口，未能把它置前，直接退出（单实例）");
         CloseHandle(singleton);
         return 0;
     }
