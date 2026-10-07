@@ -2533,7 +2533,8 @@ SetForegroundWindow
 **不新建第二个窗口。** 因此换数据根之前必须先关闭旧 CLI 窗口。
 
 提权副本必须无窗口：`runas` 会另开控制台窗口，且高完整性窗口不能被中完整性进程置前（UIPI），
-所以提权副本以 `SW_HIDE` 启动，结果经命名管道回传（见第 126 节）。
+所以提权副本以 `SW_HIDE` 启动，结果写进临时文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 回传，
+由父进程读回打印（见第 126 节）。
 
 ---
 
@@ -3563,7 +3564,8 @@ install → start → stop → uninstall 全流程
 提权（四条命令各弹一次 UAC，输出与第 126 节样例一致）
 用户取消 UAC（ERROR_CANCELLED 1223 → FMT-004 / 退出码 5，CLI 继续循环不退出）
 提权等待超时（FMT-602 / 退出码 8）
-提权副本不新开控制台窗口，结果经管道回到原窗口
+提权副本不新开控制台窗口，结果写进临时文件 %TEMP%\fmt-elev-<父进程 pid>.json 回到原窗口打印
+（服务宿主 exe 已丢失 → reinstall 一次 UAC 完成）
 开机自启（重启电脑后服务自动运行，横幅显示 Service Running...）
 Service Recovery（异常退出后按 5 秒 / 10 秒 / 30 秒重启，失败计数 1 天重置）
 uninstall 后 repository / trash / data / config / log 仍在
@@ -3860,7 +3862,8 @@ FMT 重构设计.md
 ```text
 单一 fmt.exe 三种形态（manifest 为 asInvoker）
 service install / uninstall / start / stop（无 pause、无 delete）
-service 四条命令一律 UAC 提权 + 结果经管道回传
+service 命令一律 UAC 提权 + 结果经临时文件 %TEMP%\fmt-elev-<父进程 pid>.json 回传
+  （提权副本 operation 五种：install / uninstall / start / stop / reinstall）
 CLI 走命名管道 \\.\pipe\fmt.control，不走 HTTP
 数据根由 CLI 声明，服务侧幂等初始化，CLI 只读
 服务状态文件 %ProgramData%\FMT\service.json
@@ -3906,8 +3909,10 @@ HTTP 实现限制
 
 # 126. 提权流程
 
-service 四条命令（`install` / `uninstall` / `start` / `stop`）**每条都走 UAC 提权**，
-即使目标状态已经满足也照常弹 UAC，不做免提权优化。
+service 命令（`install` / `uninstall` / `start` / `stop`）**每条都走 UAC 提权**，
+即使目标状态已经满足也照常弹 UAC，不做免提权优化。提权副本额外支持一个组合操作
+`reinstall`（= 先卸载再安装并启动，服务未安装时忽略卸载阶段的错误），用于「服务宿主 exe
+已丢失、需要重新指向当前目录」的场景，**一次 UAC 做完**。
 
 ## 126.1 判断是否已提权
 
@@ -3922,33 +3927,73 @@ GetTokenInformation(TokenElevation)
 
 ## 126.2 提权方式
 
+命令行形状（已定稿）：
+
 ```text
-打印「需要管理员权限」        ← FMT-603 AdminRequired
-打印「正在提权...」
- ↓
-ShellExecuteExW(
-    lpVerb = L"runas",
-    fMask  = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
-    nShow  = SW_HIDE)
- ↓
-WaitForSingleObject(hProcess, 60000)
- ↓
-GetExitCodeProcess
+结果文件：%TEMP%\fmt-elev-<父进程 pid>.json
+命令行  ：fmt.exe --elevated <operation> --result "<结果文件的绝对路径>"
+operation ∈ install | uninstall | start | stop | reinstall
 ```
+
+```text
+1. 先删除可能残留的结果文件 %TEMP%\fmt-elev-<父进程 pid>.json
+2. 打印「需要管理员权限」        ← FMT-603 AdminRequired
+   打印「正在提权...」
+   ↓
+   ShellExecuteExW(
+       lpVerb = L"runas",
+       lpFile = self.c_str(),        ← self 必须是具名变量，见下
+       fMask  = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+       nShow  = SW_HIDE)
+   ↓
+   WaitForSingleObject(hProcess, 60000)
+   ↓
+   GetExitCodeProcess → CloseHandle
+3. 读结果文件（读完即删除）→ 按 {ok, code, message, exit} 打印
+```
+
+**`SHELLEXECUTEINFOW::lpFile` 必须指向具名变量**：写成
+`info.lpFile = path_from_utf8(self).c_str();` 会指向一个语句结束就析构的临时 `std::wstring`，
+`ShellExecuteExW` 拿到悬垂指针，实测表现为 **Win32 1155 `ERROR_NO_ASSOCIATION`**
+（「没有应用程序与此操作的指定文件有关联」），看不出是提权的问题。先
+`const std::wstring self = executable_path();` 再取 `self.c_str()`；`lpParameters` 同理。
+
+失败分类（与 `FMT 技术文档.md` 13.8.3 一致）：
+
+| 失败点 | 表现 | 错误码 / 退出码 |
+| --- | --- | --- |
+| 用户点 UAC 的「否」 | `ShellExecuteExW` 失败，`ERROR_CANCELLED`（1223） | `FMT-004` / **5** |
+| 非管理员 / 策略禁止提权 | `ShellExecuteExW` 失败，`ERROR_ACCESS_DENIED`（5） | `FMT-603` / **5** |
+| `ShellExecuteExW` 其它失败 | 其它 `GetLastError()` | `FMT-602` / **8** |
+| 提权副本卡住 | `WAIT_TIMEOUT`（60 秒） | `FMT-602` / **8** |
+| 结果文件不存在（子进程崩了） | 读文件失败 | `FMT-602` / **8**，「提权副本没有返回结果」 |
 
 `runas` 启动的控制台程序会**另开一个控制台窗口**，所以提权副本必须：
 
 ```text
 以 SW_HIDE 无窗口启动
-只做 SCM 操作，短命，不进入命令循环
-结果 {ok, code, message}
-    经命名管道 \\.\pipe\fmt.elev.<pid>（或临时文件）回传父进程
-由父进程打印
+只做 SCM 操作（operation ∈ install / uninstall / start / stop / reinstall），短命，不进入命令循环
+结果 {ok, code, message, exit}
+    写进结果临时文件 %TEMP%\fmt-elev-<父进程 pid>.json（父进程 pid 命名，并发双击不打架）
+    命令行为 fmt.exe --elevated <operation> --result "<结果文件的绝对路径>"
+由父进程读回该文件并打印（读完即删除）
 ```
+
+结果文件内容：
+
+```json
+{ "ok": true,  "code": "FMT-000", "message": "成功",     "exit": 0 }
+{ "ok": false, "code": "FMT-601", "message": "服务未安装", "exit": 8 }
+```
+
+**为什么不用命名管道回传**：提权副本是高完整性进程，高完整性进程创建的命名管道带高完整性
+标签，而父进程（非提权 CLI，中完整性）受 MIC「禁止向上写」限制，**连接和读取都会被拒**
+（与 `FMT 技术文档.md` 13.9.2 的「坑 2」同一机制，见 13.8.3）。临时文件在用户自己的
+`%TEMP%` 下，同一个用户、只是令牌不同，父子两边都能正常读写，不需要放宽任何安全描述符。
 
 这是「只留一个窗口」的前提：整条命令始终只有一个可见控制台。
 
-## 126.3 四种命令各自何时提权
+## 126.3 五种 operation 各自何时提权
 
 | 命令 | 提权时机 | 提权后执行 |
 | --- | --- | --- |
@@ -3956,15 +4001,23 @@ GetExitCodeProcess
 | `service uninstall` | 命中该命令即提权，不检查服务是否在运行 | `ControlService(STOP)` + `DeleteService` |
 | `service start` | 命中该命令即提权，不检查服务是否已在运行 | `StartServiceW` |
 | `service stop` | 命中该命令即提权，不检查服务是否已停止 | `ControlService(SERVICE_CONTROL_STOP)` |
+| `service reinstall` | 命中该命令即提权（宿主 exe 已丢失时由引导流程触发） | `OpenServiceW` 失败（`ERROR_SERVICE_DOES_NOT_EXIST`）则**忽略** → `DeleteService`（若存在）→ `CreateServiceW` + Recovery → `StartServiceW`，**一次 UAC 完成** |
+
+`reinstall` 是提权副本的 operation 之一（`--elevated reinstall --result "<路径>"`），
+不是「先跑一次 uninstall 再跑一次 install」两条命令——两次命令会弹两次 UAC。
 
 ## 126.4 用户取消 UAC 与超时
 
 ```text
 用户取消 UAC（ERROR_CANCELLED，1223）  → FMT-004 / 退出码 5
+非管理员 / 策略禁止提权（ACCESS_DENIED，5） → FMT-603 / 退出码 5
 提权等待超时（60 秒）                  → FMT-602 / 退出码 8
+ShellExecuteExW 其它失败               → FMT-602 / 退出码 8
+结果文件不存在（提权副本崩了）          → FMT-602 / 退出码 8，「提权副本没有返回结果」
 SCM 操作失败                           → FMT-602 / 退出码 8
 服务不存在                             → FMT-601 / 退出码 8
 服务已存在（重复 install）             → FMT-600 / 退出码 8
+reinstall 时服务不存在                 → 忽略卸载阶段的 FMT-601，继续安装
 ```
 
 用户取消 UAC 或提权失败**不退出 CLI**：打印错误后回到提示符继续等待输入（见第 127 节）。
@@ -4101,8 +4154,8 @@ CLI 单实例：已有窗口则激活，不新建窗口
 | 命名空间 | `fmt` 保持不变；第三方库 vendor 到 `third_party/`，不污染业务命名空间 |
 | 第三方依赖 | vendor `nlohmann/json` + `cpp-httplib` 到 `third_party/`，`/MT` 静态链接 CRT，产物只有一个 `fmt.exe` |
 | 单一可执行文件 | `fmt.exe` 三种形态：CLI 形态 / Service 形态 / 提权短命副本；manifest 为 `asInvoker` |
-| service 命令 | 只有 `install` / `uninstall` / `start` / `stop`，无 `pause`、无 `delete`，命令不带 `--` 前缀 |
-| service 提权 | 四条命令一律走 UAC 提权，结果经 `\\.\pipe\fmt.elev.<pid>` 回传父进程打印，见第 126 节 |
+| service 命令 | 只有 `install` / `uninstall` / `start` / `stop`（提权副本另有 `reinstall` 组合操作），无 `pause`、无 `delete`，命令不带 `--` 前缀 |
+| service 提权 | service 命令（含 `reinstall`）一律走 UAC 提权，结果经临时文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 回传父进程打印（命令行 `--elevated <op> --result "<路径>"`，op 五种），见第 126 节 |
 | CLI 通道 | 命名管道 `\\.\pipe\fmt.control`（帧 = 4 字节长度 + JSON）；HTTP `127.0.0.1:4122` 只给浏览器 |
 | 数据根 | 由 CLI 用 `hello` 帧声明（自身 exe 所在目录）；服务维护当前数据根，切换不删旧数据 |
 | 初始化归属 | 服务创建 `repository`/`trash`/`config`/`data`/`log` 与默认 JSON；CLI 只读，见第 91～92 节 |

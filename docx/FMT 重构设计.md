@@ -137,12 +137,26 @@ fmt >service stop
 错误码：0                 ← 提权子进程的退出码
 ```
 
+命令行形状（**已定稿**）：
+
+```text
+结果文件：%TEMP%\fmt-elev-<父进程 pid>.json
+命令行  ：fmt.exe --elevated <operation> --result "<结果文件的绝对路径>"
+operation ∈ install | uninstall | start | stop | reinstall
+```
+
+`reinstall` = 先卸载（服务未安装时忽略该错误）再安装并启动，用于「服务宿主 exe 已丢失、
+需要重新指向当前目录」的场景，**一次 UAC 做完**。
+
 - 是否已提权：`OpenProcessToken` + `GetTokenInformation(TokenElevation)`。
-- 提权：`ShellExecuteExW(lpVerb=L"runas", fMask=SEE_MASK_NOCLOSEPROCESS|SEE_MASK_NOASYNC, nShow=SW_HIDE)`，
-  父进程 `WaitForSingleObject(hProcess, 60000)` + `GetExitCodeProcess`。
-- **`runas` 启动的控制台程序会另开一个控制台窗口**，所以提权副本必须 `SW_HIDE` 无窗口，结果经 `\\.\pipe\fmt.elev.<pid>`（或临时文件）回传，由父进程打印——这是「只留一个窗口」的前提。
-- 用户取消 UAC（`ERROR_CANCELLED` 1223）→ `FMT-004` / 退出码 5；等待超时 → `FMT-602` / 退出码 8。
-- 提权副本只做 SCM 操作，短命、不进循环。
+- 提权：`ShellExecuteExW(lpVerb=L"runas", fMask=SEE_MASK_NOCLOSEPROCESS|SEE_MASK_NOASYNC|SEE_MASK_FLAG_NO_UI, nShow=SW_HIDE)`，
+  父进程 `WaitForSingleObject(hProcess, 60000)` + `GetExitCodeProcess`，再读结果文件（读完即删除）。
+- **`runas` 启动的控制台程序会另开一个控制台窗口**，所以提权副本必须 `SW_HIDE` 无窗口，结果写进结果临时文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 回传，由父进程读回打印——这是「只留一个窗口」的前提。
+- **回传不用命名管道**：提权副本是高完整性进程，它创建的管道带高完整性标签，中完整性父进程受 MIC「禁止向上写」限制，**连接和读取都会被拒**（与技术文档 13.9.2「坑 2」同一机制）。临时文件在用户自己的 `%TEMP%` 下，同一个用户、只是令牌不同，父子两边都能读写，不需要放宽安全描述符。**命名管道方案作废，临时文件是唯一通道。**
+- 结果文件内容 `{ "ok": …, "code": "FMT-NNN", "message": …, "exit": … }`：`exit` 与提权副本的进程退出码一致（成功 0 / 需要管理员权限 5 / SCM 操作失败与等待超时 8）。
+- `SHELLEXECUTEINFOW::lpFile` 必须指向具名变量：`info.lpFile = path_from_utf8(self).c_str();` 会指向语句结束即析构的临时 `std::wstring`，实测表现为 Win32 1155 `ERROR_NO_ASSOCIATION`，完全看不出是提权的问题。
+- 用户取消 UAC（`ERROR_CANCELLED` 1223）→ `FMT-004` / 退出码 5；非管理员或策略禁止提权（`ERROR_ACCESS_DENIED` 5）→ `FMT-603` / 退出码 5；`ShellExecuteExW` 其它失败、等待超时、结果文件不存在（提权副本崩了）→ `FMT-602` / 退出码 8。
+- 提权副本只做 SCM 操作（五种 operation），短命、不进循环。
 
 ---
 
@@ -188,7 +202,8 @@ CLI 启动
  2. 查 SCM：已运行 → 不重装、不弹 UAC；未运行 → 提权 start；未安装 → 提权 install + start
  3. 比较服务 binPath 与自身路径：
       不同但文件存在   → 作为客户端继续
-      不同且文件已丢失 → 提示重新安装服务（uninstall + install，一次 UAC）
+      不同且文件已丢失 → 提示重新安装服务（提权副本的 reinstall operation：先卸载、再安装
+                          并启动，服务未安装时忽略卸载错误，一次 UAC，见第 4.4 节）
  4. 连管道声明 root=D:\FMT2 → 服务在 D:\FMT2 下建目录与默认 JSON
  5. 打印横幅与 Service Running... → fmt> 提示符
 ```
@@ -205,6 +220,7 @@ CLI 启动
 | `service uninstall` | 提权 → 先 `ControlService(STOP)` → `DeleteService`。**不得删除** `repository` / `trash` / `data` / `config` / `log` |
 | `service start` | 提权 → 存在则 `StartServiceW`；不存在 → `FMT-601` |
 | `service stop` | 提权 → `ControlService(SERVICE_CONTROL_STOP)` → 停止接受新请求 → 等在途事务 → 停 HTTP → 退出 |
+| `service reinstall` | 提权副本的 operation（`--elevated reinstall --result "<路径>"`）：卸载（服务不存在则忽略 `FMT-601`）→ 安装 → 启动，一次 UAC；用于宿主 exe 已丢失、需要重新指向当前目录 |
 
 Recovery：`ChangeServiceConfig2W(SERVICE_CONFIG_FAILURE_ACTIONS)`，第一次失败 5 秒、第二次 10 秒、后续 30 秒重启，失败计数 1 天重置；不自建 watchdog。
 
@@ -264,9 +280,10 @@ RegisterServiceCtrlHandlerExW
 |---|---|---|
 | 服务已存在，重复 install | `FMT-600 ServiceAlreadyInstalled` | 8 |
 | 服务不存在 | `FMT-601 ServiceNotInstalled` | 8 |
-| SCM 操作失败 / 提权等待超时 | `FMT-602 ServiceOperationFailed` | 8 |
-| 需要管理员权限（打印「需要管理员权限」） | `FMT-603 AdminRequired` | 5 |
-| 用户在 UAC 点「否」 | `FMT-004 PermissionDenied` | 5 |
+| SCM 操作失败 / 提权等待超时（60 秒） | `FMT-602 ServiceOperationFailed` | 8 |
+| `ShellExecuteExW` 其它失败 / 结果文件不存在（提权副本崩了） | `FMT-602 ServiceOperationFailed` | 8 |
+| 需要管理员权限（打印「需要管理员权限」，或 `ShellExecuteExW` 失败且 `ERROR_ACCESS_DENIED` 5） | `FMT-603 AdminRequired` | 5 |
+| 用户在 UAC 点「否」（`ERROR_CANCELLED` 1223） | `FMT-004 PermissionDenied` | 5 |
 
 编号一旦发布不复用、不修改语义，新增只能追加。
 
@@ -308,5 +325,5 @@ RegisterServiceCtrlHandlerExW
 |---|---|
 | 日志轮转 | 单文件大小上限与轮转规则仍未定 |
 | HTTP 鉴权 | 目前仅监听 `127.0.0.1`，局域网访问的安全控制后续再做 |
-| 提权副本的结果通道细节 | 命名管道与临时文件二选一，编码时定稿 |
+| 提权副本的结果通道细节 | **已定稿，从未决清单移出**：结果经临时文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 回传（第 4.4 节）；命名管道方案作废 |
 | 数据根切换的并发保护 | 目前依赖「只有一个 CLI 窗口」，多窗口场景不在本次范围 |

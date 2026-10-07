@@ -1154,6 +1154,7 @@ public:
 
 ```text
 %TEMP%\fmt\<服务进程 pid>\<name>.tmp       默认
+%TEMP%\fmt-elev-<父进程 pid>.json          例外：提权结果文件（固定名字，13.8.3）
 FMT_ROOT/temp/                            不再使用
 ```
 
@@ -1427,8 +1428,10 @@ FMT-NNN   业务/系统错误码，跨进程传递（管道、HTTP 信封），�
 |---|---|---|
 | 服务已存在，重复 `service install` | `FMT-600 ServiceAlreadyInstalled` | 8 |
 | 服务不存在（`service start` / `stop` / `uninstall`，或管道连不上） | `FMT-601 ServiceNotInstalled` | 8 |
-| SCM 操作失败 / 提权副本等待超时 | `FMT-602 ServiceOperationFailed` | 8 |
+| SCM 操作失败 / 提权副本等待超时 / `ShellExecuteExW` 其它失败 | `FMT-602 ServiceOperationFailed` | 8 |
+| 提权副本没有返回结果（结果文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 不存在） | `FMT-602 ServiceOperationFailed` | 8 |
 | 需要管理员权限（打印「需要管理员权限」） | `FMT-603 AdminRequired` | 5 |
+| `ShellExecuteExW` 失败且 `ERROR_ACCESS_DENIED`（5）（非管理员账户、策略禁止提权） | `FMT-603 AdminRequired` | 5 |
 | 用户在 UAC 点「否」（`ERROR_CANCELLED` 1223） | `FMT-004 PermissionDenied` | 5 |
 | 管道 `ERROR_ACCESS_DENIED`（DACL / MIC 不匹配） | `FMT-004 PermissionDenied` | 5 |
 | 入口分发遇到非 1053 的 SCM 错误 | `FMT-602 ServiceOperationFailed` | 8 |
@@ -1826,7 +1829,8 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleCP(CP_UTF8);
 
     // 1) 提权短命副本：内部参数，优先级最高
-    //    形如：fmt.exe --elevated install --pipe fmt.elev.1234
+    //    形如：fmt.exe --elevated install --result "C:\Users\me\AppData\Local\Temp\fmt-elev-1234.json"
+    //    operation ∈ install | uninstall | start | stop | reinstall（见 13.8.2 / 13.8.3）
     if (has_argument(argv, argc, L"--elevated")) {
         return service::run_elevated(argc, argv);   // 只做一次 SCM 操作后退出
     }
@@ -2220,29 +2224,60 @@ bool is_elevated() {
 
 #### 13.8.2 提权启动（父进程侧）
 
+**命令行形状（已定稿）**：
+
+```text
+结果文件：%TEMP%\fmt-elev-<父进程 pid>.json      ← 用户自己的临时目录，不是数据根、不是服务目录
+命令行  ：fmt.exe --elevated <operation> --result "<结果文件的绝对路径>"
+operation ∈ install | uninstall | start | stop | reinstall
+```
+
+其中 `reinstall` = 先卸载（**服务未安装时忽略该错误**）再安装并启动，用于「服务宿主 exe
+已丢失、需要重新指向当前目录」的场景（4.8 节表格第三行），**一次 UAC 做完**。
+
 ```cpp
-std::wstring self   = executable_path();                      // GetModuleFileNameW
-std::wstring params = L"--elevated " + op                    // install/uninstall/start/stop
-                    + L" --pipe fmt.elev." + std::to_wstring(GetCurrentProcessId());
+// 1) 先删除可能残留的结果文件：上一次崩溃留下的旧结果会让本次误判
+std::wstring result = temp_dir() + L"\\fmt-elev-"
+                    + std::to_wstring(GetCurrentProcessId()) + L".json";
+DeleteFileW(result.c_str());
+
+// 2) 组装参数：--elevated <operation> --result "<绝对路径>"
+const std::wstring self = executable_path();                  // GetModuleFileNameW
+const std::wstring params = L"--elevated " + op
+                          + L" --result \"" + result + L"\"";
 
 SHELLEXECUTEINFOW sei{};
 sei.cbSize       = sizeof(sei);
-sei.fMask        = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+sei.fMask        = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
 sei.lpVerb       = L"runas";                                  // ← 触发 UAC
-sei.lpFile       = self.c_str();
+sei.lpFile       = self.c_str();                              // ← 必须是具名变量，见下
 sei.lpParameters = params.c_str();
 sei.nShow        = SW_HIDE;                                   // ← 必须隐藏，见下
 if (!ShellExecuteExW(&sei)) {
     const DWORD error = GetLastError();
-    if (error == ERROR_CANCELLED) return /* FMT-004 PermissionDenied / 退出码 5 */;
-    return /* FMT-603 AdminRequired / 退出码 5 */;   // 非管理员账户、策略禁止等
+    if (error == ERROR_CANCELLED)     return /* FMT-004 PermissionDenied / 退出码 5 */;
+    if (error == ERROR_ACCESS_DENIED) return /* FMT-603 AdminRequired / 退出码 5 */;
+    return /* FMT-602 ServiceOperationFailed / 退出码 8 */;
 }
 
+// 3) 等子进程结束（上限 60 秒）→ 取退出码 → 关句柄
 const DWORD wait = WaitForSingleObject(sei.hProcess, 60000);   // 最多等 60 秒
+if (wait == WAIT_TIMEOUT) return /* FMT-602 ServiceOperationFailed / 退出码 8 */;
 DWORD code = 0;
 GetExitCodeProcess(sei.hProcess, &code);
 CloseHandle(sei.hProcess);
+
+// 4) 读结果文件（读完删除），按 {ok, code, message, exit} 打印，见 13.8.3
 ```
+
+> **实测教训（必须遵守）：`SHELLEXECUTEINFOW::lpFile` 必须指向具名变量。**
+>
+> 写成 `info.lpFile = path_from_utf8(self).c_str();` 会让指针指向一个**在语句结束就析构的
+> 临时 `std::wstring`**，`ShellExecuteExW` 拿到的是悬垂指针。实测表现为 **Win32 1155
+> `ERROR_NO_ASSOCIATION`（「没有应用程序与此操作的指定文件有关联」）**——报错文本里完全
+> 看不出和提权有关，最容易往「路径写错了 / exe 没找到」的方向白排查。
+> 正确写法是先落到一个具名变量（`const std::wstring self = executable_path();`），再取
+> `.c_str()`；`lpParameters` 指向的字符串同理，必须活到 `ShellExecuteExW` 返回为止。
 
 **必须写明：`runas` 启动的控制台程序会另开一个控制台窗口。**
 
@@ -2253,50 +2288,76 @@ CloseHandle(sei.hProcess);
 | 后果 | 处理 |
 |---|---|
 | 闪窗，观感差、内容还看不清 | `nShow = SW_HIDE` 隐藏窗口 |
-| 隐藏之后提权副本的输出用户看不到 | 结果**经命名管道回传父进程**，由父进程打印（13.8.3） |
+| 隐藏之后提权副本的输出用户看不到 | 结果**写进结果临时文件回传父进程**，由父进程读回打印（13.8.3） |
 
 **不能靠「提权副本自己打印」**：窗口被隐藏，它写 stdout 没人看得见；
 而且它一旦变成高完整性进程，它的窗口也不能被中完整性进程置前（UIPI，见 11.11）。
 所以正确分工是：
 
 ```text
-提权副本：只做 SCM 操作 → 把 {ok, code, message} 写回管道 → 退出
-父进程  ：读管道 → 自己打印「需要管理员权限 / 正在提权... / 执行成功... / 错误码：N」
+提权副本：只做 SCM 操作 → 把 {ok, code, message, exit} 写进结果文件 → 退出
+父进程  ：读结果文件（读完删除）→ 自己打印「需要管理员权限 / 正在提权... / 执行成功... / 错误码：N」
 ```
 
-#### 13.8.3 结果回传：命名管道（默认）或临时文件（降级）
+#### 13.8.3 结果回传：结果临时文件（已定稿）
 
-管道名：`\\.\pipe\fmt.elev.<父进程 pid>`（**父进程 pid**，保证并发双击不打架）。
+**定稿：临时文件。命名管道方案作废。**
 
 ```text
-1. 父进程先 CreateNamedPipeW(\\.\pipe\fmt.elev.<pid>, PIPE_ACCESS_INBOUND, ...)
-   并 ConnectNamedPipe（等待）→ 之后再 ShellExecuteExW
-   顺序不能反：先启动子进程再建管道，子进程可能连不上
-2. 子进程 CreateFileW(同名管道) → 写 JSON → FlushFileBuffers → 关闭
-3. 父进程 ReadFile → 解析 → 打印
-4. 两种失败都要兜住：
-   · 管道创建失败 → 降级：让子进程写 %TEMP%\fmt\elev.<pid>.json，父进程轮询读取
-   · 子进程不写（崩溃）→ 以 GetExitCodeProcess 的结果为准，report 通用失败
+结果文件：%TEMP%\fmt-elev-<父进程 pid>.json
+          父进程 pid → 并发双击也不会打架；同一用户 → 父子两边都能读写
 ```
 
-回传体（复用与业务信封同构的结构，便于共用格式化代码）：
+**为什么不用命名管道**：提权副本是**高完整性进程**，高完整性进程创建的命名管道会带上
+高完整性标签；而父进程（非提权的 CLI，中完整性）受**强制完整性级别（MIC）的「禁止向上写」
+（No-Write-Up）**限制，**连接和读取都会被拒**——即使 DACL 已经放行也一样。这
+与 13.9.2 的「坑 2」是同一个机制。要绕过它就得再给管道加 MIC 标签、放宽安全描述符，等于为了
+一条一次性回传通道去削弱一处安全边界。
+
+临时文件放在用户自己的 `%TEMP%` 下（**同一个用户，只是令牌不同**），父子两边都能正常读写，
+**不需要额外放宽任何安全描述符**。
+
+父进程流程（与 13.8.2 的代码一一对应）：
+
+```text
+1. 先删除可能残留的结果文件 %TEMP%\fmt-elev-<父进程 pid>.json
+2. ShellExecuteExW(lpVerb=L"runas", fMask=SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC |
+                  SEE_MASK_FLAG_NO_UI, nShow=SW_HIDE)
+3. WaitForSingleObject(hProcess, 60000) → GetExitCodeProcess → CloseHandle
+4. 读结果文件（读完即删除），按 {ok, code, message, exit} 打印
+```
+
+提权副本（`run_elevated`）执行 SCM 操作后把结果写进结果文件并退出，
+**进程退出码就是 `FMT-NNN` 映射出的退出码**（11.8 的映射表）。
+
+结果文件内容：
 
 ```json
-{ "ok": true,  "error": null,                            "message": "执行成功" }
-{ "ok": false, "error": { "code": "FMT-601", "message": "服务未安装" }, "message": "服务未安装" }
+{ "ok": true,  "code": "FMT-000", "message": "成功",     "exit": 0 }
+{ "ok": false, "code": "FMT-601", "message": "服务未安装", "exit": 8 }
 ```
 
 | 字段 | 说明 |
 |---|---|
 | `ok` | 提权副本这次 SCM 操作是否成功 |
-| `error` | 失败时为 `{code, message}`，`code` 是 `FMT-NNN` 字符串（与业务信封同格式，13.9.3） |
+| `code` | `FMT-NNN` 字符串（与业务信封同格式，13.9.3）；成功为 `FMT-000` |
 | `message` | 给用户看的一句话，父进程直接打印 |
+| `exit` | 与子进程退出码一致：成功 0；需要管理员权限 5；SCM 操作失败与等待超时 8 |
 
-**退出码仍由子进程的 `GetExitCodeProcess` 决定**（成功 0；需要管理员权限 5；
-SCM 操作失败与等待超时 8），与回传体里的 `code` 一一对应（11.8 的映射表）。
+父进程的失败分类（**1223 / 5 / 8 的分工以这张表为准**）：
 
-父进程还要给读取加超时（与 `WaitForSingleObject` 的 60 秒同量级），
-否则子进程挂在管道上会把 CLI 拖死。
+| 失败点 | Win32 表现 | 处理 |
+|---|---|---|
+| 用户点了 UAC 的「否」 | `ShellExecuteExW` 失败，`ERROR_CANCELLED`（1223） | `FMT-004 PermissionDenied` / 退出码 **5** |
+| 非管理员账户、策略禁止提权 | `ShellExecuteExW` 失败，`ERROR_ACCESS_DENIED`（5） | `FMT-603 AdminRequired` / 退出码 **5** |
+| `ShellExecuteExW` 其它失败 | 其它 `GetLastError()` | `FMT-602 ServiceOperationFailed` / 退出码 **8** |
+| 提权副本卡住 / 不退出 | `WaitForSingleObject` 返回 `WAIT_TIMEOUT`（60 秒） | `FMT-602 ServiceOperationFailed` / 退出码 **8** |
+| 结果文件不存在（子进程崩了） | `GetFileAttributesW` 失败 | `FMT-602 ServiceOperationFailed` / 退出码 **8**，提示「提权副本没有返回结果」 |
+
+- 结果文件**读完即删**，不留在 `%TEMP%` 里；也避免下次同 pid 复用时把旧结果当成新结果。
+- 提权副本退出码非 0 但结果文件存在时，**以结果文件为准**（`code` 决定错误码、`exit` 决定退出码）。
+- 读取发生在 `GetExitCodeProcess` 之后（子进程已退出），所以读文件本身不需要再设超时；
+  但**等待子进程必须有 60 秒上限**，否则提权副本卡住会把 CLI 一起拖死。
 
 #### 13.8.4 失败与错误的映射
 
@@ -2306,22 +2367,25 @@ SCM 操作失败与等待超时 8），与回传体里的 `code` 一一对应（
 | 用户等了很久没确认 | 同上（也可能更晚才返回 1223） | 同上 |
 | 提权副本卡住 / 不退出 | `WaitForSingleObject` 返回 `WAIT_TIMEOUT` | `FMT-602 ServiceOperationFailed`；**`TerminateProcess` 结束子进程**；退出码 **8** |
 | 提权副本返回非 0 | `GetExitCodeProcess` 得到 5 / 8 等 | 原样透传父进程的退出码 |
-| 提权副本回传 `ok=false` | — | 打印 `message` + `FMT-NNN`，退出码取 `code` 映射 |
-| 当前用户不是管理员 / 策略禁止提权 | `ShellExecuteExW` 返回非 `ERROR_CANCELLED` 的失败 | `FMT-603 AdminRequired` / 退出码 5，提示「需要管理员账户」 |
+| 提权副本回传 `ok=false` | 结果文件里 `"ok": false` | 打印 `message` + `FMT-NNN`，退出码取 `exit`（与 `code` 映射一致） |
+| 提权副本没有返回结果 | 结果文件不存在 | `FMT-602 ServiceOperationFailed` / 退出码 **8**，提示「提权副本没有返回结果」 |
+| 当前用户不是管理员 / 策略禁止提权 | `ShellExecuteExW` 失败，`ERROR_ACCESS_DENIED`（5） | `FMT-603 AdminRequired` / 退出码 5，提示「需要管理员账户」 |
 | 服务已经装过（install 时） | `OpenServiceW` 成功 | `FMT-600 ServiceAlreadyInstalled` / 退出码 8 |
 | 服务不存在（start / stop / uninstall） | `OpenServiceW` 失败，`ERROR_SERVICE_DOES_NOT_EXIST` | `FMT-601 ServiceNotInstalled` / 退出码 8 |
+| `reinstall` 时服务不存在 | `OpenServiceW` 失败，`ERROR_SERVICE_DOES_NOT_EXIST` | **忽略**卸载阶段的这个错误，继续安装并启动（不是失败） |
 
-**父进程的输入锁**：提权期间父进程在等管道，不应响应 `Ctrl+C` 之外的交互。
+**父进程的输入锁**：提权期间父进程在 `WaitForSingleObject`（以及随后的读结果文件），
+不应响应 `Ctrl+C` 之外的交互。
 `Ctrl+C` → 记一次中断 → 终止子进程 → 退出码 1。
 
 #### 13.8.5 提权副本的边界（硬约束）
 
 ```text
-只做 SCM 操作：install / uninstall / start / stop
+只做 SCM 操作：install / uninstall / start / stop / reinstall
   不做业务命令（不连 \\.\pipe\fmt.control，不读写数据根）
   不进入交互循环，不检查单实例互斥体（11.11）
   不带窗口（nShow = SW_HIDE），完成后立刻退出
-  它的全部输出走回传通道，不留控制台痕迹
+  它的全部输出写进结果文件（%TEMP%\fmt-elev-<父进程 pid>.json），不留控制台痕迹
 ```
 
 理由：它是**高完整性进程**。让高完整性进程去碰业务数据、长时间存活，
@@ -2412,6 +2476,9 @@ const wchar_t* kSddlWithMic = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;N
 2. 只用 SetSecurityInfo 单独设标签容易漏掉 DACL，反之亦然 → 一次设置
 3. ME（中完整性）意味着：中完整性 CLI 可连接；低完整性（如 IE 保护模式）仍会被拒
 4. 提权副本不连这个管道（它只做 SCM，见 13.8.5），所以不需要更高标签
+5. 反过来，**提权副本到父进程的回传通道也不能用命名管道**：高完整性副本创建的管道带高
+   完整性标签，中完整性父进程「禁止向上写」，连接与读取都会被拒——与坑 2 同一机制。
+   这是 13.8.3 定稿「结果走临时文件」的直接原因
 ```
 
 排查手法：连接返回 `ERROR_ACCESS_DENIED` 时，先用 `accesschk.exe <pipe>` 看 DACL，
@@ -3297,7 +3364,7 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 
 | 事项 | 现状 / 说明 |
 |---|---|
-| 提权路径端到端实测 | `service install/uninstall/start/stop` 都需要一次真实的 UAC 确认。要验证：成功路径、**取消 UAC（`ERROR_CANCELLED` 1223 → `FMT-004` / 5）**、等待超时（`WAIT_TIMEOUT` → `FMT-602` / 8）、重复 install（`FMT-600` / 8）、服务不存在（`FMT-601` / 8）、提权期间不出现控制台闪窗 |
+| 提权路径端到端实测 | `service install/uninstall/start/stop/reinstall` 都需要一次真实的 UAC 确认。要验证：成功路径、**取消 UAC（`ERROR_CANCELLED` 1223 → `FMT-004` / 5）**、等待超时（`WAIT_TIMEOUT` → `FMT-602` / 8）、重复 install（`FMT-600` / 8）、服务不存在（`FMT-601` / 8）、提权期间不出现控制台闪窗、结果文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 正确生成并在父进程读完后删除 |
 | 管道连接权限实测 | DACL（`D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`）与 MIC 标签（`S:(ML;;NW;;;ME)`）都要在**非提权 CLI** 上跑通；只测提权 CLI 会掩盖 13.9.2 的两个坑 |
 | 根切换实测 | CLI 换目录运行 → 服务切根、幂等初始化新根、旧根数据不删、`service.json` 的 `current_root` 更新 |
 | SCM 30 秒限制 | 需要一次「初始化故意变慢」的验证：确认 `START_PENDING` + `dwCheckPoint` 上报真的消除了 1053 |
@@ -3306,11 +3373,11 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 | Trash / `file delete` | 与 18.12 相同，尚未实现；落地方案已定（标记 `is_trash` + 移入 `trash/<user>/<bucket>/YYYY/MM/DD/`） |
 | Preview | `file preview` / `share preview` 返回 `FMT-701`，属于阶段 6 |
 | 交互式输入的 UTF-8 | 输出与参数已是 UTF-8；`std::getline(std::cin, ...)` 在 GBK 控制台下读中文的方案待冻结（`ReadConsoleW` 是候选） |
-| 临时文件位置 | 第 10.2 节旧文写「系统临时目录或 `FMT_ROOT/temp/`」，4.2 已改为 `%TEMP%\fmt\<pid>\`；临时文件**不放在数据根**，避免污染被切换的目录 |
+| 临时文件位置 | 第 10.2 节旧文写「系统临时目录或 `FMT_ROOT/temp/`」，4.2 已改为 `%TEMP%\fmt\<pid>\`；临时文件**不放在数据根**，避免污染被切换的目录。提权结果文件是唯一例外：固定名 `%TEMP%\fmt-elev-<父进程 pid>.json`（13.8.3），便于父进程直接拼出路径 |
 
 ### 18.14 上一次实现遗留、本次仍需保留的纪律
 
-以下三条与代码形态无关，重构后仍然适用（来自 18.5 / 18.7 / 18.11 的实测教训）：
+以下四条与代码形态无关，重构后仍然适用（来自 18.5 / 18.7 / 18.11 的实测教训）：
 
 ```text
 1. 所有用户输入片段拼路径，必须经 common/text 的 UTF-8 ↔ fs::path 转换
@@ -3321,6 +3388,12 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 
 3. 长生命周期对象（Service、PathManager、Logger）不存值成员、不存会悬垂的引用
    → 值成员被移动后引用悬垂；Windows 上表现为访问违例而不是可读的异常
+
+4. ShellExecuteExW 的 lpFile / lpParameters 必须指向具名变量，不能直接挂 .c_str()
+   → info.lpFile = path_from_utf8(self).c_str(); 会指向语句结束即析构的临时 std::wstring
+   → 悬垂指针的实测表现是 Win32 1155 ERROR_NO_ASSOCIATION
+     （「没有应用程序与此操作的指定文件有关联」），完全看不出是提权问题，极难排查
+   → 先 const std::wstring self = executable_path(); 再取 self.c_str()（见 13.8.2）
 ```
 
 ---
@@ -3336,12 +3409,12 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 | 两个不同的数据根 | CLI 所在目录（声明值）与服务宿主 exe 所在目录（无 CLI 连接时的回退值）可能不同。是否需要一条「服务启动后马上规范化为记录值」的规则，避免「服务自启 → 用宿主目录 → 第一个 CLI 连上 → 又切一次」的抖动，待定 |
 | 多 CLI 窗口 | 单实例（11.11）保证同时只有一个数据根，因此根切换不需要按连接隔离。若将来放开多窗口，需要重新设计「一个当前根」的语义 |
 | `service.json` 的字段集 | 现定 `version` / `current_root` / `binary_path` / `installed_at`。是否需要记录「上次正常停止时间」等诊断字段待定 |
-| `--elevated` 的参数形状 | 现定 `fmt.exe --elevated <op> --pipe fmt.elev.<pid>`。是否为每个 op 携带附加参数（如 install 时指定 root）待定 |
+| `--elevated` 的参数形状 | **已定稿**：`fmt.exe --elevated <operation> --result "<结果文件绝对路径>"`，`operation ∈ install / uninstall / start / stop / reinstall`（13.8.2）。是否再为某个 op 携带附加参数（如 install 时指定 root）仍待定 |
 | 管道 `op` 的完整清单 | `bucket.*` / `file.*` / `share.*` / `trash.*` / `config.*` / `hello` 的**精确名字与参数**随各命令实现确定（13.9.3） |
 | 长耗时命令的超时值 | 普通命令定为 30 秒（13.9.4）；`file.upload` 这类的最长等待时间需按最大上传大小估算后冻结 |
 | 停止等待与 Recovery 的相互作用 | 停止过程中若超时（13.7.3），是否返回非零退出码让 SCM 记录一次失败、甚至触发 Recovery，待定——不处理好会出现「停止失败 → 自动重启」的循环 |
 | 管道实例数量与线程模型 | `PIPE_UNLIMITED_INSTANCES` + 每连接一线程，理论上可被本机进程耗尽。是否改成固定工作线程池待定 |
-| 提权副本的临时文件回退 | 13.8.3 的降级路径（写 `%TEMP%`）是否需要，取决于管道方案在实测中是否稳定；若稳定可只在文档保留而不实现 |
+| 提权副本的结果通道 | **已定稿，从待决清单移出**：结果经临时文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 回传（13.8.3）。命名管道方案作废，原因是 MIC「禁止向上写」（13.9.2 坑 2），不存在「管道 + 临时文件降级」两条路 |
 | `version` 字段与兼容 | `service.json` 沿用「未知版本直接拒绝」的策略，还是允许忽略未知字段待定 |
 
 ### 19.2 上一次实现遗留的待决事项（仍然有效）
