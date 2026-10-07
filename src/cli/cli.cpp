@@ -91,10 +91,10 @@ void print_version() { std::printf("%s\n", banner_text().c_str()); }
 void print_command_list() {
     std::printf("可用命令：\n");
     std::printf("  (service)  install  uninstall  start  stop  status\n");
+    std::printf("  (bucket)   create  list  get  use  delete\n");
     std::printf("  (help)     help [命令]\n");
     std::printf("  (exit)     exit  quit\n");
     std::printf("\n业务命令（服务端尚未实现，现在会返回 FMT-602）：\n");
-    std::printf("  (bucket)   create  list  get  use  delete\n");
     std::printf("  (file)     upload  list  get  delete\n");
     std::printf("  (share)    create  get  list  delete\n");
     std::printf("  (trash)    list  get  restore  delete\n");
@@ -126,12 +126,12 @@ bool print_command_help(const std::string& topic) {
     }
     if (topic == "bucket") {
         std::printf(
-            "bucket —— 存储空间（服务端尚未实现，现在返回 FMT-602）\n"
-            "  create <名称>   创建\n"
-            "  list            列出\n"
-            "  get <名称>      查看\n"
-            "  use <名称>      切换当前 Bucket\n"
-            "  delete <名称>   删除到回收站\n");
+            "bucket —— 存储空间（Bucket 就是一个目录，没有独立 ID）\n"
+            "  create <名称>   创建；第一个 Bucket 会自动成为当前 Bucket\n"
+            "  list            列出所有 Bucket；当前的那个前面标 *\n"
+            "  get <名称>      查看名称、是否当前、目录路径\n"
+            "  use <名称>      切换当前 Bucket（只改 current_bucket，不动数据）\n"
+            "  delete <名称>   移到回收站；删的是当前 Bucket 时置空，不自动切换\n");
         return true;
     }
     if (topic == "file") {
