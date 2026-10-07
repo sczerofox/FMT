@@ -227,30 +227,50 @@ Result<ServiceState> load_state() { return load_state_from(state_directory()); }
 
 Status save_state(const ServiceState& state) { return save_state_to(state_directory(), state); }
 
-State query_state() {
+Result<StatusInfo> query_status() {
     Result<SC_HANDLE> manager = open_manager(SC_MANAGER_CONNECT);
     if (!ok(manager)) {
-        return State::Unknown;
+        return *error_of(manager);
     }
+    const SC_HANDLE manager_handle = std::get<SC_HANDLE>(manager);
 
-    SC_HANDLE service = OpenServiceW(std::get<SC_HANDLE>(manager), kServiceName, SERVICE_QUERY_STATUS);
+    SC_HANDLE service = OpenServiceW(manager_handle, kServiceName, SERVICE_QUERY_STATUS);
     if (service == nullptr) {
         const DWORD error = GetLastError();
-        CloseServiceHandle(std::get<SC_HANDLE>(manager));
+        CloseServiceHandle(manager_handle);
         if (error == ERROR_SERVICE_DOES_NOT_EXIST) {
-            return State::NotInstalled;
+            StatusInfo info;
+            info.state = State::NotInstalled;  // 正常结果，不是错误
+            return info;
         }
-        return State::Unknown;
+        return make_error(ErrorCode::ServiceOperationFailed,
+                          "打开服务失败（Win32 " + std::to_string(error) + "）");
     }
 
-    SERVICE_STATUS status{};
-    const BOOL queried = QueryServiceStatus(service, &status);
+    SERVICE_STATUS_PROCESS status{};
+    DWORD needed = 0;
+    const BOOL queried = QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+                                              reinterpret_cast<LPBYTE>(&status), sizeof(status),
+                                              &needed);
     CloseServiceHandle(service);
-    CloseServiceHandle(std::get<SC_HANDLE>(manager));
+    CloseServiceHandle(manager_handle);
+
     if (!queried) {
-        return State::Unknown;
+        return make_error(ErrorCode::ServiceOperationFailed,
+                          "查询服务状态失败（Win32 " + std::to_string(GetLastError()) + "）");
     }
-    return map_state(status.dwCurrentState);
+
+    StatusInfo info;
+    info.state = map_state(status.dwCurrentState);
+    info.wait_hint_ms = status.dwWaitHint;
+    info.win32_exit_code = status.dwWin32ExitCode;
+    info.service_exit_code = status.dwServiceSpecificExitCode;
+    return info;
+}
+
+State query_state() {
+    Result<StatusInfo> info = query_status();
+    return ok(info) ? std::get<StatusInfo>(info).state : State::Unknown;
 }
 
 Result<std::string> installed_binary_path() {
@@ -293,42 +313,22 @@ Result<std::string> installed_binary_path() {
 }
 
 Result<ErrorCode> last_start_failure() {
-    Result<SC_HANDLE> manager = open_manager(SC_MANAGER_CONNECT);
-    if (!ok(manager)) {
-        return *error_of(manager);
+    Result<StatusInfo> queried = query_status();
+    if (!ok(queried)) {
+        return *error_of(queried);
     }
-    const SC_HANDLE manager_handle = std::get<SC_HANDLE>(manager);
+    const StatusInfo& info = std::get<StatusInfo>(queried);
 
-    SC_HANDLE service = OpenServiceW(manager_handle, kServiceName, SERVICE_QUERY_STATUS);
-    if (service == nullptr) {
-        const DWORD error = GetLastError();
-        CloseServiceHandle(manager_handle);
-        if (error == ERROR_SERVICE_DOES_NOT_EXIST) {
-            return make_error(ErrorCode::ServiceNotInstalled, "服务未安装");
-        }
+    if (info.state == State::NotInstalled) {
+        return make_error(ErrorCode::ServiceNotInstalled, "服务未安装");
+    }
+    if (info.win32_exit_code != ERROR_SERVICE_SPECIFIC_ERROR || info.service_exit_code == 0) {
         return make_error(ErrorCode::ServiceOperationFailed,
-                          "打开服务失败（Win32 " + std::to_string(error) + "）");
-    }
-
-    SERVICE_STATUS_PROCESS status{};
-    DWORD needed = 0;
-    const BOOL queried = QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
-                                              reinterpret_cast<LPBYTE>(&status), sizeof(status),
-                                              &needed);
-    CloseServiceHandle(service);
-    CloseServiceHandle(manager_handle);
-
-    if (!queried) {
-        return make_error(ErrorCode::ServiceOperationFailed, "查询服务状态失败");
-    }
-    if (status.dwWin32ExitCode != ERROR_SERVICE_SPECIFIC_ERROR ||
-        status.dwServiceSpecificExitCode == 0) {
-        return make_error(ErrorCode::ServiceOperationFailed,
-                          "服务没有留下失败编号（Win32 " + std::to_string(status.dwWin32ExitCode) +
+                          "服务没有留下失败编号（Win32 " + std::to_string(info.win32_exit_code) +
                               "）");
     }
 
-    const std::string number = std::to_string(status.dwServiceSpecificExitCode);
+    const std::string number = std::to_string(info.service_exit_code);
     bool known = false;
     const ErrorCode code = code_from_string(number, &known);
     if (!known) {

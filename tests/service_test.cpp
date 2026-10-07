@@ -74,6 +74,20 @@ FMT_TEST(Service, 查询不会因为权限失败而崩溃) {
     }
 }
 
+FMT_TEST(Service, 状态查询与状态名一致) {
+    const auto info = fmt::service::query_status();
+    FMT_CHECK(fmt::ok(info));
+
+    const fmt::service::StatusInfo& value = std::get<fmt::service::StatusInfo>(info);
+    FMT_CHECK(value.state == fmt::service::query_state());
+
+    // 未安装是一个正常结果，不是错误；此时也不该有等待提示
+    if (value.state == fmt::service::State::NotInstalled) {
+        FMT_CHECK_EQ(value.wait_hint_ms, DWORD{0});
+        FMT_CHECK_EQ(value.win32_exit_code, DWORD{0});
+    }
+}
+
 FMT_TEST(Service, 运行体声明数据根并幂等初始化) {
     fmt_test::TempDir temp("service-runtime");
     const auto root_a = temp / "A";

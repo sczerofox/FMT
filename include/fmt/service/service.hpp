@@ -41,6 +41,19 @@ enum class State {
 
 std::string_view state_name(State state);
 
+// 一次状态查询的完整结果。等待类状态会带上 SCM 自己估计的 dwWaitHint：
+// 「还要多久」由 SCM 说，别写死秒数。
+struct StatusInfo {
+    State state = State::Unknown;
+    DWORD wait_hint_ms = 0;
+    DWORD win32_exit_code = 0;
+    DWORD service_exit_code = 0;
+};
+
+// 查询服务状态。**不需要管理员权限**。
+// 「未安装」是一个正常状态（state = NotInstalled）；只有查询本身失败才返回错误。
+Result<StatusInfo> query_status();
+
 // ---- 服务自身状态 ----
 std::filesystem::path state_directory();  // %ProgramData%\FMT
 std::filesystem::path state_file();       // %ProgramData%\FMT\service.json

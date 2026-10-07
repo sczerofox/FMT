@@ -62,6 +62,9 @@ constexpr wchar_t kConsoleTitle[] = L"FMT";
 // 服务刚被 service start 拉起来时监听还没就绪，连接要给它一点时间。
 constexpr int kConnectWaitMs = 5000;
 
+// 状态落定的兜底上限：正常由 SCM 的 dwWaitHint 决定，这只是最后一道闸。
+constexpr int kSettleCapMs = 30000;
+
 // 服务当前数据根与本进程不同时，点明服务侧日志写在哪里：
 // 两个进程各写自己数据根下的 log/fmt.log（根一样时才是同一个文件）。
 void note_service_root(const Options& options) {
@@ -111,14 +114,39 @@ std::string service_state_line(service::State state) {
 
 // 刚安装或刚启动时服务还在 START_PENDING：等它落定再显示状态，
 // 否则横幅会在服务已经起来的情况下写 Service Stopped...
-service::State settle_state(service::State state, int timeout_ms) {
-    constexpr int kStepMs = 100;
-    for (int waited = 0; waited < timeout_ms; waited += kStepMs) {
-        if (state != service::State::StartPending && state != service::State::StopPending) {
+//
+// 「还要等多久」听 SCM 的 dwWaitHint，而不是写死秒数：慢机器上写死会把
+// 「还在启动」误判成「启动失败」，然后白弹一次 UAC 去重装。
+service::State settle_state(service::State state, int cap_ms) {
+    constexpr int kMinStepMs = 100;
+    constexpr int kMaxStepMs = 2000;
+
+    int waited = 0;
+    while (waited < cap_ms && (state == service::State::StartPending ||
+                               state == service::State::StopPending)) {
+        Result<service::StatusInfo> info = service::query_status();
+        if (!ok(info)) {
             break;
         }
-        Sleep(kStepMs);
-        state = service::query_state();
+        const service::StatusInfo& current = std::get<service::StatusInfo>(info);
+        state = current.state;
+
+        int step = static_cast<int>(current.wait_hint_ms);
+        if (step < kMinStepMs) {
+            step = kMinStepMs;
+        }
+        if (step > kMaxStepMs) {
+            step = kMaxStepMs;
+        }
+        if (waited + step > cap_ms) {
+            step = cap_ms - waited;
+        }
+        if (step <= 0) {
+            break;
+        }
+
+        Sleep(static_cast<DWORD>(step));
+        waited += step;
     }
     return state;
 }
@@ -505,7 +533,7 @@ service::State recover_from_start_failure(const Options& options, service::State
     log_info("Service", "启动失败，尝试 reinstall");
     run_service_command("reinstall", options);
 
-    const service::State after = settle_state(service::query_state(), 8000);
+    const service::State after = settle_state(service::query_state(), kSettleCapMs);
     if (after != service::State::Running) {
         std::printf("重新安装后服务仍未运行，请查看 log/fmt.log\n");
         log_error("Service", "reinstall 之后服务仍未运行");
@@ -548,14 +576,14 @@ int bootstrap_and_run(const Options& options) {
     if (state == service::State::NotInstalled) {
         log_info("Service", "服务未安装 -> 安装并启动");
         run_service_command("install", options);  // 一次 UAC：装 + 启动
-        state = settle_state(service::query_state(), 8000);
+        state = settle_state(service::query_state(), kSettleCapMs);
     } else if (state == service::State::Running) {
         log_info("Service", "服务运行中，不重复安装、不弹 UAC");
     } else {
         // 已安装但没在运行（已停止 / 正在停止 / 正在启动）：先尝试启动
         log_info("Service", "服务未在运行 -> 尝试启动");
         run_service_command("start", options);
-        state = settle_state(service::query_state(), 8000);
+        state = settle_state(service::query_state(), kSettleCapMs);
 
         if (state != service::State::Running) {
             state = recover_from_start_failure(options, state);
