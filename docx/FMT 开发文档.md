@@ -6,8 +6,9 @@
 > 对应架构文档：`FMT 项目架构.md`
 > 开发平台：Windows
 > 构建工具：CMake + Ninja + Visual Studio Build Tools
-> 主程序：`fmt.exe`
-> 文档状态：V1 开发规范
+> 主程序：`fmt.exe`（单一可执行文件，三种形态：CLI 形态 / Service 形态 / 提权短命副本）
+> 文档状态：V1 开发规范（`arch-restart` 重构版）
+> 本次重构差异与决策索引：`FMT 重构设计.md`
 
 ---
 
@@ -34,7 +35,10 @@
 * MD5 去重
 * Trash
 * Share
+* 运行目录与数据根
 * Windows Service
+* Service 提权与命名管道 IPC
+* CLI 界面约定
 * HTTP Server
 * 错误处理
 * 一致性处理
@@ -113,6 +117,15 @@ MSVC
 fmt.exe
 ```
 
+依赖（vendor 到 `third_party/`，不再自研）：
+
+```text
+nlohmann/json       JSON 解析与序列化
+cpp-httplib         HTTP Server（Service 侧）
+```
+
+CRT 采用 `/MT` 静态链接，最终产物只有一个 `fmt.exe`。
+
 ---
 
 # 4. 项目源码目录
@@ -136,6 +149,7 @@ FMT/
 │       ├── trash/
 │       ├── storage/
 │       ├── service/
+│       ├── ipc/
 │       ├── server/
 │       └── common/
 │
@@ -151,6 +165,7 @@ FMT/
 │   ├── trash/
 │   ├── storage/
 │   ├── service/
+│   ├── ipc/
 │   ├── server/
 │   └── common/
 │
@@ -168,7 +183,7 @@ FMT/
 编译完成后：
 
 ```text
-FMT/
+<数据根>/
 ├── fmt.exe
 ├── repository/
 ├── trash/
@@ -185,7 +200,20 @@ FMT/
     └── error.log
 ```
 
+数据根（`FMT_ROOT`）**由 CLI 声明**：CLI 连接服务时用 `hello` 帧带上自己 exe 所在目录
+（`GetModuleFileNameW` 取父目录），服务把该目录作为「当前数据根」。切换数据根时**不删除旧根数据**，
+只对新根做幂等初始化（见第 91～94 节）。
+
 `log/` 与业务数据分离（日志不是业务数据），见第 65 节。
+
+服务自身状态不属于业务数据，单独存放，不放进任何数据根：
+
+```text
+%ProgramData%\FMT\service.json
+```
+
+该文件只记录「当前数据根路径」与安装信息。服务开机自启且没有 CLI 连接时，
+数据根取该文件的记录值；从未记录过则取服务宿主 exe 所在目录。
 
 ---
 
@@ -203,6 +231,7 @@ file
 share
 trash
 cli
+ipc
 service
 server
 ```
@@ -221,6 +250,9 @@ Core
  ├── Storage
  └── File System
 ```
+
+CLI 与 Service 之间经 `ipc` 模块的命名管道通信；HTTP Server 与 CLI 把请求交给同一个
+service 层（见第 76 节）。
 
 业务模块之间不得直接大量互相调用底层实现。
 
@@ -349,6 +381,9 @@ language
 删除原配置
 重新生成空配置
 ```
+
+上述「检查 → 加载 → 校验」流程在 **Service 形态**中执行；CLI 形态不加载配置、不创建配置目录、
+也不写配置文件，只把命令经命名管道交给服务（见第 76 节、第 91～94 节）。
 
 ---
 
@@ -1977,6 +2012,12 @@ FMT_ROOT/log/
 **只有 Service 写日志文件**；CLI 不写 `fmt.log`，只输出到控制台——避免两个进程争抢
 同一日志文件。
 
+日志目录位于**当前数据根**下（`FMT_ROOT/log/`），由服务在初始化时创建（见第 92 节）。
+
+CLI 与服务之间的通道是命名管道（见第 76 节）：CLI 把命令发给服务，服务执行后把
+`{ok, code, message}` 回传，CLI 只把结果打印到控制台，
+**既不写日志文件，也不直接读写数据根下的任何 JSON**。
+
 V1 **不实现**异步日志、日志线程、日志队列、压缩、轮转、ELK 或复杂配置。
 将来若出现大量并发网络请求，再升级为「业务线程 → 日志队列 → 日志线程 → 文件」。
 
@@ -2079,8 +2120,12 @@ fmt.exe bucket --help
 fmt.exe file --help
 fmt.exe share --help
 fmt.exe trash --help
-fmt.exe --service --help
+fmt.exe service --help
 ```
+
+`service` 命令**不带 `--` 前缀**：旧写法 `fmt.exe --service install` 作废；
+service 只有 `install` / `uninstall` / `start` / `stop` 四条，**没有 pause，也没有 delete**
+（旧 `delete` 已更名为 `uninstall`），见第 70 节、第 95 节。
 
 帮助内容应该：
 
@@ -2094,141 +2139,246 @@ fmt.exe --service --help
 
 # 69. Service 模块
 
-Service 模块负责 Windows Service。
+Service 模块负责 Windows Service 的生命周期。
 
-主要功能：
+`fmt.exe` 是**单一可执行文件**，同一份二进制有三种形态：
 
 ```text
-install
-start
-stop
-delete
+CLI 形态        用户双击或命令行启动，普通用户权限
+Service 形态    由 SCM 启动，LocalSystem，后台常驻
+提权短命副本    由 CLI 经 UAC 启动（内部参数），做完即退
 ```
+
+三种形态共享同一份业务代码；形态由**启动方式**决定，不是三份不同的 exe（见第 76 节）。
+
+manifest 必须是：
+
+```xml
+<requestedExecutionLevel level="asInvoker" uiAccess="false" />
+```
+
+**绝不使用 `requireAdministrator`**：否则双击就直接弹 UAC，普通业务命令也会以高权限运行。
+
+Service 形态职责：
+
+```text
+维护当前数据根
+按 CLI 声明初始化数据根（建目录 + 默认 JSON）
+承载业务模块（bucket / file / share / trash / config）
+监听命名管道 \\.\pipe\fmt.control
+监听 HTTP 127.0.0.1:4122
+写日志文件
+```
+
+Service 形态**不处理 pause**：服务不声明 `SERVICE_ACCEPT_PAUSE_CONTINUE`，
+`HandlerEx` 只处理：
+
+```text
+SERVICE_CONTROL_STOP
+SERVICE_CONTROL_SHUTDOWN
+SERVICE_CONTROL_INTERROGATE
+```
+
+因此命令集中没有 pause（见第 70 节）。
 
 ---
 
-# 70. Service Install
+# 70. Service 命令集
+
+service 命令只有四条：
+
+```text
+fmt.exe service install
+fmt.exe service uninstall
+fmt.exe service start
+fmt.exe service stop
+```
+
+固定规则：
+
+```text
+不带 -- 前缀（旧写法 fmt.exe --service install 作废）
+没有 pause，也没有 delete（旧 delete 更名为 uninstall）
+四条命令都直连 SCM，不走命名管道、不走 HTTP
+四条命令一律走 UAC 提权
+```
+
+为什么必须直连 SCM：服务可能尚未安装或尚未运行，此时走任何进程间通道都会形成引导死锁。
+
+**每条命令都提权**，即使目标状态已经满足（例如服务已安装仍执行 `install`）也照常弹 UAC，
+不做「已满足状态就免提权」的优化。
+
+各命令提权后做什么：
+
+| 命令 | 提权后执行 | 典型结果 |
+| --- | --- | --- |
+| `service install` | 创建服务 + 配置 Recovery + 启动 | 已存在 → `FMT-600` / 退出码 8 |
+| `service uninstall` | 先 stop，再 `DeleteService` | 未安装 → `FMT-601` / 退出码 8 |
+| `service start` | `StartServiceW` | 未安装 → `FMT-601` / 退出码 8 |
+| `service stop` | `ControlService(SERVICE_CONTROL_STOP)` | 未安装 → `FMT-601` / 退出码 8 |
+
+提权的完整流程、四种命令各自何时提权、用户取消 UAC 的处理与固定输出格式，见第 126 节。
+
+---
+
+# 71. Service Install
 
 命令：
 
 ```text
-fmt.exe --service install
+fmt.exe service install
 ```
+
+安装参数（已冻结）：
+
+| 项目 | 值 |
+| --- | --- |
+| 服务名 | `FMT` |
+| 显示名 | `FMT File Management Service` |
+| 启动类型 | `SERVICE_AUTO_START`（开机自启） |
+| 运行账户 | `LocalSystem` |
+| 可执行路径 | **首次安装时那个 `fmt.exe` 的绝对路径**，不复制到别处 |
+| 接受的控件 | `SERVICE_ACCEPT_STOP` + `SERVICE_ACCEPT_SHUTDOWN`，**不声明** `SERVICE_ACCEPT_PAUSE_CONTINUE` |
 
 流程：
 
 ```text
-检查管理员权限
+需要管理员权限（FMT-603）
  ↓
-检查 Service 是否已经存在
+UAC 提权
  ↓
-不存在 → 创建
+OpenSCManagerW
  ↓
-设置自动启动
+查询服务是否已经存在
  ↓
-配置 Recovery
-```
-
-如果已经存在：
-
-```text
-不要重复创建
+已存在 → FMT-600，不重复创建、不覆盖已有 binPath，退出码 8
+ ↓
+不存在 → CreateServiceW
+ ↓
+ChangeServiceConfig2W 配置 Recovery（见第 74 节）
+ ↓
+StartServiceW
 ```
 
 ---
 
-# 71. Service Start
+# 72. Service Start / Stop
+
+启动：
 
 ```text
-fmt.exe --service start
+fmt.exe service start
 ```
 
-检查：
-
 ```text
-Service 是否存在
+需要管理员权限 → UAC 提权
+ ↓
+OpenSCManagerW → OpenServiceW
+ ↓
+不存在 → FMT-601 / 退出码 8
+ ↓
+存在 → StartServiceW（已在运行时按成功处理）
 ```
 
-存在：
+停止：
 
 ```text
-启动
+fmt.exe service stop
 ```
 
-不存在：
-
 ```text
-报错
-```
-
----
-
-# 72. Service Stop
-
-```text
-fmt.exe --service stop
-```
-
-正常停止 Service。
-
-停止过程中应该：
-
-```text
-停止 HTTP Server
+需要管理员权限 → UAC 提权
+ ↓
+ControlService(SERVICE_CONTROL_STOP)
+ ↓
+停止接受新请求
  ↓
 等待正在进行的关键操作完成
+ ↓
+停止 HTTP Server
  ↓
 退出 Service
 ```
 
 ---
 
-# 73. Service Delete
+# 73. Service Uninstall
+
+命令（旧 `delete` 已更名为 `uninstall`）：
 
 ```text
-fmt.exe --service delete
+fmt.exe service uninstall
 ```
 
-要求：
+流程：
 
 ```text
-Service 已停止
+需要管理员权限 → UAC 提权
+ ↓
+OpenServiceW
+ ↓
+不存在 → FMT-601 / 退出码 8
+ ↓
+存在 → ControlService(SERVICE_CONTROL_STOP) 先停止服务
+ ↓
+DeleteService
 ```
 
-然后：
-
-```text
-删除 Windows Service
-```
-
-不能删除：
+卸载**不得删除**数据：
 
 ```text
 repository
 trash
 data
 config
+log
 ```
+
+卸载只移除 Windows Service 注册信息；数据根下的任何文件都保持原样。
 
 ---
 
 # 74. Service Recovery
 
-使用 Windows Service Recovery：
+使用 Windows Service Recovery，通过 `ChangeServiceConfig2W(SERVICE_CONFIG_FAILURE_ACTIONS)` 配置：
+
+| 失败次序 | 动作 |
+| --- | --- |
+| 第一次失败 | 5 秒后重启 |
+| 第二次失败 | 10 秒后重启 |
+| 后续失败 | 30 秒后重启 |
+| 失败计数重置 | 1 天（86400 秒） |
 
 ```text
 服务异常退出
  ↓
 Windows 检测
  ↓
-重新启动 fmt.exe
+按上表间隔重新启动 fmt.exe
 ```
 
-V1 不实现独立 watchdog。
+V1 **不实现**独立 watchdog，也不自建守护进程。
 
 ---
 
 # 75. fmt.exe 双击行为
+
+双击 `fmt.exe` 的完整流程：
+
+```text
+1. 单实例互斥体 Local\FMT.CLI.v1
+     已有实例 → 激活已有窗口，不新建窗口（见第 76 节）
+2. 查 SCM
+     未安装        → 提权 install + start（一次 UAC）
+     已安装未运行  → 提权 start（一次 UAC）
+     已运行        → 不动，不提权
+3. 比较服务 binPath 与自身路径
+     相同              → 正常继续
+     不同但文件存在    → 作为客户端继续
+     不同且文件已丢失  → 提示重新安装服务（uninstall + install）
+4. 连命名管道，用 hello 帧声明 root = 自身 exe 所在目录
+5. 打印横幅与 Service Running... → 进入交互循环
+```
 
 第一次双击：
 
@@ -2237,11 +2387,13 @@ V1 不实现独立 watchdog。
  ↓
 不存在
  ↓
-请求管理员权限
+请求管理员权限（一次 UAC）
  ↓
 安装
  ↓
 启动
+ ↓
+声明数据根，进入 CLI
 ```
 
 再次双击：
@@ -2249,45 +2401,139 @@ V1 不实现独立 watchdog。
 ```text
 检查 Service
  ↓
-存在
+已存在
  ↓
 检查状态
  ↓
-必要时启动
+未运行 → 提权启动（一次 UAC）
+已运行 → 不重复安装、不提权
 ```
 
-不重复安装。
+换目录双击（把 exe **复制**到新目录）：
+
+```text
+双击 D:\FMT2\fmt.exe
+ ↓
+服务宿主仍是首次安装时注册的那个 exe
+ ↓
+管道 hello 帧声明 root = D:\FMT2
+ ↓
+服务在 D:\FMT2 下幂等初始化
+ ↓
+旧数据原样保留，不删除
+```
+
+服务宿主路径规则：
+
+```text
+服务宿主 = 首次安装时注册的那个 exe 的绝对路径
+不复制到别处，也不随双击位置改变
+```
+
+因此：
+
+> **移动请用复制。** 剪切（移动）或删除宿主 `fmt.exe` 会让服务无法启动（SCM 报 1053），
+> 需要重新执行 `service install`。
+
+换数据根前必须先关闭旧的 CLI 窗口（单实例，见第 76 节）。
 
 ---
 
 # 76. Service 与 CLI
 
-V1 保持简单。
-
-`fmt.exe` 同时承担：
+`fmt.exe` 是单一可执行文件，形态由启动方式决定：
 
 ```text
-CLI
-+
-Service
+wmain
+ ├─ StartServiceCtrlDispatcherW 成功                    → Service 形态
+ ├─ 失败且 ERROR_FAILED_SERVICE_CONTROLLER_CONNECT      → 用户启动 → CLI 形态
+ └─ 其它错误                                            → FMT-602 / 退出码 8
 ```
 
-启动参数决定运行模式。
-
-例如：
+命令示例：
 
 ```text
-普通 CLI：
-fmt.exe file list
+普通业务命令：fmt.exe file list
+service 命令：fmt.exe service stop
 ```
 
-Service：
+## 76.1 两条入口，同一个 service 层
 
 ```text
-fmt.exe --service ...
+CLI 窗口 ──命名管道 \\.\pipe\fmt.control──→ service 层
+浏览器   ──HTTP/HTTPS 127.0.0.1:4122──────→ service 层
 ```
 
-Windows Service 启动时进入后台服务模式。
+**CLI 不再走 HTTP**：HTTP 可以被 `server.json` 关闭，端口也可能被占用，CLI 不应随之失效。
+CLI 与 HTTP 只是两条通道，业务行为由同一个 service 层决定。
+
+管道协议（已冻结）：
+
+```text
+帧格式   [4 字节小端长度][UTF-8 JSON]
+请求     {"id":7,"op":"hello","root":"D:\\FMT2","pid":1234}
+         {"id":8,"op":"file.list"}
+响应     {"ok":true,"data":{...}}
+         {"ok":false,"error":{"code":"FMT-305","message":"..."}}
+```
+
+响应信封与 HTTP 完全一致，一份信封两处复用；超时：连接 3 秒、普通命令 30 秒。
+
+管道安全：服务以 `LocalSystem` 运行，必须显式授权交互用户（IU）：
+
+```text
+D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)
+```
+
+并设置强制完整性标签（MIC），否则中完整性的普通 CLI 连接会报 `ERROR_ACCESS_DENIED`：
+
+```text
+S:(ML;;NW;;;ME)
+```
+
+CLI 形态**不碰 core、不建目录、不写 JSON**：只解析命令行、走管道、打印结果。
+
+## 76.2 数据根由 CLI 声明
+
+CLI 连接时的首帧是 `hello`，其中 `root` = CLI 自身 exe 所在目录（`GetModuleFileNameW` 取父目录）。
+
+```text
+root != 当前数据根 ?
+ ├─ 是 → 切换当前数据根（旧根数据原样保留），对新根做幂等初始化
+ └─ 否 → 直接进入命令循环
+```
+
+该连接上的所有业务命令都在该数据根下执行。因为同时只有一个 CLI 窗口，所以同时只有一个数据根。
+
+服务开机自启且没有 CLI 连接时：
+
+```text
+%ProgramData%\FMT\service.json 已记录数据根 → 取该记录值
+从未记录                                   → 取服务宿主 exe 所在目录
+```
+
+## 76.3 单实例
+
+CLI 用命名互斥体保证单实例：
+
+```text
+Local\FMT.CLI.v1
+```
+
+已存在实例时：
+
+```text
+EnumWindows 查找 ConsoleWindowClass
+ ↓
+SetForegroundWindow
+ ↓
+失败（前台锁定限制）→ FlashWindowEx
+```
+
+**不新建第二个窗口。** 因此换数据根之前必须先关闭旧 CLI 窗口。
+
+提权副本必须无窗口：`runas` 会另开控制台窗口，且高完整性窗口不能被中完整性进程置前（UIPI），
+所以提权副本以 `SW_HIDE` 启动，结果经命名管道回传（见第 126 节）。
 
 ---
 
@@ -2621,12 +2867,17 @@ user.json
 
 # 91. 初始化流程
 
-第一次运行：
+初始化**由服务执行，CLI 只读**：CLI 不创建目录、不写默认 JSON、不直接读写数据根下的文件。
+（这条统一了旧文档「CLI 只读不建目录」与「首次运行创建目录」的口径冲突，口径唯一：
+**服务建，CLI 只读**。）
+
+触发时机：CLI 连接服务时用 `hello` 帧声明 `root`（自身 exe 所在目录），服务发现该根与当前数据根
+不同（或该根从未初始化）时，对该根做一次幂等初始化。
 
 ```text
-fmt.exe
+CLI 声明 root
  ↓
-检查运行目录
+服务检查 root
  ↓
 创建必要目录
  ↓
@@ -2638,12 +2889,27 @@ fmt.exe
  ↓
 创建 trash/
  ↓
-创建默认 JSON
+创建 log/
+ ↓
+写入默认 JSON（.tmp 原子替换）
  ↓
 加载配置
+ ↓
+把该根记为当前数据根
 ```
 
-不得删除用户已经存在的数据。
+幂等要求：
+
+```text
+不存在则创建
+已存在 → 保持原样，不修改、不清空、不覆盖
+绝不删除用户已经存在的数据
+```
+
+服务开机自启且没有 CLI 连接时，数据根取 `%ProgramData%\FMT\service.json` 的记录值；
+从未记录过则取服务宿主 exe 所在目录，并在该根下执行同样的初始化。
+
+**切换数据根时不删除旧根的任何数据**，旧根只保留在磁盘上不再被使用。
 
 ---
 
@@ -2656,9 +2922,28 @@ repository/
 trash/
 config/
 data/
+log/
 ```
 
-不存在则创建。
+由**服务**在数据根下创建，不存在则创建，已存在不动。
+
+对应默认文件：
+
+```text
+config/config.json     {"version":1,...}
+config/server.json     {"version":1,...}
+data/user.json         {"version":1,"users":[]}
+data/file.json         {"version":1,"files":[]}
+data/share.json        {"version":1,"shares":[]}
+data/trash.json        {"version":1,"trash":[]}
+```
+
+默认 JSON 一律「写 `.tmp` → 验证 → 替换」，已存在的文件不改、不删、不覆盖
+（见第 11 节、第 13 节）。
+
+`log/` 由服务独占写入，CLI 不写日志文件（见第 65 节）。
+
+CLI 只读：不建目录、不写 JSON，只把命令经命名管道交给服务执行。
 
 ---
 
@@ -2737,18 +3022,34 @@ fmt.exe
 │   ├── restore <id>
 │   └── delete <id>
 │
-└── --service
+└── service
     ├── install
+    ├── uninstall
     ├── start
-    ├── stop
-    └── delete
+    └── stop
 ```
+
+规则：
+
+```text
+service 命令不带 -- 前缀（旧写法 fmt.exe --service install 作废）
+service 只有 install / uninstall / start / stop 四条
+没有 pause，也没有 delete（旧 delete 更名为 uninstall）
+业务命令（bucket / file / share / trash）经命名管道交给服务执行
+service 命令直连 SCM，且每条都走 UAC 提权
+```
+
+各子命令支持 `--help`（如 `fmt.exe file --help`、`fmt.exe service --help`），
+帮助内容必须与实际命令一致。
 
 ---
 
 # 96. 开发顺序
 
 V1 不建议一次性开发全部功能。
+
+Service 与 CLI 提前到**阶段 2 / 3**（旧设计排在阶段 9），先让「双击即用的服务 + CLI」闭环成立，
+业务功能（bucket / file / share / trash）排在后面。
 
 推荐：
 
@@ -2764,85 +3065,53 @@ fmt.exe
 
 ```text
 阶段 2
-Config
-Storage
-JSON
-目录初始化
+common
+Error / Result / Time / String / Path / Logger
+config
+storage
+core 初始化
 ```
 
 ↓
 
 ```text
 阶段 3
-Bucket
+service
+ipc
+cli
 ```
 
 ↓
 
 ```text
 阶段 4
-File
-file_id
-文件名
-MD5
+Bucket
 ```
 
 ↓
 
 ```text
 阶段 5
+File
 Upload
-```
-
-↓
-
-```text
-阶段 6
-File Get
-File List
-File Delete
-```
-
-↓
-
-```text
-阶段 7
 Trash
-Restore
-Permanent Delete
-```
-
-↓
-
-```text
-阶段 8
 Share
 ```
 
 ↓
 
 ```text
-阶段 9
-Windows Service
-```
-
-↓
-
-```text
-阶段 10
-HTTP Server
-```
-
-↓
-
-```text
-阶段 11
+阶段 6
+server
+HTTP
 Preview
 ```
 
+阶段 2 + 3 完成后，「双击即用的服务 + CLI」闭环成立（见第 99 节）。
+
 ---
 
-# 97. 第一阶段：项目骨架
+# 97. 阶段 1：项目骨架
 
 目标：
 
@@ -2868,34 +3137,97 @@ fmt.exe --help
 
 ---
 
-# 98. 第二阶段：基础存储
+# 98. 阶段 2：common、config、storage 与 core 初始化
 
 实现：
 
 ```text
-目录初始化
-Config
-JSON Storage
-Path
-Logger
-Error
+common
+    Error
+    Result
+    Time
+    String
+    Path
+    Logger
+config
+storage
+core 初始化
 ```
 
-完成后：
+完成后，服务在 CLI 声明的数据根下自动创建：
 
 ```text
-FMT/
+<数据根>/
 ├── repository/
 ├── trash/
 ├── config/
-└── data/
+├── data/
+└── log/
 ```
 
-能够自动创建。
+并写入默认 JSON（`.tmp` 原子替换，已存在不动）。
+
+验收：
+
+```text
+能在指定数据根建出五个目录 + 默认 JSON
+JSON 损坏报配置错误（退出码 7），且不修改原文件
+```
 
 ---
 
-# 99. 第三阶段：Bucket
+# 99. 阶段 3：service、ipc 与 cli
+
+实现：
+
+```text
+service
+    service install
+    service uninstall
+    service start
+    service stop
+    ServiceMain + HandlerEx
+    Recovery
+    %ProgramData%\FMT\service.json
+ipc
+    命名管道 \\.\pipe\fmt.control
+    帧格式 [4 字节小端长度][UTF-8 JSON]
+    安全描述符（授权 IU）+ MIC 标签
+cli
+    交互循环与横幅
+    单实例互斥体 Local\FMT.CLI.v1
+    单实例窗口激活
+    UAC 提权与结果回显
+    双击行为（首次 / 再次 / 换目录）
+```
+
+并配置：
+
+```text
+自动启动（SERVICE_AUTO_START）
+异常自动恢复（Recovery 5 秒 / 10 秒 / 30 秒，失败计数 1 天重置）
+```
+
+同时确定：
+
+```text
+manifest 为 asInvoker
+服务不声明 SERVICE_ACCEPT_PAUSE_CONTINUE（没有 pause）
+数据根由 CLI 用 hello 帧声明
+初始化由服务执行，CLI 只读
+```
+
+验收：
+
+```text
+全新环境双击 → 一次 UAC → 服务装好且开机自启
+service stop / service start 各弹一次 UAC，输出与第 126 节样例一致
+复制 exe 到新目录双击 → 在新目录建出数据，旧目录数据保留
+```
+
+---
+
+# 100. 阶段 4：Bucket
 
 实现：
 
@@ -2917,7 +3249,7 @@ current_bucket
 
 ---
 
-# 100. 第四阶段：File 基础
+# 101. 阶段 5：File 基础
 
 实现：
 
@@ -2942,7 +3274,7 @@ Preview
 
 ---
 
-# 101. 第五阶段：Upload
+# 102. 阶段 5：Upload
 
 实现：
 
@@ -2964,7 +3296,7 @@ metadata
 
 ---
 
-# 102. 第六阶段：File 操作
+# 103. 阶段 5：File 操作
 
 实现：
 
@@ -2987,7 +3319,7 @@ file delete <file_id>
 
 ---
 
-# 103. 第七阶段：Trash
+# 104. 阶段 5：Trash
 
 实现：
 
@@ -3011,7 +3343,7 @@ Bucket 永久删除
 
 ---
 
-# 104. 第八阶段：Share
+# 105. 阶段 5：Share
 
 实现：
 
@@ -3035,27 +3367,7 @@ Trash 状态
 
 ---
 
-# 105. 第九阶段：Windows Service
-
-实现：
-
-```text
---service install
---service start
---service stop
---service delete
-```
-
-并配置：
-
-```text
-自动启动
-异常自动恢复
-```
-
----
-
-# 106. 第十阶段：HTTP Server
+# 106. 阶段 6：HTTP Server 与 Preview
 
 实现：
 
@@ -3072,6 +3384,8 @@ Share
 ```text
 Preview
 ```
+
+HTTP 作用于**当前数据根**，默认只监听 `127.0.0.1:4122`；CLI 不依赖 HTTP（见第 76 节）。
 
 ---
 
@@ -3240,14 +3554,23 @@ MD5 不一致
 必须测试：
 
 ```text
-第一次安装
-重复安装
-启动
-停止
-删除
-重启电脑
-异常退出
-Service Recovery
+第一次安装（全新环境 install → 服务存在、开机自启、Recovery 已配置）
+重复安装（已存在 → FMT-600 / 退出码 8，不重复创建、不覆盖 binPath）
+未安装时 start（FMT-601 / 退出码 8）
+未安装时 stop（FMT-601 / 退出码 8）
+uninstall 之后再 start（FMT-601 / 退出码 8）
+install → start → stop → uninstall 全流程
+提权（四条命令各弹一次 UAC，输出与第 126 节样例一致）
+用户取消 UAC（ERROR_CANCELLED 1223 → FMT-004 / 退出码 5，CLI 继续循环不退出）
+提权等待超时（FMT-602 / 退出码 8）
+提权副本不新开控制台窗口，结果经管道回到原窗口
+开机自启（重启电脑后服务自动运行，横幅显示 Service Running...）
+Service Recovery（异常退出后按 5 秒 / 10 秒 / 30 秒重启，失败计数 1 天重置）
+uninstall 后 repository / trash / data / config / log 仍在
+换目录声明新数据根（复制 exe 到新目录双击 → 新根完成初始化，旧根数据保留）
+单实例（再次双击 → 激活已有窗口，不新建第二个窗口）
+服务宿主 exe 被移动或删除 → 提示重新安装服务
+HandlerEx 不响应 pause（服务不声明 SERVICE_ACCEPT_PAUSE_CONTINUE）
 ```
 
 ---
@@ -3400,8 +3723,18 @@ V2
 14. File 本身不保存下载限制
 15. JSON 损坏不能静默重置
 16. 关键文件操作必须具备事务式处理
-17. Windows Service V1 保持简单
-18. CLI 与 HTTP 使用统一业务核心
+17. Windows Service V1 保持简单（四条命令 + SCM + Recovery，不自建 watchdog）
+18. CLI（命名管道）与 HTTP 使用统一业务核心
+19. 单一 fmt.exe，三种形态：CLI / Service / 提权短命副本
+20. manifest 为 asInvoker，绝不 requireAdministrator
+21. service 只有 install / uninstall / start / stop，没有 pause、没有 delete
+22. service 四条命令一律走 UAC 提权，不做免提权优化
+23. CLI 走命名管道，HTTP 只给浏览器（CLI 不走 HTTP）
+24. 数据根由 CLI 声明，服务维护当前数据根，切换不删旧数据
+25. 初始化由服务执行，CLI 只读不建目录、不写 JSON
+26. 服务自身状态写在 %ProgramData%\FMT\service.json，不属于业务数据
+27. 同时只有一个 CLI 窗口，因此同时只有一个数据根
+28. 服务宿主为首次安装时注册的 exe 绝对路径，移动请用复制
 ```
 
 ---
@@ -3507,7 +3840,7 @@ FMT 开发文档.md
 为：
 
 ```text
-V1 开发规范初稿
+V1 开发规范（`arch-restart` 重构版）
 ```
 
 本文件以：
@@ -3516,7 +3849,24 @@ V1 开发规范初稿
 FMT 项目架构.md
 ```
 
-为上层设计依据。
+为上层设计依据；本次重构的差异说明与决策索引见：
+
+```text
+FMT 重构设计.md
+```
+
+本次更新已并入的冻结决策：
+
+```text
+单一 fmt.exe 三种形态（manifest 为 asInvoker）
+service install / uninstall / start / stop（无 pause、无 delete）
+service 四条命令一律 UAC 提权 + 结果经管道回传
+CLI 走命名管道 \\.\pipe\fmt.control，不走 HTTP
+数据根由 CLI 声明，服务侧幂等初始化，CLI 只读
+服务状态文件 %ProgramData%\FMT\service.json
+CLI 单实例与固定界面输出（横幅、提示符、stdout / stderr）
+开发顺序：阶段 2 = common/config/storage/core，阶段 3 = service/ipc/cli
+```
 
 后续开发过程中，如果发现：
 
@@ -3554,6 +3904,185 @@ HTTP 实现限制
 
 ---
 
+# 126. 提权流程
+
+service 四条命令（`install` / `uninstall` / `start` / `stop`）**每条都走 UAC 提权**，
+即使目标状态已经满足也照常弹 UAC，不做免提权优化。
+
+## 126.1 判断是否已提权
+
+```text
+OpenProcessToken
+ ↓
+GetTokenInformation(TokenElevation)
+ ↓
+已提权 → 直接执行 SCM 操作
+未提权 → 进入提权流程
+```
+
+## 126.2 提权方式
+
+```text
+打印「需要管理员权限」        ← FMT-603 AdminRequired
+打印「正在提权...」
+ ↓
+ShellExecuteExW(
+    lpVerb = L"runas",
+    fMask  = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+    nShow  = SW_HIDE)
+ ↓
+WaitForSingleObject(hProcess, 60000)
+ ↓
+GetExitCodeProcess
+```
+
+`runas` 启动的控制台程序会**另开一个控制台窗口**，所以提权副本必须：
+
+```text
+以 SW_HIDE 无窗口启动
+只做 SCM 操作，短命，不进入命令循环
+结果 {ok, code, message}
+    经命名管道 \\.\pipe\fmt.elev.<pid>（或临时文件）回传父进程
+由父进程打印
+```
+
+这是「只留一个窗口」的前提：整条命令始终只有一个可见控制台。
+
+## 126.3 四种命令各自何时提权
+
+| 命令 | 提权时机 | 提权后执行 |
+| --- | --- | --- |
+| `service install` | 命中该命令即提权，不检查服务是否已存在 | `CreateServiceW` + Recovery + `StartServiceW` |
+| `service uninstall` | 命中该命令即提权，不检查服务是否在运行 | `ControlService(STOP)` + `DeleteService` |
+| `service start` | 命中该命令即提权，不检查服务是否已在运行 | `StartServiceW` |
+| `service stop` | 命中该命令即提权，不检查服务是否已停止 | `ControlService(SERVICE_CONTROL_STOP)` |
+
+## 126.4 用户取消 UAC 与超时
+
+```text
+用户取消 UAC（ERROR_CANCELLED，1223）  → FMT-004 / 退出码 5
+提权等待超时（60 秒）                  → FMT-602 / 退出码 8
+SCM 操作失败                           → FMT-602 / 退出码 8
+服务不存在                             → FMT-601 / 退出码 8
+服务已存在（重复 install）             → FMT-600 / 退出码 8
+```
+
+用户取消 UAC 或提权失败**不退出 CLI**：打印错误后回到提示符继续等待输入（见第 127 节）。
+
+## 126.5 固定输出
+
+成功：
+
+```text
+FMT v1.0.0
+Service Running...
+fmt >service stop
+需要管理员权限
+正在提权...
+执行成功...
+错误码：0
+fmt >
+```
+
+失败（后两行替换为执行失败行与错误码行）：
+
+```text
+FMT v1.0.0
+Service Running...
+fmt >service stop
+需要管理员权限
+正在提权...
+执行失败：FMT-601 服务未安装
+错误码：8
+fmt >
+```
+
+约定：
+
+```text
+「执行成功...」/「执行失败：FMT-NNN <消息>」是结果行
+「错误码：N」是该次命令的进程退出码
+FMT-NNN 与退出码分属两层：错误码定位原因，退出码给脚本判断
+```
+
+---
+
+# 127. CLI 界面约定
+
+## 127.1 横幅
+
+CLI 启动时打印：
+
+```text
+FMT v1.0.0
+Service Running...
+```
+
+服务未运行时第二行改为：
+
+```text
+FMT v1.0.0
+Service Stopped...
+```
+
+横幅之后打印提示符，等待用户输入。
+
+## 127.2 提示符与交互循环
+
+提示符为：
+
+```text
+fmt> 
+```
+
+规则：
+
+```text
+空行忽略：不报错、不退出
+正常结果 → stdout
+错误 → stderr
+命令失败后继续循环，不退出
+exit 或 quit 退出
+```
+
+命令按 `fmt> ` 提示符逐条输入，例如：
+
+```text
+fmt >service stop
+fmt >file list
+```
+
+## 127.3 退出
+
+```text
+exit
+quit
+```
+
+两种写法都结束 CLI 循环并以退出码 `0` 退出；直接关闭窗口同样只结束 CLI，
+**不影响后台服务**（服务由 SCM 托管）。
+
+## 127.4 输出通道
+
+```text
+stdout   命令的正常结果、横幅、提示符、提权过程提示（需要管理员权限 / 正在提权...）
+stderr   错误码与错误消息（执行失败：FMT-NNN <消息>、错误码：N）
+```
+
+CLI 只输出控制台，**不写日志文件**（见第 65 节）。
+
+## 127.5 CLI 与服务的边界
+
+```text
+CLI 不碰 core、不建目录、不写 JSON
+CLI 只解析命令、走管道、打印结果
+业务命令经命名管道交给服务执行（见第 76 节）
+service 命令直连 SCM + UAC 提权（见第 126 节）
+CLI 单实例：已有窗口则激活，不新建窗口
+```
+
+---
+
 # 附录 A. 已冻结决策（第二阶段开工前）
 
 以下决策在第二阶段编码前确定，**不再扩展基础架构**，各模块按此实现。
@@ -3569,7 +4098,16 @@ HTTP 实现限制
 | 日志 | 文件为主；DEBUG 只进文件，WARN/ERROR 同时输出控制台 |
 | 哈希 | MD5 |
 | 路径 | 第二阶段引入 `PathManager`，上下文对象，不做全局单例 |
-| 命名空间 | `fmt` 保持不变；V1 不引入第三方库，不存在重名问题 |
+| 命名空间 | `fmt` 保持不变；第三方库 vendor 到 `third_party/`，不污染业务命名空间 |
+| 第三方依赖 | vendor `nlohmann/json` + `cpp-httplib` 到 `third_party/`，`/MT` 静态链接 CRT，产物只有一个 `fmt.exe` |
+| 单一可执行文件 | `fmt.exe` 三种形态：CLI 形态 / Service 形态 / 提权短命副本；manifest 为 `asInvoker` |
+| service 命令 | 只有 `install` / `uninstall` / `start` / `stop`，无 `pause`、无 `delete`，命令不带 `--` 前缀 |
+| service 提权 | 四条命令一律走 UAC 提权，结果经 `\\.\pipe\fmt.elev.<pid>` 回传父进程打印，见第 126 节 |
+| CLI 通道 | 命名管道 `\\.\pipe\fmt.control`（帧 = 4 字节长度 + JSON）；HTTP `127.0.0.1:4122` 只给浏览器 |
+| 数据根 | 由 CLI 用 `hello` 帧声明（自身 exe 所在目录）；服务维护当前数据根，切换不删旧数据 |
+| 初始化归属 | 服务创建 `repository`/`trash`/`config`/`data`/`log` 与默认 JSON；CLI 只读，见第 91～92 节 |
+| 服务状态文件 | `%ProgramData%\FMT\service.json`（当前数据根 + 安装信息），不属于业务数据 |
+| CLI 界面 | 横幅 `FMT v1.0.0` + `Service Running...`，提示符 `fmt> `，正常 → stdout / 错误 → stderr，见第 127 节 |
 
 ## 附录 A.1 错误码枚举
 
