@@ -59,12 +59,21 @@ HostResult run_service_host() {
         server_thread = std::thread([] { runtime->run(); });
         return std::monostate{};
     };
+    callbacks.on_control = [](const char* event) {
+        if (runtime != nullptr) {
+            runtime->log_event("Service", event);
+        }
+    };
     callbacks.shutdown = [] {
         if (runtime != nullptr) {
+            runtime->log_event("Service", "正在停止：停 HTTP、等在途操作");
             runtime->request_stop();
         }
         if (server_thread.joinable()) {
             server_thread.join();
+        }
+        if (runtime != nullptr) {
+            runtime->log_event("Service", "服务已停止");
         }
     };
 
@@ -239,6 +248,13 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
 std::filesystem::path ServerRuntime::current_root() const {
     std::lock_guard<std::mutex> guard(mutex_);
     return context_ != nullptr ? context_->paths->root() : std::filesystem::path{};
+}
+
+void ServerRuntime::log_event(std::string_view module, const std::string& message) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (context_ != nullptr && context_->logger != nullptr) {
+        context_->logger->info(module, message);
+    }
 }
 
 void ServerRuntime::request_stop() {

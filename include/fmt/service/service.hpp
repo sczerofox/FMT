@@ -80,6 +80,9 @@ struct ServiceCallbacks {
     std::function<Status()> initialize;
     // 收到停止/关机控制后的收尾（等在途操作、停 HTTP）。
     std::function<void()> shutdown;
+    // 服务控制事件（STOP / SHUTDOWN），用于写日志。
+    // 由 SCM 的控制线程调用：实现里不要做耗时工作。
+    std::function<void(const char* event)> on_control;
 };
 
 enum class DispatcherResult {

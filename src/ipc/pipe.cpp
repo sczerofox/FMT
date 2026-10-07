@@ -177,7 +177,7 @@ void PipeConnection::reset() {
     buffer_.clear();
 }
 
-Result<PipeConnection> PipeConnection::accept(int timeout_ms) {
+Result<PipeConnection> PipeConnection::accept(int timeout_ms, const wchar_t* pipe_name) {
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(kPipeSddl, SDDL_REVISION_1,
                                                               &descriptor, nullptr)) {
@@ -190,7 +190,7 @@ Result<PipeConnection> PipeConnection::accept(int timeout_ms) {
     attributes.lpSecurityDescriptor = descriptor;
     attributes.bInheritHandle = FALSE;
 
-    HANDLE handle = CreateNamedPipeW(kPipeName, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+    HANDLE handle = CreateNamedPipeW(pipe_name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
                                      PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
                                      PIPE_UNLIMITED_INSTANCES, kPipeBufferBytes, kPipeBufferBytes, 0,
                                      &attributes);
@@ -362,11 +362,11 @@ PipeClient::~PipeClient() {
     }
 }
 
-Result<PipeClient> PipeClient::connect(int timeout_ms) {
+Result<PipeClient> PipeClient::connect(int timeout_ms, const wchar_t* pipe_name) {
     HANDLE handle = INVALID_HANDLE_VALUE;
 
     for (int attempt = 0; attempt < 2; ++attempt) {
-        handle = CreateFileW(kPipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+        handle = CreateFileW(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
                              FILE_FLAG_OVERLAPPED, nullptr);
         if (handle != INVALID_HANDLE_VALUE) {
             break;
@@ -375,7 +375,7 @@ Result<PipeClient> PipeClient::connect(int timeout_ms) {
         const DWORD error = GetLastError();
         if (error == ERROR_PIPE_BUSY && attempt == 0) {
             // 实例被占满：等 3 秒再来一次（§13.9.4）。
-            if (WaitNamedPipeW(kPipeName, static_cast<DWORD>(timeout_ms))) {
+            if (WaitNamedPipeW(pipe_name, static_cast<DWORD>(timeout_ms))) {
                 continue;
             }
             return make_error(ErrorCode::ServiceNotInstalled, "无法连接 FMT Service，请先执行 service install");
@@ -406,6 +406,31 @@ Result<PipeClient> PipeClient::connect(int timeout_ms) {
     client.handle_ = handle;
     client.event_ = event;
     return client;
+}
+
+Result<PipeClient> PipeClient::connect_waiting(int total_timeout_ms, const wchar_t* pipe_name) {
+    constexpr int kStepMs = 100;
+
+    Result<PipeClient> last =
+        make_error(ErrorCode::ServiceNotInstalled, "无法连接 FMT Service，请先执行 service install");
+
+    for (int waited = 0;; waited += kStepMs) {
+        last = connect(kConnectTimeoutMs, pipe_name);
+        if (ok(last)) {
+            return last;
+        }
+        if (error_of(last)->code != ErrorCode::ServiceNotInstalled) {
+            return last;  // 权限之类的问题重试也不会变好
+        }
+        if (waited >= total_timeout_ms) {
+            break;
+        }
+        Sleep(kStepMs);
+    }
+
+    return make_error(ErrorCode::ServiceNotInstalled,
+                      "无法连接 FMT Service（等待 " + std::to_string(total_timeout_ms) +
+                          " 毫秒仍没有监听），请先执行 service install");
 }
 
 Result<std::string> PipeClient::read_some(int timeout_ms) {

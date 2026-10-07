@@ -47,7 +47,8 @@ public:
     PipeConnection& operator=(const PipeConnection&) = delete;
 
     // 建实例 + 等连接。超时返回 FMT-602。
-    static Result<PipeConnection> accept(int timeout_ms);
+    // pipe_name 默认是真实管道名；测试传独立名字，免得跟正在运行的服务抢同一个实例。
+    static Result<PipeConnection> accept(int timeout_ms, const wchar_t* pipe_name = kPipeName);
 
     // 读一个完整请求。超时不算错误（ReadStatus::Timeout），调用方继续等即可。
     RequestOutcome read_request(int timeout_ms);
@@ -90,7 +91,14 @@ public:
     //   管道不存在   -> FMT-601 服务未安装 / 未运行
     //   实例被占满   -> WaitNamedPipeW 重试一次
     //   权限被拒     -> FMT-004（DACL 或 MIC 不对）
-    static Result<PipeClient> connect(int timeout_ms);
+    static Result<PipeClient> connect(int timeout_ms, const wchar_t* pipe_name = kPipeName);
+
+    // 在「管道还不存在」时重试到 total_timeout_ms。
+    // 场景：service start 刚返回，服务进程还在初始化、监听还没起来，
+    // 这时候一次失败就报 FMT-601 会误伤「刚启动完就敲命令」。
+    // 权限类错误不重试（重试也不会变好）。
+    static Result<PipeClient> connect_waiting(int total_timeout_ms,
+                                              const wchar_t* pipe_name = kPipeName);
 
     // 发一帧请求。
     Status send(const Request& request, int timeout_ms);

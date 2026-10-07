@@ -147,10 +147,17 @@ FMT_TEST(Ipc, 请求与响应信封) {
 }
 
 FMT_TEST(Ipc, 管道真实往返) {
-    // 服务端线程：accept -> read -> write
+    // 用独立管道名：真实服务可能正在监听 \\.\pipe\fmt.control，
+    // 抢同一个名字会让这条测试时好时坏。
+    const std::wstring pipe_name =
+        L"\\\\.\\pipe\\fmt.test." + std::to_wstring(GetCurrentProcessId());
+
+    // 服务端线程故意晚 300 ms 才开始监听，用来验证客户端的等待重试。
     std::atomic<bool> server_ok{false};
-    std::thread server([&server_ok] {
-        auto connection = fmt::ipc::PipeConnection::accept(5000);
+    std::thread server([&server_ok, pipe_name] {
+        sleep_ms(300);
+
+        auto connection = fmt::ipc::PipeConnection::accept(5000, pipe_name.c_str());
         if (!fmt::ok(connection)) {
             return;
         }
@@ -174,18 +181,9 @@ FMT_TEST(Ipc, 管道真实往返) {
         server_ok = true;
     });
 
-    // 客户端可能先于服务端建好实例，允许重试几次
-    fmt::ipc::PipeClient client;
-    for (int attempt = 0; attempt < 40; ++attempt) {
-        auto connected = fmt::ipc::PipeClient::connect(3000);
-        if (fmt::ok(connected)) {
-            client = std::move(std::get<fmt::ipc::PipeClient>(connected));
-            break;
-        }
-        sleep_ms(50);
-    }
-
-    FMT_CHECK(client.valid());
+    // connect_waiting 会一直重试到对端出现为止。
+    auto connected = fmt::ipc::PipeClient::connect_waiting(5000, pipe_name.c_str());
+    FMT_CHECK(fmt::ok(connected));
 
     fmt::ipc::Request request;
     request.id = 1;
@@ -193,14 +191,17 @@ FMT_TEST(Ipc, 管道真实往返) {
     request.root = R"(D:\FMT)";
     request.pid = 4242;
 
-    const auto response = client.call(request, 5000);
-    FMT_CHECK(fmt::ok(response));
-    if (fmt::ok(response)) {
-        const fmt::ipc::Response& value = std::get<fmt::ipc::Response>(response);
-        FMT_CHECK(value.ok);
-        FMT_CHECK_EQ(value.id, 1);
-        FMT_CHECK_EQ(value.data["echo"].get<std::string>(), std::string("hello"));
-        FMT_CHECK_EQ(value.data["root"].get<std::string>(), std::string(R"(D:\FMT)"));
+    if (fmt::ok(connected)) {
+        fmt::ipc::PipeClient client = std::move(std::get<fmt::ipc::PipeClient>(connected));
+        const auto response = client.call(request, 5000);
+        FMT_CHECK(fmt::ok(response));
+        if (fmt::ok(response)) {
+            const fmt::ipc::Response& value = std::get<fmt::ipc::Response>(response);
+            FMT_CHECK(value.ok);
+            FMT_CHECK_EQ(value.id, 1);
+            FMT_CHECK_EQ(value.data["echo"].get<std::string>(), std::string("hello"));
+            FMT_CHECK_EQ(value.data["root"].get<std::string>(), std::string(R"(D:\FMT)"));
+        }
     }
 
     server.join();
@@ -208,10 +209,17 @@ FMT_TEST(Ipc, 管道真实往返) {
 }
 
 FMT_TEST(Ipc, 没有服务时连接失败给出FMT601) {
-    const auto client = fmt::ipc::PipeClient::connect(200);
-    // 有服务在跑时跳过这条检查（例如开发机上装了服务）
-    if (!fmt::ok(client)) {
-        FMT_CHECK(fmt::error_of(client)->code == fmt::ErrorCode::ServiceNotInstalled);
-        FMT_CHECK_EQ(fmt::exit_code(fmt::error_of(client)->code), 8);
-    }
+    // 同样用独立名字，避免连到机器上真正在跑的服务。
+    const std::wstring pipe_name =
+        L"\\\\.\\pipe\\fmt.nothing." + std::to_wstring(GetCurrentProcessId());
+
+    const auto client = fmt::ipc::PipeClient::connect(200, pipe_name.c_str());
+    FMT_CHECK(!fmt::ok(client));
+    FMT_CHECK(fmt::error_of(client)->code == fmt::ErrorCode::ServiceNotInstalled);
+    FMT_CHECK_EQ(fmt::exit_code(fmt::error_of(client)->code), 8);
+
+    // 等待版本也要在超时后如实报 FMT-601，而不是一直挂着。
+    const auto waited = fmt::ipc::PipeClient::connect_waiting(300, pipe_name.c_str());
+    FMT_CHECK(!fmt::ok(waited));
+    FMT_CHECK(fmt::error_of(waited)->code == fmt::ErrorCode::ServiceNotInstalled);
 }

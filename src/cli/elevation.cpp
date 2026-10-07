@@ -65,6 +65,7 @@ Result<ElevatedOutcome> elevate_service_command(const std::string& operation,
         std::error_code code;
         std::filesystem::remove(path_from_utf8(result_path), code);
     }
+    log_info("Cli", "启动提权副本：--elevated " + operation + "（结果文件 " + result_path + "）");
 
     const std::wstring parameters = L"--elevated " + to_wide(operation) + L" --result " +
                                     to_wide(result_path);
@@ -83,11 +84,14 @@ Result<ElevatedOutcome> elevate_service_command(const std::string& operation,
     if (!ShellExecuteExW(&info)) {
         const DWORD error = GetLastError();
         if (error == ERROR_CANCELLED) {
+            log_warn("Cli", "用户在 UAC 里点了「否」，取消提权");
             return make_error(ErrorCode::PermissionDenied, "用户取消提权");
         }
         if (error == ERROR_ACCESS_DENIED) {
+            log_error("Cli", "提权被拒绝（Win32 5）");
             return make_error(ErrorCode::AdminRequired, "提权被拒绝");
         }
+        log_error("Cli", "无法启动提权副本（Win32 " + std::to_string(error) + "）");
         return make_error(ErrorCode::ServiceOperationFailed,
                           "无法启动提权副本（Win32 " + std::to_string(error) + "）");
     }
@@ -143,6 +147,15 @@ Result<ElevatedOutcome> elevate_service_command(const std::string& operation,
 }
 
 int run_elevated(const std::vector<std::string>& args) {
+    // 提权副本是独立进程：它也要把自己做了什么写进同一个 fmt.log。
+    std::unique_ptr<Logger> file_logger;
+    if (Result<std::unique_ptr<Logger>> opened =
+            open_cli_logger(path_to_utf8(executable_directory()));
+        ok(opened)) {
+        file_logger = std::move(std::get<std::unique_ptr<Logger>>(opened));
+        set_logger(file_logger.get());
+    }
+
     std::string operation;
     std::string result_path;
 
@@ -155,8 +168,11 @@ int run_elevated(const std::vector<std::string>& args) {
     }
 
     if (operation.empty()) {
+        log_error("Elevated", "提权副本缺少 --elevated 参数");
         return exit_code(ErrorCode::InvalidArgument);
     }
+
+    log_info("Elevated", "提权副本开始执行：" + operation);
 
     Status status = std::monostate{};
     if (operation == "install") {
@@ -183,6 +199,13 @@ int run_elevated(const std::vector<std::string>& args) {
         succeeded ? std::string(default_message(ErrorCode::Ok)) : error_of(status)->message;
     const int exit = exit_code(code);
 
+    if (succeeded) {
+        log_info("Elevated", "提权副本执行成功：" + operation + "（错误码 0）");
+    } else {
+        log_error("Elevated", "提权副本执行失败：" + operation + " -> " + code_string(code) + " " +
+                                  message + "（错误码 " + std::to_string(exit) + "）");
+    }
+
     if (!result_path.empty()) {
         nlohmann::json value = nlohmann::json::object();
         value["ok"] = succeeded;
@@ -191,10 +214,12 @@ int run_elevated(const std::vector<std::string>& args) {
         value["exit"] = exit;
         const Status written = write_json_file(path_from_utf8(result_path), value);
         if (!ok(written)) {
+            log_error("Elevated", "结果文件写入失败：" + error_of(written)->message);
             return exit_code(error_of(written)->code);
         }
     }
 
+    set_logger(nullptr);
     return exit;
 }
 

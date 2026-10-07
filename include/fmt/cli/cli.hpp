@@ -10,16 +10,40 @@
 //   错误码：0
 //
 // 正常结果走 stdout，错误走 stderr；命令失败后继续循环，不退出。
-// CLI 不建目录、不写 JSON、不写日志文件：它只是客户端。
+// CLI 不改业务数据（它是管道客户端），但会把「自己做了什么、结果如何」追加到
+// 与 Service 共用的 <数据根>/log/fmt.log。
 #pragma once
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "fmt/common/error.hpp"
+#include "fmt/common/logger.hpp"
 #include "fmt/ipc/pipe.hpp"
 
 namespace fmt::cli {
+
+// ---- CLI 侧日志 ----
+//
+// CLI 与 Service **往同一个** <数据根>/log/fmt.log 追加。旧口径是「只有 Service
+// 写日志文件」，结果是用户在 CLI 里敲的命令在日志里完全看不到（例如敲完
+// service stop，服务随即停了，日志里一个字都没有）。
+//
+// 两个进程都以追加方式打开同一个文件，每行一次写入；控制台输出仍由 CLI 自己
+// 打印，所以日志器的控制台开关全部关掉，避免同一句话打印两遍。
+//
+// CLI 只允许创建 <数据根>/log/ 这一个目录（日志不是业务数据）；
+// repository / data / config 一概不碰。
+Result<std::unique_ptr<Logger>> open_cli_logger(const std::string& data_root);
+
+// 进程内的 CLI 日志器；传 nullptr 表示不写日志（测试用）。
+void set_logger(Logger* logger);
+Logger* logger();
+void log(LogLevel level, std::string_view module, const std::string& message);
+void log_info(std::string_view module, const std::string& message);
+void log_warn(std::string_view module, const std::string& message);
+void log_error(std::string_view module, const std::string& message);
 
 struct Options {
     std::string self_path;  // 本进程 exe 的绝对路径（提权副本要用同一个文件）

@@ -44,6 +44,11 @@ DWORD WINAPI handler_ex(DWORD control, DWORD, void*, void*) {
             if (g_stop_event != nullptr) {
                 SetEvent(g_stop_event);
             }
+            // 先把停止信号发出去，再做写日志这类可能阻塞的事。
+            if (g_callbacks.on_control != nullptr) {
+                g_callbacks.on_control(control == SERVICE_CONTROL_STOP ? "收到停止控制 STOP"
+                                                                       : "收到关机控制 SHUTDOWN");
+            }
             return NO_ERROR;
         case SERVICE_CONTROL_INTERROGATE:
             return NO_ERROR;  // 立即返回，SCM 要的就是当前状态

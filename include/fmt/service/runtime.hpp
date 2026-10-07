@@ -51,6 +51,9 @@ public:
 
     void request_stop();
 
+    // 写一行日志（服务控制事件等）。线程安全。
+    void log_event(std::string_view module, const std::string& message);
+
     // 处理一个请求（可以脱离管道单独测试）。
     ipc::Response handle(const ipc::Request& request);
 

@@ -10,15 +10,71 @@
 
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
+#include "fmt/core/path_manager.hpp"
 #include "fmt/ipc/pipe.hpp"
 #include "fmt/service/service.hpp"
 #include "fmt/version.hpp"
 
 namespace fmt::cli {
 namespace {
+Logger* g_logger = nullptr;
+}  // namespace
+
+void set_logger(Logger* logger) { g_logger = logger; }
+
+Logger* logger() { return g_logger; }
+
+void log(LogLevel level, std::string_view module, const std::string& message) {
+    if (g_logger != nullptr) {
+        g_logger->log(level, module, message);
+    }
+}
+
+void log_info(std::string_view module, const std::string& message) {
+    log(LogLevel::Info, module, message);
+}
+
+void log_warn(std::string_view module, const std::string& message) {
+    log(LogLevel::Warn, module, message);
+}
+
+void log_error(std::string_view module, const std::string& message) {
+    log(LogLevel::Error, module, message);
+}
+
+Result<std::unique_ptr<Logger>> open_cli_logger(const std::string& data_root) {
+    Logger::Options options;
+    // 控制台由 CLI 自己打印，日志器不要再打印一遍。
+    options.info_to_console = false;
+    options.warn_error_to_console = false;
+
+    const PathManager paths{path_from_utf8(data_root)};
+    // log/ 不是业务数据：CLI 只允许创建这一个目录。
+    return Logger::open(paths.log(), options);
+}
+
+namespace {
 
 constexpr wchar_t kSingletonMutex[] = L"Local\\FMT.CLI.v1";
 constexpr wchar_t kConsoleTitle[] = L"FMT";
+
+// 服务刚被 service start 拉起来时监听还没就绪，连接要给它一点时间。
+constexpr int kConnectWaitMs = 5000;
+
+// 服务当前数据根与本进程不同时，点明服务侧日志写在哪里：
+// 两个进程各写自己数据根下的 log/fmt.log（根一样时才是同一个文件）。
+void note_service_root(const Options& options) {
+    Result<service::ServiceState> state = service::load_state();
+    if (!ok(state)) {
+        return;
+    }
+    const std::string service_root = std::get<service::ServiceState>(state).current_root;
+    if (service_root.empty() || iequals(service_root, to_forward_slashes(options.data_root))) {
+        return;
+    }
+    log_warn("Cli", "服务当前数据根是 " + service_root + "，服务侧日志写在该根的 log/fmt.log；" +
+                        "本进程日志写在本目录的 log/fmt.log");
+}
 
 void print_version() {
     std::printf("%.*s\n", static_cast<int>(version::STRING.size()), version::STRING.data());
@@ -112,6 +168,7 @@ bool is_user_service_command(const std::string& operation) {
 
 // ---- service 四条命令：每条都提权 ----
 int run_service_command(const std::string& operation, const Options& options) {
+    log_info("Cli", "service " + operation + "：需要管理员权限，开始提权");
     std::printf("需要管理员权限\n");
     std::printf("正在提权...\n");
     std::fflush(stdout);
@@ -120,6 +177,8 @@ int run_service_command(const std::string& operation, const Options& options) {
         elevate_service_command(operation, options.self_path);
     if (!ok(elevated)) {
         const Error& error = *error_of(elevated);
+        log_error("Cli", "service " + operation + " 提权失败：" + code_string(error.code) + " " +
+                             error.message);
         std::fprintf(stderr, "执行失败：%s %s\n", code_string(error.code).c_str(),
                      error.message.c_str());
         std::fprintf(stderr, "错误码：%d\n", exit_code(error.code));
@@ -128,11 +187,14 @@ int run_service_command(const std::string& operation, const Options& options) {
 
     const ElevatedOutcome& outcome = std::get<ElevatedOutcome>(elevated);
     if (outcome.ok) {
+        log_info("Cli", "service " + operation + " 执行成功（错误码 0）");
         std::printf("执行成功...\n");
         std::printf("错误码：0\n");
         return 0;
     }
 
+    log_error("Cli", "service " + operation + " 执行失败：" + code_string(outcome.code) + " " +
+                         outcome.message + "（错误码 " + std::to_string(outcome.exit_code) + "）");
     std::fprintf(stderr, "执行失败：%s %s\n", code_string(outcome.code).c_str(),
                  outcome.message.c_str());
     std::fprintf(stderr, "错误码：%d\n", outcome.exit_code);
@@ -151,7 +213,7 @@ Status ensure_connected(Session& session, const Options& options) {
         return std::monostate{};
     }
 
-    Result<ipc::PipeClient> connected = ipc::PipeClient::connect(ipc::kConnectTimeoutMs);
+    Result<ipc::PipeClient> connected = ipc::PipeClient::connect_waiting(kConnectWaitMs);
     if (!ok(connected)) {
         return *error_of(connected);
     }
@@ -173,6 +235,7 @@ Status ensure_connected(Session& session, const Options& options) {
     }
 
     session.connected = true;
+    log_info("Ipc", "已连接服务，数据根声明为：" + to_forward_slashes(options.data_root));
     return std::monostate{};
 }
 
@@ -184,14 +247,17 @@ void print_failure(const Error& error) {
 
 int run_business_command(const std::vector<std::string>& parts, Session& session,
                          const Options& options) {
+    const std::string operation = parts[0] + "." + parts[1];
+
     if (const Status status = ensure_connected(session, options); !ok(status)) {
+        log_error("Cli", "命令 " + operation + " 无法连接服务：" + error_of(status)->message);
         print_failure(*error_of(status));
         return exit_code(error_of(status)->code);
     }
 
     ipc::Request request;
     request.id = session.next_id++;
-    request.op = parts[0] + "." + parts[1];
+    request.op = operation;
     request.root = options.data_root;
     request.pid = GetCurrentProcessId();
 
@@ -203,15 +269,19 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
         request.args["argv"] = arguments;
     }
 
+    log_info("Cli", "命令 " + operation + " 已发送（id " + std::to_string(request.id) + "）");
+
     Result<ipc::Response> response = session.client.call(request, ipc::kCommandTimeoutMs);
     if (!ok(response)) {
         session.connected = false;
+        log_error("Cli", "命令 " + operation + " 通信失败：" + error_of(response)->message);
         print_failure(*error_of(response));
         return exit_code(error_of(response)->code);
     }
 
     const ipc::Response& value = std::get<ipc::Response>(response);
     if (value.ok) {
+        log_info("Cli", "命令 " + operation + " 执行成功（错误码 0）");
         if (!value.data.is_null() && !(value.data.is_object() && value.data.empty())) {
             std::printf("%s\n", value.data.dump(2).c_str());
         }
@@ -220,6 +290,8 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
         return 0;
     }
 
+    log_error("Cli", "命令 " + operation + " 执行失败：" + code_string(value.error.code) + " " +
+                         value.error.message);
     print_failure(value.error);
     return exit_code(value.error.code);
 }
@@ -228,6 +300,7 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
 int run_interactive(const Options& options, service::State state) {
     std::printf("FMT %.*s\n", static_cast<int>(version::STRING.size()), version::STRING.data());
     std::printf("%s\n", service_state_line(state).c_str());
+    log_info("Cli", "进入交互循环，数据根：" + to_forward_slashes(options.data_root));
 
     Session session;
     while (true) {
@@ -244,6 +317,9 @@ int run_interactive(const Options& options, service::State state) {
         if (parts.empty()) {
             continue;
         }
+
+        // 用户敲了什么就记什么：日志要能跟着 CLI 走。
+        log_info("Cli", "fmt> " + trim(line));
 
         const std::string& head = parts[0];
         if (head == "exit" || head == "quit") {
@@ -268,27 +344,35 @@ int run_interactive(const Options& options, service::State state) {
 
         run_business_command(parts, session, options);
     }
+    log_info("Cli", "退出交互循环");
     return 0;
 }
 
 // ---- 双击引导：查 SCM -> 需要时提权 -> 进循环 ----
 int bootstrap_and_run(const Options& options) {
     service::State state = service::query_state();
+    log_info("Service", "当前状态：" + std::string(service::state_name(state)));
 
     if (state == service::State::NotInstalled) {
+        log_info("Service", "服务未安装 -> 首次安装并启动");
         run_service_command("install", options);  // 首次双击：一次 UAC，装 + 启动
         state = service::query_state();
     } else if (state == service::State::Stopped) {
+        log_info("Service", "服务已停止 -> 启动");
         run_service_command("start", options);
         state = service::query_state();
+    } else {
+        log_info("Service", "服务运行中，不重复安装、不弹 UAC");
     }
     // 运行中就不动它，也不弹 UAC。
     state = settle_state(state, 5000);
+    log_info("Service", "落定后的状态：" + std::string(service::state_name(state)));
 
     // 宿主 exe 是不是还在：不在就得重新安装指向当前目录。
     if (Result<std::string> host = service::installed_binary_path(); ok(host)) {
         const std::string path = std::get<std::string>(host);
         if (!iequals(path, options.self_path) && !std::filesystem::exists(path_from_utf8(path))) {
+            log_warn("Service", "服务宿主 exe 已丢失：" + path);
             std::printf("服务指向的可执行文件已丢失：%s\n", path.c_str());
             std::printf("是否重新安装服务并指向当前目录？(y/N) ");
             std::fflush(stdout);
@@ -297,6 +381,8 @@ int bootstrap_and_run(const Options& options) {
             std::getline(std::cin, answer);
             if (!answer.empty() && (answer[0] == 'y' || answer[0] == 'Y')) {
                 run_service_command("reinstall", options);
+            } else {
+                log_info("Service", "用户放弃重新安装");
             }
         }
     }
@@ -306,19 +392,7 @@ int bootstrap_and_run(const Options& options) {
 
 }  // namespace
 
-int run(const std::vector<std::string>& args, const Options& options) {
-    if (!args.empty() && args[0] == "--elevated") {
-        return run_elevated(args);
-    }
-    if (!args.empty() && (args[0] == "--help" || args[0] == "-h")) {
-        print_usage();
-        return 0;
-    }
-    if (!args.empty() && (args[0] == "--version" || args[0] == "-v")) {
-        print_version();
-        return 0;
-    }
-
+int dispatch_command(const std::vector<std::string>& args, const Options& options) {
     // 一次性命令不参与单实例：已经开着一个窗口时，别的脚本仍然要能停服务。
     if (!args.empty()) {
         if (args[0] == "service") {
@@ -352,6 +426,47 @@ int run(const std::vector<std::string>& args, const Options& options) {
         ReleaseMutex(singleton);
         CloseHandle(singleton);
     }
+    return code;
+}
+
+int run(const std::vector<std::string>& args, const Options& options) {
+    if (!args.empty() && args[0] == "--elevated") {
+        return run_elevated(args);  // 提权副本自己开日志器（在 run_elevated 里）
+    }
+    if (!args.empty() && (args[0] == "--help" || args[0] == "-h")) {
+        print_usage();
+        return 0;
+    }
+    if (!args.empty() && (args[0] == "--version" || args[0] == "-v")) {
+        print_version();
+        return 0;
+    }
+
+    // 从这里开始都是真的干活，才值得写日志：--help / --version 不该在磁盘上
+    // 留下任何东西。日志与 Service 共用同一个 <数据根>/log/fmt.log。
+    std::unique_ptr<Logger> file_logger;
+    if (Result<std::unique_ptr<Logger>> opened = open_cli_logger(options.data_root); ok(opened)) {
+        file_logger = std::move(std::get<std::unique_ptr<Logger>>(opened));
+        set_logger(file_logger.get());
+    }
+
+    std::string summary = "CLI 启动 v" + std::string(version::STRING) +
+                          "，数据根：" + to_forward_slashes(options.data_root);
+    if (args.empty()) {
+        summary += "，交互模式";
+    } else {
+        summary += "，命令：" + args[0];
+        if (args.size() > 1) {
+            summary += " " + args[1];
+        }
+    }
+    log_info("Cli", summary);
+    note_service_root(options);
+
+    const int code = dispatch_command(args, options);
+
+    log_info("Cli", "CLI 退出，错误码 " + std::to_string(code));
+    set_logger(nullptr);  // 先摘掉指针，再让 file_logger 析构
     return code;
 }
 
