@@ -155,7 +155,9 @@ Result<std::vector<BucketInfo>> BucketService::list() {
             }
             BucketInfo info;
             info.name = path_to_utf8(entry.path().filename());
-            info.is_current = (info.name == config_.current_bucket);
+            // 目录名不区分大小写（Windows）：current_bucket 存的是用户敲的拼写，
+            // 可能和磁盘上的实际名字大小写不同，比较时不能按字节精确比。
+            info.is_current = iequals(info.name, config_.current_bucket);
             buckets.push_back(std::move(info));
         }
     }
@@ -230,7 +232,7 @@ Result<BucketRemoval> BucketService::remove(std::string_view name) {
     std::vector<TrashBucket> entries = std::get<std::vector<TrashBucket>>(loaded);
 
     BucketRemoval removal;
-    removal.was_current = (config_.current_bucket == name);
+    removal.was_current = iequals(config_.current_bucket, name);
     removal.trashed_name = unique_trashed_name(name);
 
     if (const Status status = move_bucket_to_trash(name, removal.trashed_name, &removal.moved_to);
@@ -525,8 +527,9 @@ Result<BucketService::TrashLookup> BucketService::find_trashed(
     TrashLookup lookup;
 
     // 回收站里的名字优先：它是精确的、不带歧义的。
+    // 比较不区分大小写（桶名那部分可能是用户按不同大小写敲的）。
     for (std::size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].trashed_name == identifier) {
+        if (iequals(entries[i].trashed_name, identifier)) {
             lookup.found = true;
             lookup.index = i;
             return lookup;
@@ -536,7 +539,7 @@ Result<BucketService::TrashLookup> BucketService::find_trashed(
     // 再用原桶名：同名多条时必须让调用方改用回收站里的名字。
     std::vector<std::size_t> matched;
     for (std::size_t i = 0; i < entries.size(); ++i) {
-        if (!entries[i].original_name.empty() && entries[i].original_name == identifier) {
+        if (!entries[i].original_name.empty() && iequals(entries[i].original_name, identifier)) {
             matched.push_back(i);
         }
     }

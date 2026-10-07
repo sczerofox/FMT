@@ -498,6 +498,23 @@ FMT_TEST(Bucket, 有索引没目录的条目可以永久删掉) {
     FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(after).size(), std::size_t{0});
 }
 
+FMT_TEST(Bucket, 大小写不同也认得同一个桶) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(buckets.create("work")));
+    FMT_CHECK(fmt::ok(buckets.create("other")));  // 第二个不抢「当前」
+
+    // Windows 的目录名不区分大小写：用大写切过去，指向的还是同一个桶
+    FMT_CHECK(fmt::ok(buckets.use("WORK")));
+
+    const auto list = buckets.list();
+    FMT_CHECK(fmt::ok(list));
+    for (const fmt::BucketInfo& info : std::get<std::vector<fmt::BucketInfo>>(list)) {
+        // current_bucket 里存的是用户敲的拼写（WORK），但标记必须落在实际的目录上
+        FMT_CHECK_EQ(info.is_current, info.name == std::string("work"));
+    }
+}
+
 FMT_TEST(Bucket, 当前Bucket失效时置空) {
     Fixture f;
     fmt::BucketService buckets(*f.paths, f.config, nullptr);

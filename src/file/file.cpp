@@ -524,9 +524,13 @@ Result<FileRecord> FileService::commit_upload(PreparedUpload& prepared) {
         }
     }
     // 第 38 节：同用户 + 正常文件 + 同名 -> 拒绝，**不自动改名**。
+    //
+    // 名字比较**不区分大小写**：Windows 的文件名不区分大小写，`DOC.TXT` 与 `doc.txt`
+    // 会落到同一个磁盘路径上。按精确匹配放过的话，第二次上传会**直接覆盖**第一个文件的
+    // 字节，而 file.json 里两条记录的 size/md5 各说各话——这是数据损坏，不是显示问题。
     for (const FileRecord& record : records) {
         if (record.user == config_.current_user && !record.is_trash &&
-            record.file_name == prepared.file_name) {
+            iequals(record.file_name, prepared.file_name)) {
             return make_error(ErrorCode::FileNameConflict,
                               "同名文件已存在：" + record.file_name +
                                   "（换一个文件名再上传）");
@@ -638,7 +642,7 @@ Result<FileRecord> FileService::get_by_name(std::string_view file_name) {
     }
     for (const FileRecord& record : std::get<std::vector<FileRecord>>(loaded)) {
         if (record.user == config_.current_user && !record.is_trash &&
-            record.file_name == file_name) {
+            iequals(record.file_name, file_name)) {
             return record;
         }
     }
@@ -689,25 +693,30 @@ Result<std::filesystem::path> FileService::trash_path_of(const FileRecord& recor
 
 Result<std::size_t> FileService::locate_record(const std::vector<FileRecord>& records,
                                                std::string_view key) const {
+    // 标识比较**一律不区分大小写**（Windows 习惯：文件名与路径都不区分大小写，
+    // 用户敲 `DOC.TXT` 或大写 file_id 时不该得到「文件不存在」）。
+
     // ① 先当 file_id：全局唯一，形状固定（fmt-YYYYMMDD-N），先查不会误伤名字。
     for (std::size_t i = 0; i < records.size(); ++i) {
-        if (records[i].file_id == key) {
+        if (iequals(records[i].file_id, key)) {
             return i;
         }
     }
 
     // ② 再当文件名：当前用户 + 正常文件。
-    //    名字在同用户范围内唯一（重名上传会被 FMT-105 拒绝），所以不会撞出歧义。
+    //    名字在同用户范围内唯一（重名上传会被 FMT-105 拒绝，且比较不区分大小写），
+    //    所以不会撞出歧义。
     for (std::size_t i = 0; i < records.size(); ++i) {
         if (records[i].user == config_.current_user && !records[i].is_trash &&
-            records[i].file_name == key) {
+            iequals(records[i].file_name, key)) {
             return i;
         }
     }
 
     // ③ 名字存在、但已经在回收站里：说清楚是哪一条，别让用户以为文件没了。
     for (const FileRecord& record : records) {
-        if (record.user == config_.current_user && record.is_trash && record.file_name == key) {
+        if (record.user == config_.current_user && record.is_trash &&
+            iequals(record.file_name, key)) {
             return make_error(ErrorCode::InvalidArgument,
                               "该文件已经在回收站里：" + std::string(key) + "（file_id " +
                                   record.file_id + "）");

@@ -378,6 +378,52 @@ FMT_TEST(File, 按名字删除用的是记录自己的Bucket) {
     FMT_CHECK(text.find("/生活/") == std::string::npos);
 }
 
+FMT_TEST(File, 大小写不同的同名必须被当成重名) {
+    Fixture f;
+    const auto first = upload_local(f, "doc.txt");
+    FMT_CHECK(fmt::ok(first));
+    if (!fmt::ok(first)) {
+        return;
+    }
+    const fmt::FileRecord record = std::get<fmt::FileRecord>(first);
+
+    // 换个内容，用大小写不同的同一个名字再传一次。
+    // Windows 的文件名不区分大小写，两者会落到**同一个磁盘路径**上：
+    // 要么干净地报重名，要么就会把上一个文件覆盖掉（灾难）。
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(f.source, "different content here")));
+    const auto second = upload_local(f, "DOC.TXT");
+
+    // **先查数据完整性**：不管第二次上传成不成功，第一个文件都必须完好。
+    // （这条放在断言拒绝之前：万一磁盘被覆盖，先炸的就是它，证据才清楚。）
+    fmt::FileService files(*f.paths, f.config, nullptr);
+    const auto path = files.resolve_path(record);
+    FMT_CHECK(fmt::ok(path));
+    if (fmt::ok(path)) {
+        const std::filesystem::path stored = std::get<std::filesystem::path>(path);
+        FMT_CHECK(fmt::file_exists(stored));
+        FMT_CHECK_EQ(std::filesystem::file_size(stored), record.size);
+        const auto text = fmt::read_text_file(stored);
+        FMT_CHECK(fmt::ok(text));
+        FMT_CHECK_EQ(std::get<std::string>(text), std::string("hello world"));
+    }
+
+    FMT_CHECK(!fmt::ok(second));
+}
+
+FMT_TEST(File, 按名字查询不区分大小写) {
+    Fixture f;
+    FMT_CHECK(fmt::ok(upload_local(f, "Report.txt")));
+
+    fmt::FileService files(*f.paths, f.config, nullptr);
+    // Windows 的文件名不区分大小写，用户敲大写也要能找到
+    const auto lower = files.get_by_name("report.txt");
+    FMT_CHECK(fmt::ok(lower));
+    if (fmt::ok(lower)) {
+        FMT_CHECK_EQ(std::get<fmt::FileRecord>(lower).file_name, std::string("Report.txt"));
+    }
+    FMT_CHECK(fmt::ok(files.remove("REPORT.TXT")));
+}
+
 FMT_TEST(File, 从HTTP下载入库) {
     Fixture f;
 
