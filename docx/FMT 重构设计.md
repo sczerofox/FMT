@@ -3,7 +3,8 @@
 > 项目名称：FMT
 > 项目类型：Windows 文件管理系统
 > 文档定位：**本次重构（V1 重构版）的差异说明与冻结决策索引**
-> 状态：冻结，作为阶段 2 / 阶段 3 的编码依据
+> 状态：冻结，作为阶段 2 / 阶段 3 的编码依据；**阶段 2～4 已实现并提交**
+> （阶段 4 = Bucket，commit 32249ea），下一步是阶段 5（File / Upload / Trash / Share）
 > 分支：`arch-restart`（基线 `bdbe33d`，旧实现保留在 `dev`）
 
 本文档不替代三份主文档，只回答一个问题：**相对旧设计，这次改了什么、为什么改、按什么顺序做。**
@@ -36,7 +37,9 @@ CLI 与服务之间的唯一通道是 `127.0.0.1:4122`，数据根固定为「�
   `服务启动失败：FMT-008 配置错误`，而不是只会说「启动失败」。
 - `hello` 响应新增 `switched` / `previous_root`，CLI 据此记一行日志 `[Service] 数据根切换：旧 -> 新`（只进日志）。
 
-范围外（本阶段不做）：`pause`（本次确认不需要）、业务命令实现、HTTP 客户端 CLI、多用户与权限系统。
+范围外（本阶段不做）：`pause`（本次确认不需要）、HTTP 客户端 CLI、多用户与权限系统。
+业务命令**按阶段推进**：阶段 4 已完成 `bucket`（决策 19～23 与第 4.2、4.3 节的参数形状就来自它），
+阶段 5 做 `file` / `upload` / `trash` / `share`，阶段 6 做 HTTP 浏览器侧与 Preview。
 
 ---
 
@@ -62,6 +65,9 @@ CLI 与服务之间的唯一通道是 `127.0.0.1:4122`，数据根固定为「�
 | 16 | 程序横幅名 `File Manager Tool`，版本部分 `v<MAJOR>.<MINOR>`（当前 `v1.0`），构建日期由 CMake 配置时生成（`FMT_BUILD_DATE`，`%Y.%m.%d` 本地时间）→ `banner_text()` 一处产出，横幅与 `--version` 共用；用法标题是 `用法：fmt.exe [命令]` |
 | 17 | **控制台只留交互**：双击时数据根体检结果（新建目录 / 新建文件 / 完整）与「服务当前状态」**只进日志**；只有异常（无法补齐、文件损坏）走 stderr |
 | 18 | 帮助有两个入口：`--help` 打印带横幅与退出码表的完整用法；`help` 不带参数只列命令总览、`help <组>` 打印该组详情（`service` / `bucket` / `file` / `share` / `trash` / `help` / `exit`），交互与一次性都支持；`help <未知组>` → stderr 一行 + `FMT-001` / 退出码 2。`exit` / `quit` 是正式命令 |
+| 19 | **Bucket 就是目录，没有独立 ID**：`repository/<user>/<bucket>/` 这个目录就是 Bucket，存在性 = 目录存在；`current_bucket` 存在 `config.json` 里（只存名称）。删除 = 把整个目录移到 `trash/<user>/<bucket>/`，**不丢弃数据**；回收站重名**不覆盖**（新目录名加时间戳后缀 `工作_20261008012345`），删两次得两份数据、`trash.json` 两条记录 |
+| 20 | **`current_user` 用占位名**：V1 没有用户系统，数据根初始化时若 `current_user` 为空就自动置 `user` 并保存（需求原文「不做用户先用 user 代替」），磁盘上是 `repository/user/<bucket>/…`。**不需要用户先设置**；`FMT-604 NoCurrentUser` 保留给「用户被显式清空」 |
+| 21 | **两条入口一套参数**：管道 `op = "<组>.<动作>"`（如 `bucket.create`）+ 位置参数放 `args.argv`；HTTP 路由固定，请求体接受 `{"name":"工作"}` 或 `{"argv":["工作"]}`，**路径参数里的中文由服务端 `url_decode` 解码**（`common/string` 的 `url_encode` / `url_decode`）。错误码 → HTTP 状态码的映射一并冻结（400 / 403 / 404 / 409 / 500 五档，见技术文档 12.5） |
 
 ---
 
@@ -155,13 +161,26 @@ settle_state() 返回落定后的 State，回来仍是等待类就说明「没�
 ```text
 管道名   \\.\pipe\fmt.control
 类型     PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT
-实例数   PIPE_UNLIMITED_INSTANCES
+实例数   PIPE_UNLIMITED_INSTANCES（但服务端一次只 accept 一条连接，见下）
 帧格式   [4 字节小端长度][UTF-8 JSON]，一请求一响应，用 id 配对
 请求     {"id":7,"op":"hello","root":"D:\\FMT2","pid":1234}
-         {"id":8,"op":"file.list"}
+         {"id":8,"op":"bucket.create","args":{"argv":["工作"]}}
 响应     {"ok":true,"data":{...}}
-         {"ok":false,"error":{"code":"FMT-305","message":"未设置当前 Bucket"}}
+         {"ok":false,"error":{"code":"FMT-201","message":"Bucket 已存在：工作"}}
 ```
+
+**连接是严格串行的**（阶段 4 实现为准）：服务端只有一条 accept 循环，
+`accept` 一次建立一条连接，然后在这条连接上「读一个请求 → 处理 → 写一个响应」，
+**客户端断开才回到 accept**——所以同一时刻只有一条 CLI 连接（配套决策 10），
+第二个客户端会拿到 `ERROR_PIPE_BUSY`，客户端等 3 秒重试、最终归为 `FMT-601`。
+**没有「每连接一个线程」这回事**（HTTP 那边才是线程池并发）。
+
+**`args.argv` 是位置参数的唯一形状**（决策 21）：`op = "<组>.<动作>"`，
+`fmt> bucket create 工作` → `{"op":"bucket.create","args":{"argv":["工作"]}}`。
+阶段 4 落地的 op 有五种：`bucket.create` / `bucket.list` / `bucket.get` /
+`bucket.use` / `bucket.delete`；响应的 `data` 形状见技术文档 12.3.2.1
+（`list` 回 `{buckets, count, current_bucket}`，`create` / `use` / `delete` 回
+`message` + 相关字段，`get` 回 `{bucket, is_current, path}`）。
 
 `hello` 的响应 `data` 里带两个新字段：
 
@@ -185,6 +204,31 @@ settle_state() 返回落定后的 State，回来仍是等待类就说明「没�
 ### 4.3 浏览器 ↔ 服务：HTTP
 
 保持旧设计：`server.json` 控制 `enabled` / `host` / `port`（默认 `127.0.0.1:4122`），由 cpp-httplib 提供。HTTP 请求作用于**当前数据根**。
+
+**阶段 4 已落地的业务路由（`/api/bucket` 五条，形状已冻结）**：
+
+```text
+GET    /api/bucket                → bucket.list
+POST   /api/bucket                → bucket.create   body: {"name":"工作"} 或 {"argv":["工作"]}
+GET    /api/bucket/<name>         → bucket.get
+POST   /api/bucket/<name>/use     → bucket.use
+DELETE /api/bucket/<name>         → bucket.delete
+```
+
+- **路径参数里的中文会被客户端百分号编码**（`/api/bucket/%E5%B7%A5%E4%BD%9C`），
+  服务端必须先用 `common/string` 的 `url_decode` 还原成 UTF-8 再当业务参数用；
+  对应地 `url_encode` 给客户端拼路径用。不解码会得到 `FMT-200 Bucket 不存在：%E5%B7%A5…`。
+- 请求体两种写法等价：`{"name":"工作"}`（好写）或 `{"argv":["工作"]}`（与管道一致）；
+  两者最终都变成 `args.argv`，**交给同一个 `execute_business()`**，所以两条入口的行为、
+  错误码、信封完全一致。
+- **错误码 → HTTP 状态码**已冻结（技术文档 12.5）：`400` 参数/名称/路径/URL 类、
+  `403` 权限与分享不可用、`404` 对象不存在、`409` 冲突、其余 `500`；
+  管道没有这一层，CLI 只看信封里的 `FMT-NNN`。
+- HTTP 是**线程池并发**（cpp-httplib 默认 `max(8, hardware_concurrency-1)`），
+  `/api/ping`、`/api/status` 不碰业务锁；业务路由与管道共用运行体的同一把互斥锁（第 4.2 节）。
+
+`file` / `share` / `trash` / `config` 的 `/api/*` 路由仍是**设计约定**，随阶段 5、6 落地细化；
+**「service 层是唯一业务执行者、两条入口共用信封」这一结构不变**。
 
 ### 4.4 service 命令：直连 SCM + UAC
 
@@ -263,6 +307,9 @@ CLI 启动
          已有的 JSON 会被真正读一遍（解析 + 版本检查）确认完整性
          读不出来或版本不受支持 → 只报告、绝不重置（沿用「JSON 损坏不能静默重置」）
          都不碰业务数据内容：不写 data/*.json 的内容、不删文件、不改名
+阶段 4 加的一步（在共用规则之后，由 initialize_root 做）
+         加载 config.json → current_user 为空？→ 置占位名 "user" 并保存（决策 20）
+         幂等：第二次读到 "user" 什么都不写
 ```
 
 CLI 侧的结果**只进日志**（`log/fmt.log`，模块 `Cli`），控制台一行都不打：
@@ -421,16 +468,22 @@ CLI 侧 service::last_start_failure() 读回该编号 → code_from_number → �
 <数据根>/                     ← CLI 声明，等于 CLI 的 fmt.exe 所在目录
 ├── fmt.exe
 ├── repository/              <user>/<bucket>/YYYY/MM/DD/<file_name>
+│                            Bucket 就是这一层目录，没有独立 ID（决策 19）
 ├── trash/                   保持原层级，便于恢复
+│                            Bucket 删除 → trash/<user>/<bucket>/（整个桶搬进来，
+│                            重名加时间戳后缀，不覆盖）
 ├── config/
 │   ├── config.json          version / current_user / current_bucket /
 │   │                        max_upload_size / size_unit / language
+│   │                        current_user 由初始化补成占位名 user（决策 20）
 │   └── server.json          version / enabled / host / port(4122)
 ├── data/
 │   ├── user.json            {"version":1,"users":[]}
 │   ├── file.json            {"version":1,"files":[]}
 │   ├── share.json           {"version":1,"shares":[]}
 │   └── trash.json           {"version":1,"trash":[]}
+│                            Bucket 级记录：type=bucket，无 file_id
+│                            （user / bucket / original_path / trash_path / deleted_at）
 ├── log/
 │   ├── fmt.log              Service 与 CLI 追加同一个文件
 │   └── error.log            仅 ERROR 级
@@ -485,13 +538,13 @@ CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位�
 
 ## 10. 阶段拆分
 
-| 阶段 | 内容 | 验收 |
-|---|---|---|
-| 2 | `common`（Error / Result / Time / String / Path / Logger）、`config`、`storage`、`core` 初始化 | 能在指定数据根建出六个目录（`repository/` `trash/` `config/` `data/` `log/` `temp/`）+ 默认 JSON（**`ensure_root`/`check_root` 由 Service 与 CLI 共用**，第二次运行日志里只多一行「数据根完整」、控制台无输出）；JSON 损坏报 7 且不动原文件 |
-| 3 | `service`（SCM 五命令 `install`/`uninstall`/`start`/`stop`/`status` + 统一查询接口 `query_status()`/`query_state()`/`installed_binary_path()`/`last_start_failure()` + 按 `dwWaitHint` 自适应的 `settle_state()` + ServiceMain + 失败编号上报 `dwServiceSpecificExitCode` + Recovery + 服务状态文件）、`ipc`（管道 + 安全描述符）、`cli`（循环、横幅 `File Manager Tool  v1.0  ( build  <日期> )`、`help` 总览与分组详情、单实例、提权、双击幂等体检与补齐、落定判定与 reinstall 兜底） | **全新环境双击 → 一次 UAC → 服务装好且开机自启 → 控制台干净（无「建了什么」）→ `service stop/start` 各弹一次 UAC、`service status` 不弹 UAC、输出与样例一致；`help` / `help service` 输出与样例一致；复制 exe 到新目录双击 → 在新目录建出数据，日志里有「数据根切换」** |
-| 4 | `bucket` | create / list / get / use / delete + `current_bucket` |
-| 5 | `file` / `upload` / `trash` / `share` | 需求里的文件、分享、回收站 |
-| 6 | `server`（HTTP + Preview） | 浏览器可用 |
+| 阶段 | 内容 | 验收 | 状态 |
+|---|---|---|---|
+| 2 | `common`（Error / Result / Time / String / Path / Logger）、`config`、`storage`、`core` 初始化 | 能在指定数据根建出六个目录（`repository/` `trash/` `config/` `data/` `log/` `temp/`）+ 默认 JSON（**`ensure_root`/`check_root` 由 Service 与 CLI 共用**，第二次运行日志里只多一行「数据根完整」、控制台无输出）；JSON 损坏报 7 且不动原文件 | ✅ 完成 |
+| 3 | `service`（SCM 五命令 `install`/`uninstall`/`start`/`stop`/`status` + 统一查询接口 `query_status()`/`query_state()`/`installed_binary_path()`/`last_start_failure()` + 按 `dwWaitHint` 自适应的 `settle_state()` + ServiceMain + 失败编号上报 `dwServiceSpecificExitCode` + Recovery + 服务状态文件）、`ipc`（管道 + 安全描述符）、`cli`（循环、横幅 `File Manager Tool  v1.0  ( build  <日期> )`、`help` 总览与分组详情、单实例、提权、双击幂等体检与补齐、落定判定与 reinstall 兜底） | **全新环境双击 → 一次 UAC → 服务装好且开机自启 → 控制台干净（无「建了什么」）→ `service stop/start` 各弹一次 UAC、`service status` 不弹 UAC、输出与样例一致；`help` / `help service` 输出与样例一致；复制 exe 到新目录双击 → 在新目录建出数据，日志里有「数据根切换」** | ✅ 完成 |
+| 4 | `bucket` + `common/validation` 名称校验 | create / list / get / use / delete + `current_bucket`；Bucket 无独立 ID；删除移入回收站且**重名不覆盖**；管道与 HTTP 两条入口行为一致；`current_bucket` 失效校验在**服务启动**与**数据根切换**时由运行体自动执行（失效置空、有效不动） | ✅ 完成（commit 32249ea；收尾 8a5e554、acc90a3，见 `FMT 技术文档.md` 第 18.15 节） |
+| 5 | `file` / `upload` / `trash` / `share` | 需求里的文件、分享、回收站。**开工前先定锁粒度**：阶段 4 是「两条入口共用一把互斥锁」，上传/下载持锁会挡住 `bucket list` 与浏览器请求（见第 12 节） | ⏳ **下一步** |
+| 6 | `server`（HTTP + Preview） | 浏览器可用（`/api/bucket` 五条路由已在阶段 4 落地） | ⏳ 未开始 |
 
 阶段 2 + 3 完成后，「双击即用的服务 + CLI」闭环成立。
 
@@ -520,6 +573,10 @@ CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位�
 | 17 | 横幅是 `FMT v1.0.0`，用法标题写 `FMT 1.0.0 - Windows 文件管理系统` | 横幅与 `--version` 共用 `File Manager Tool  v1.0  ( build  <配置日期> )`；用法标题改 `用法：fmt.exe [命令]` | 程序对外名字固定、构建日期由 CMake 生成，避免源码里再硬编码一个日期 |
 | 18 | 双击时把「数据根：… / 新建目录：… / 新建文件：… / 数据根完整 / 服务状态：…」都打到控制台 | 这些行**只进日志**（模块 `Cli` / `Service`），控制台只留横幅、提示符、命令结果与异常 | 太杂乱，把提示符淹掉；按「控制台负责交互与异常，日志负责完整记录」归位 |
 | 19 | 只有 `--help`（一次性、带完整用法） | 新增 `help` 命令：`help` 列命令总览（只列命令、不加描述）、`help <组>` 看该组详情；交互与一次性都支持；`help <未知组>` → `FMT-001` / 退出码 2 | 交互式里需要一个轻量的「我有哪些命令」，而 `--help` 太重 |
+| 20 | Bucket 有独立标识、删除即丢弃数据（旧文档的口气） | **Bucket 就是目录**：`repository/<user>/<bucket>/`，无独立 ID；删除 = 整个目录移到 `trash/<user>/<bucket>/`，**数据不丢**；回收站重名不覆盖（时间戳后缀），删两次得两份数据 | 目录本身就是最好的 ID；删除必须可恢复（第 1 节的范围里就写了「回收站」） |
+| 21 | 用户必须先设置 `current_user`（旧文档第 93 节的口气） | 初始化自动补占位名 `user` 并保存，用户第一条命令就能成功；`FMT-604` 只留给「被显式清空」 | V1 没有用户系统、也没有设置用户的命令，让首启先撞一次错误是白费一步 |
+| 22 | 管道与 HTTP 各写一套参数解析 | 统一成 `op = "<组>.<动作>"` + `args.argv`；HTTP 请求体接受 `{"name":…}` 或 `{"argv":[…]}`，路径参数由服务端 `url_decode` 解码 | 两条入口一份业务实现，参数就不该有第二种形状 |
+| 23 | 各入口自己决定 HTTP 状态码 | 冻结一张「错误码 → 状态码」映射表（400 / 403 / 404 / 409 / 500），实现里一个 `switch` + `default: 500` | 浏览器与调试工具需要稳定的状态码；新错误码未登记就落 500，绝不猜一个不匹配的 4xx |
 
 ---
 
@@ -531,6 +588,7 @@ CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位�
 | HTTP 鉴权 | 目前仅监听 `127.0.0.1`，局域网访问的安全控制后续再做 |
 | 提权副本的结果通道细节 | **已定稿，从未决清单移出**：结果经结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 回传（第 4.4 节），数据根不可写时退回 `%TEMP%` 同名文件并记一行 WARN；命名管道方案作废 |
 | 数据根切换的并发保护 | 目前依赖「只有一个 CLI 窗口」，多窗口场景不在本次范围 |
+| **阶段 5 的锁粒度（开工前必须定）** | 阶段 4 的并发形态：**管道连接级严格串行**（服务端一次只 accept 一条连接，没有「每连接一个线程」）、**HTTP 线程池并发**、**业务命令共用运行体的一把互斥锁**。注意这是**互斥不是队列**：不保证先来先服务、没有优先级、没有排队上限、没有排队超时。**代价**：一个慢命令会卡住两条入口的所有业务命令；上传/下载可能几十秒到几分钟，那时 `bucket list` 与浏览器请求都会一起等。阶段 5 必须二选一：**收细锁粒度**（按 JSON 文件 / 按 `file_id` 分锁）或**把长任务移出锁**（登记任务 + 后台线程 + 轮询状态）。在选定之前，「上传期间其他命令一起等」是既定限制（`FMT 技术文档.md` 第 15.1、18.16 节） |
 | 双击引导的重装判定 | **已定稿，从待决清单移出**：等待时长**不写死**，按 SCM 的 `dwWaitHint` 自适应（夹在 100 ms – 2000 ms，兜底 30 秒，不是等待类就立即结束，第 4.1 节）；仍没起来先读 `dwServiceSpecificExitCode` 还原 FMT 编号（第 4.1、6 节）：命中数据根/配置类错误码集合（第 5.4 节表）就**不重装**、只打印原因，其余才提权 `reinstall` 一次 |
 | `service status` 是否要机器可读输出 | **已定稿，从待决清单移出**：**V1 不做 `--json`、也不预留参数名**。机器可读通道是**命令退出码**（`0` 成功 / 未安装 `FMT-601` → `8`），人类可读通道是固定顺序的那几行文本（第 6 节） |
 

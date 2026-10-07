@@ -611,6 +611,23 @@ bootstrap_root(root):          // CLI 侧同一函数也叫 check_root，语义�
 发现问题——记一行 `[Cli] 数据根损坏（未自动修复）：data/file.json` 到日志，并把
 `数据根文件损坏（未自动修复）：data/file.json` 送到 stderr，而不是等业务命令失败才暴露。
 
+**阶段 4 在 `initialize_root()` 上补的一步（占位用户名）**：
+
+```text
+5.5 加载 config.json（损坏 → FMT-008，不覆盖）
+    current_user 为空？
+      ├─ 是 → 置为占位名 "user" → save_config() 落盘 → 记日志
+      └─ 否 → 原样保留（这一步幂等：第二次读到 "user" 什么都不做）
+    最后加载 server.json
+```
+
+需求原文是「不做用户先用 user 代替」，所以这不是降级路径而是正常首启路径：用户双击后
+直接敲 `bucket create 工作` 就能得到 `repository/user/工作/`。**`FMT-604 NoCurrentUser`
+仍然保留**，但只在 `current_user` 被外部显式清空时才会由 Bucket 服务返回（18.15）。
+
+实现位置：`src/core/app.cpp`（`initialize_root`）——注意这一步在 `ensure_root()` **之外**，
+因为它是「配置内容」的修正，而 `ensure_root` 只负责目录与文件是否存在。
+
 **`temp/` 的清理**：**Service 启动时**（时机 1）删除 `temp/` 下以 `fmt-` 开头的遗留文件——
 上次异常退出留下的提权结果（`fmt-elev-<父进程 pid>.json`）等；**用户手放进去的其它文件一律不动**。
 删除数量记一行 INFO（例如 `[Service] 清理 temp/ 中 2 个遗留临时文件`；为 0 时不记）。
@@ -716,9 +733,20 @@ CLI 会碰磁盘的地方因此是：`log/fmt.log` 与 `log/error.log`（追加�
 }
 ```
 
+> **注意：这是「刚写出的默认文件」的样子，不是运行时的样子。** 阶段 4 起，
+> 数据根初始化（`initialize_root`，4.4）读到 `current_user` 为空时会立刻置为**占位名
+> `user`** 并保存（需求原文「不做用户先用 user 代替」）。因此实际运行中字段是这样的：
+>
+> ```json
+> { "version": 1, "current_user": "user", "current_bucket": "工作", … }
+> ```
+>
+> 好处是磁盘路径与用户身份解耦：没有用户系统也能得到 `repository/user/<bucket>/…` 这种
+> 合法层级，`FMT-604 NoCurrentUser` 只在用户被**显式清空**时才出现（见 18.15）。
+
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `current_user` | string | 当前用户。用户系统未实现前为空，由 CLI 引导设置 |
+| `current_user` | string | 当前用户。用户系统未实现前由初始化写成占位名 `user`；为空表示被显式清空 |
 | `current_bucket` | string | 当前默认 Bucket 的**名称**，不保存路径或 ID |
 | `max_upload_size` | integer | 最大上传字节数，统一用字节 |
 | `size_unit` | string | 显示单位 B/KB/MB/GB，只影响显示 |
@@ -772,9 +800,14 @@ V1 使用 HTTP，后续可扩展 HTTPS。
 | 配置不存在 | 允许创建默认配置（服务在启动/换根时、CLI 在双击体检时都会补；见 4.4.2、11.13） |
 | JSON 损坏 | **停止初始化**，报告配置错误 |
 | 字段缺失 | 用默认值补齐并回写（不改动其他字段） |
-| 字段类型错误 | 报配置错误，不猜测 |
+| 字段类型错误 | 用默认值补齐并回写（**阶段 2 的实现口径**：`read_field()` 发现类型不符时保留默认值并标记 `patched`，随即整份回写一次；旧文写「报配置错误，不猜测」与实现不符） |
 
 **不得删除原配置，不得重新生成空配置。**
+
+> 只有「文件不是合法 JSON / 版本不受支持 / 写不回去」才报 `FMT-008 ConfigError`；
+> 单个字段写错类型不会让整个数据根不可用，代价是那一次启动会写回一份修正后的配置
+> （字段缺失、类型错误的处理都走同一条 `patched → save_config()` 路径）。
+> `current_user` 为空也走这条路径：由 `initialize_root` 补成占位名 `user`（5.1、4.4）。
 
 加载发生在两个时机：服务启动时（当前根）与根切换时（CLI 声明的新根）。
 两个时机走的是同一个 `bootstrap_root()`，规则完全一致。
@@ -1034,6 +1067,34 @@ struct FileRecord {
 
 Bucket 级记录**不使用 `file_id`**，用 Bucket 信息管理。Bucket 不生成 `file_id`。
 
+**Bucket 级记录（阶段 4 已落地，形状已冻结）**：
+
+```json
+{
+  "type": "bucket",
+  "user": "user",
+  "bucket": "工作",
+  "original_path": "repository/user/工作",
+  "trash_path": "trash/user/工作",
+  "deleted_at": "2026-10-08T01:23:45"
+}
+```
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `type` | string | 固定 `"bucket"`（文件级记录固定 `"file"`） |
+| `user` | string | 归属用户，等于删除时的 `config.current_user` |
+| `bucket` | string | Bucket **名称**；**没有 `file_id`** |
+| `original_path` | string | 删除前的位置，**相对数据根、正斜杠**（`repository/<user>/<bucket>`） |
+| `trash_path` | string | **实际**落点，相对数据根、正斜杠 |
+| `deleted_at` | string | 本地时间 ISO 8601（7.5），无时区 |
+
+写入时机（`BucketService::remove()`，第 30 节流程的第 3 步）：数据搬完之后**追加**到
+`trash` 数组末尾，不是覆盖整个文件。**重名不覆盖**：`trash/<user>/<bucket>` 已经存在时，
+新目录名加时间戳后缀（`工作_20261008012345`），`trash_path` 记加过后缀的**实际**路径——
+同一名字删两次就有两条记录、两份数据都还在。相对路径的理由见 7.6。
+`original_path` 在移动之后才取，因此它描述的是「原来在哪」，不是当时的磁盘状态。
+
 ### 7.4 user.json
 
 ```json
@@ -1185,6 +1246,57 @@ Trash **不占用**正常文件名空间：删除 `test.txt` 后可以重新上�
 
 ### 9.3 接口
 
+**阶段 4 已落地**：`common/validation` 已在 `include/fmt/common/validation.hpp` /
+`src/common/validation.cpp` 实现，**命名空间是 `fmt`**（不是下面那份草案里的
+`fmt::common::validation`），函数名以实际为准：
+
+```cpp
+// Windows 保留设备名：CON / PRN / AUX / NUL / COM1-9 / LPT1-9（带扩展名同样算）
+bool is_windows_reserved_name(std::string_view name);
+
+// 单个路径分量的字节上限
+inline constexpr std::size_t kMaxNameBytes = 255;
+
+// Bucket 名：失败一律 FMT-202 BucketNameInvalid
+Status validate_bucket_name(std::string_view name);
+
+// 文件名（上传用）：空 FMT-100 / 非法字符 FMT-101 / 分隔符或 . .. FMT-102 /
+//                     保留名 FMT-103 / 超长 FMT-104
+Status validate_file_name(std::string_view name);
+
+// URL 合法性仍在待实现清单（阶段 5 与 file upload 一起做）
+// Status validate_url(std::string_view url);
+```
+
+判定顺序（两类名称共用，差别只在错误码粒度）：
+
+```text
+1. 非空
+2. ≤ kMaxNameBytes（255 字节；中文一个字 3 字节，所以名字不能靠「字数」估）
+3. 不含路径分隔符 / 与 \，且不是 "." 或 ".."
+4. 不含控制字符（< 0x20 与 0x7F）与 < > : " | ? *（文件名把两者都归 FMT-101）
+5. 不是 Windows 保留设备名（9.1 的名单，主干比对、大小写不敏感）
+6. 不以点或空格结尾（Windows 会静默截断，宁可拒绝）
+```
+
+错误码对照：
+
+| 失败原因 | `validate_file_name` | `validate_bucket_name` |
+|---|---|---|
+| 空 | `FMT-100` | `FMT-202` |
+| 含 Windows 非法字符 / 以点或空格结尾 | `FMT-101` | `FMT-202` |
+| 含路径分隔符 / 是 `.` 或 `..` | `FMT-102` | `FMT-202` |
+| Windows 保留设备名 | `FMT-103` | `FMT-202` |
+| 超过 255 字节 | `FMT-104` | `FMT-202` |
+
+**校验只回答「这个名字能不能用」，不回答「这个名字是否已存在」**——后者是业务规则
+（Bucket 用 `FMT-201` / `FMT-200`，文件用 `FMT-105 FileNameConflict`）。中文、空格、
+UTF-8 多字节名称都合法（`工作`、`小谷姐姐麻辣烫.jpg`、`a b.txt` 均通过）。
+单元测试：`tests/validation_test.cpp`。
+
+> **下面这份是最初的接口草案，已被上面的实现取代**（保留以便对照：命名空间不同、
+> `validate_url` 尚未落地）：
+
 ```cpp
 namespace fmt::common::validation {
 
@@ -1208,14 +1320,39 @@ Status validate_url(const std::string& url);
 
 ### 10.1 BucketService
 
+**阶段 4 已落地**（`include/fmt/bucket/bucket.hpp`、`src/bucket/bucket.cpp`）。
+Bucket **没有独立 ID**：`repository/<user>/<bucket>/` 这个目录就是 Bucket 本身，
+存在性 = 目录存在；`current_bucket` 存在 `config.json` 里。
+
 ```cpp
+struct BucketInfo {
+    std::string name;
+    bool is_current = false;
+};
+
+// 删除 Bucket 的结果：删到哪儿去了、影响了几个文件、删的是不是当前 Bucket。
+// 调用方（管道/HTTP 响应）要如实回报这些，而不是只说一句「成功」。
+struct BucketRemoval {
+    std::filesystem::path moved_to;
+    std::size_t files_affected = 0;
+    bool was_current = false;
+};
+
 class BucketService {
 public:
-    Status create(const std::string& name);
-    Result<std::vector<std::string>> list();
-    Result<BucketInfo> get(const std::string& name);
-    Status use(const std::string& name);      // 设置 current_bucket 并保存配置
-    Status remove(const std::string& name);   // 移入 Trash
+    BucketService(const PathManager& paths, Config& config, Logger* logger);
+
+    Status create(std::string_view name);
+    Result<std::vector<BucketInfo>> list();
+    Result<BucketInfo> get(std::string_view name);
+    Status use(std::string_view name);
+    Result<BucketRemoval> remove(std::string_view name);   // 注意：不是 Status
+
+    // Bucket 目录：repository/<user>/<bucket>。
+    std::filesystem::path directory_of(std::string_view name) const;
+
+    // 当前 Bucket 不存在时置空并落盘；不做任何自动切换。
+    Status refresh_current_bucket();
 };
 ```
 
@@ -1223,11 +1360,45 @@ public:
 
 | 操作 | 要点 |
 |---|---|
-| `create` | 名称校验 → 检查是否已存在 → 建目录 → **若是第一个 Bucket，自动设为 `current_bucket`** |
-| `use` | 检查存在 → 改 `current_bucket` → 保存 `config.json`。**不修改 Bucket 本身** |
-| `remove` | 移动数据到 Trash → 相关文件 `is_trash = true` → 写 `trash.json` → **若删除的是 `current_bucket`，置空，不自动切换** |
+| `create` | `current_user` 空 → `FMT-604`；名称校验失败 → `FMT-202`；目录已存在 → `FMT-201`；建 `repository/<user>/<bucket>/`；**`current_bucket` 为空则设为它并保存配置**（第二个及以后的桶不抢「当前」） |
+| `list` | 扫 `repository/<user>/` 下的**目录**（文件忽略），按名称排序，标出 `is_current`；目录不存在时返回空列表，不报错 |
+| `get` | 名称空 → `FMT-001`；目录不存在 → `FMT-200`；返回 `{name, is_current}` |
+| `use` | 名称空 → `FMT-001`；目录不存在 → `FMT-200`；只改 `current_bucket` 并保存 `config.json`。**不修改 Bucket 本身**（不移动文件、不改 file.json） |
+| `remove` | 目录不存在 → `FMT-200`；接着按第 30 节的四步：搬目录 → 标记文件 → 写 trash 记录 → 处理当前桶；**若删除的是 `current_bucket`，置空，不自动切换**；返回 `BucketRemoval` |
+| `directory_of` | `repository/<user>/<bucket>`（`bucket get` 的 `path` 字段就是它相对数据根的显示形式） |
+| `refresh_current_bucket` | `current_bucket` 非空且目录不存在 → 置空 + 保存，记一行 WARN；**绝不自动选择别的 Bucket**（开发文档第 61 节） |
 
-Bucket **不生成 `bucket_id`**，用名称标识。
+**`remove` 的四个步骤（与开发文档第 30 节一致）**：
+
+```text
+1. move_bucket_to_trash    repository/<user>/<bucket>/ → trash/<user>/<bucket>/
+                           回收站已有同名目录 → 目标名加时间戳后缀（工作_20261008012345）
+                           （std::filesystem::rename，失败 → FMT-009 StorageError）
+2. mark_bucket_files_trashed
+                           只改 file.json 里 user + bucket 都匹配、且 is_trash 原本为 false
+                           的记录；file.json 缺失 → 视为 0 个文件；别的桶一律不动
+3. append_trash_record     追加一条 Bucket 级记录（7.3），无 file_id；
+                           original_path / trash_path 相对数据根、正斜杠
+4. 当前桶处理              was_current → current_bucket 置空 + 保存配置
+```
+
+Bucket **不生成 `bucket_id`**，用名称标识。日志模块名统一 `Bucket`。
+
+**`refresh_current_bucket()` 已接线（运行时生效）**：
+
+```text
+接线点   ServerRuntime::start()      服务启动、上下文建好后
+         ServerRuntime::apply_root() 数据根切换（hello 触发的那条路径）换根后
+调用位置 两者都在业务锁（mutex_）内，经由 ServerRuntime::refresh_current_bucket_locked()
+行为     current_bucket 指向的目录不存在 → 置空并 save_config()；存在 → 什么都不做
+失败处理 返回错误只记一条 WARN（模块 Bucket），不影响启动/换根
+```
+
+放在锁内是必要的：置空动作与并发的 `bucket.use` / `bucket.create` 走同一把锁，
+不会出现「刚把 current_bucket 设成 A，启动校验又把它清掉」的覆盖。
+单测：`tests/bucket_test.cpp` 的 `当前Bucket失效时置空`、
+`tests/service_test.cpp` 的 `启动时把失效的当前Bucket置空`（同时断言「存在的当前 Bucket
+不能被误清」）。
 
 ### 10.2 FileService
 
@@ -1498,6 +1669,21 @@ fmt.exe
 Trash），与 `service uninstall` 完全不同层次，不要混用「删除」二字。
 `service status` 与它们都不冲突：它是 `service` 子命令，读的是 SCM 状态。
 
+**阶段 4 已落地的 `bucket` 五条命令如何变成管道 `op`**（CLI 侧实现为准）：
+
+| CLI 输入 | 管道 `op` | `args` |
+|---|---|---|
+| `bucket create 工作` | `bucket.create` | `{"argv":["工作"]}` |
+| `bucket list` | `bucket.list` | 不带 |
+| `bucket get 工作` | `bucket.get` | `{"argv":["工作"]}` |
+| `bucket use 工作` | `bucket.use` | `{"argv":["工作"]}` |
+| `bucket delete 工作` | `bucket.delete` | `{"argv":["工作"]}` |
+
+规则：`op = <组>.<动作>`，**位置参数从 `parts[2]` 起原样进 `argv`**（第 3 段开始，
+不再有 `--name` 这类开关；旧写法 `bucket create --name 工作` 属于上一次实现，已作废）。
+`file` / `share` / `trash` / `config` 同规则，但**尚未落地**，现在返回 `FMT-602`。
+参数形状的完整说明见 12.3.2.1 与 13.9.3。
+
 ### 11.4 命令帮助
 
 帮助有**两个入口**，内容来源是同一份命令总览与同一份分组详情：
@@ -1513,11 +1699,11 @@ help [组]             交互循环内同上（交互里也接受 --help 这个�
 ```text
 可用命令：
   (service)  install  uninstall  start  stop  status
+  (bucket)   create  list  get  use  delete
   (help)     help [命令]
   (exit)     exit  quit
 
 业务命令（服务端尚未实现，现在会返回 FMT-602）：
-  (bucket)   create  list  get  use  delete
   (file)     upload  list  get  delete
   (share)    create  get  list  delete
   (trash)    list  get  restore  delete
@@ -1539,9 +1725,21 @@ service —— Windows 服务管理
       服务恢复策略自动重启（第一次 5 秒、第二次 10 秒、之后 30 秒）。
 ```
 
-四组业务命令（`bucket` / `file` / `share` / `trash`）的详情里**都要注明**
-「服务端尚未实现，现在返回 FMT-602」——因为它们的管道 op 还没落地，敲下去拿到的是 `FMT-602`，
-不注明会让人以为是参数写错了。
+四组业务命令的详情里原本都要注明「服务端尚未实现，现在返回 FMT-602」——因为管道 op
+还没落地时，敲下去拿到的是 `FMT-602`，不注明会让人以为是参数写错了。
+
+**帮助文案已随阶段 4 同步（提交 `8a5e554`）**：`bucket` 的五条 op 已经落地，这句话现在
+**只适用于 `file` / `share` / `trash`**；命令总览里 `(bucket)` 已移进「可用命令」组。
+`help bucket` 的实际输出：
+
+```text
+bucket —— 存储空间（Bucket 就是一个目录，没有独立 ID）
+  create <名称>   创建；第一个 Bucket 会自动成为当前 Bucket
+  list            列出所有 Bucket；当前的那个前面标 *
+  get <名称>      查看名称、是否当前、目录路径
+  use <名称>      切换当前 Bucket（只改 current_bucket，不动数据）
+  delete <名称>   移到回收站；删的是当前 Bucket 时置空，不自动切换
+```
 
 `exit` / `quit` 是**正式命令**（不只是「Ctrl+Z 退出」）：交互循环里输入它们即跳出循环、
 以退出码 `0` 结束，`help exit` 给出说明。
@@ -1814,13 +2012,28 @@ fmt >
 ### 11.10 首次运行
 
 ```text
-current_user 为空   → 引导用户设置当前用户
-current_bucket 为空 → 执行 file upload / file list 时提示先创建或选择 Bucket
+current_user 为空   → 由 initialize_root 自动补占位名 user（不需要用户设置，见 4.4.1）
+current_bucket 为空 → bucket create 的第一个桶自动成为当前（第 28 节）；
+                      文件类命令（file upload / file list）才返回 FMT-305 并提示先创建或选择 Bucket
 ```
 
-CLI 只是**提示**（见 18.9 的历史决策：当前实现自动落到 `default` 与默认 Bucket
-「工作」，由**服务**写回 `config.json`）；CLI 自己不写配置文件，它只在双击时补齐
-**缺失的**目录与默认 JSON（见 11.13），不修改任何已有内容。
+**阶段 4 的口径**：`current_user` 的空值由**服务侧的初始化**补掉（`initialize_root()`，
+见 4.4.1 第 5.5 步），CLI 不提示、也不写配置文件内容。注意区分两个函数：
+CLI 双击时调的是共用的 `ensure_root` / `check_root`（只补缺失的目录与默认 JSON），
+**不**调 `initialize_root()`——所以占位用户名永远是**服务**在启动/换根时写进去的
+（时机：CLI 连上后服务初始化它声明的那个根）。
+
+```text
+正常首启（config.json 缺失或 current_user 为空）
+  → 初始化写出占位名 user 并保存 → 用户敲 bucket create 工作 直接成功
+  → 磁盘上是 repository/user/工作/
+异常路径（current_user 被外部显式清空）
+  → Bucket 服务的业务命令返回 FMT-604 NoCurrentUser / 退出码 7
+```
+
+> 旧文写的「引导用户设置当前用户」与「上一次实现自动落到 `default` 与默认 Bucket「工作」」
+> **都已作废**：V1 没有设置用户的命令，占位名是 `user`（不是 `default`），
+> Bucket 也不再自动创建——由用户的第一条 `bucket create` 决定。
 
 用户系统正式开发后，替换为正式登录机制。
 
@@ -1989,6 +2202,71 @@ stderr：数据根文件损坏（未自动修复）：data/file.json
 **服务侧的初始化逻辑没有变**：它仍在启动时与 hello 换根时执行同一个 `bootstrap_root`
 （4.4.1）。变的是「谁有权调用它」——现在 Service 与 CLI 都调，规则一致、都是幂等的。
 
+### 11.14 业务命令的输出样例（阶段 4：Bucket）
+
+**服务端只回结构化数据，展示在 CLI 一侧完成**（`src/cli/cli.cpp` 的
+`print_business_data()`）：有 `buckets` 数组按列表打印、有 `bucket` + `is_current` 按单条
+打印、否则打印服务给的 `message`。`bucket` 五条命令已可用，真实输出：
+
+```text
+fmt> bucket create 工作
+Bucket 已创建：工作（已设为当前 Bucket）
+执行成功...
+错误码：0
+
+fmt> bucket create 生活
+Bucket 已创建：生活
+执行成功...
+错误码：0
+
+fmt> bucket list
+* 工作  (当前)
+  生活
+共 2 个 Bucket
+执行成功...
+错误码：0
+
+fmt> bucket get 工作
+Bucket：工作
+当前：是
+路径：repository/user/工作
+执行成功...
+错误码：0
+
+fmt> bucket use 生活
+已切换到 Bucket：生活
+执行成功...
+错误码：0
+
+fmt> bucket delete 生活
+Bucket 已删除（移入回收站）：生活
+执行成功...
+错误码：0
+```
+
+| 服务端 `data` 形状 | CLI 打印 |
+|---|---|
+| `{buckets:[{name,is_current}], count, current_bucket}` | 每行一个：当前项 `* 名称  (当前)`，其余 `  名称`；末行 `共 N 个 Bucket` |
+| `{bucket, is_current, path}` | `Bucket：…` / `当前：是\|否` / `路径：…`（有 `path` 才打印第三行） |
+| `{…, message}` | 打印 `message` 一行 |
+| 其它 / 空 | 退回 `data.dump(2)`，不吞输出 |
+
+失败仍走 stderr 的固定两行：
+
+```text
+fmt> bucket create 工作
+执行失败：FMT-201 Bucket 已存在：工作
+错误码：4
+```
+
+`路径` 是**相对数据根、正斜杠**的形式（`relative_path_text`），所以换根后它依然成立（7.6）。
+CLI **不做任何业务判断**：`is_current`、`message`、`path` 全部由服务给，CLI 只负责排版；
+中文参数经管道 argv 传递（UTF-8），不经过控制台代码页转换。
+
+> **帮助文案已同步**（提交 `8a5e554`）：命令总览把 `(bucket)` 放进了「可用命令」组，
+> `help bucket` 写明五条子命令的真实行为、不含「尚未实现」字样；仍返回 `FMT-602` 的
+> 只有 `file` / `share` / `trash`（11.4）。
+
 ---
 
 ## 12. HTTP Server
@@ -2051,8 +2329,21 @@ Service 模式下不中断其他功能。
 
 Service 启动顺序：先初始化业务与存储，再启动 HTTP，避免请求到达时数据层未就绪。
 
-根切换（13.10）时 HTTP **不需要重启**——`server.json` 随根改变后，最迟下一次
-请求生效；`disabled` 时停止监听，`enabled` 时按新 `host`/`port` 重新 `listen`。
+**根切换（13.10）时 HTTP 会按新根的 `server.json` 重新评估**（阶段 4 实现为准）：
+`ServerRuntime::apply_root()` 换完根与配置后调用 `restart_http()`，把旧实例停掉、按新根的
+`enabled` / `host` / `port` 起一个新实例。旧文写的「HTTP 不需要重启、最迟下一次请求生效」
+**与实现不符**——那样会让浏览器在旧根的 `server.json`（可能 `enabled=false` 或另一个端口）
+下继续服务，与新根不一致。
+
+```text
+换根 → 摘出旧 HttpServer（持锁，只做 move）→ **放锁** → stop()（join 工作线程）
+     → enabled? 是 → 按新 host/port 起新实例 → 持锁装回
+     → 失败只记 ERROR 日志，不中断服务的其他功能（同「端口占用」的处理）
+```
+
+**`stop()` / `start()` 必须在锁外做**：HTTP 的请求处理器要拿业务锁，持锁去 join 它的工作线程
+会互相等待（15.1）。这条同时适用于换根、启动与停止。
+（`server.json` 的加载时机与 `root` 的绑定关系见 5.2、13.10。）
 
 ### 12.3 路由
 
@@ -2104,6 +2395,47 @@ HTTP 状态码（12.5）与简短文本。CLI 不访问它们，只把链接打�
 
 **`service *` 没有、也不会有 HTTP 路由**：它操作的是 SCM，与服务进程内的业务无关，
 且服务可能尚未安装/运行。见 13.8。
+
+#### 12.3.2.1 请求参数（阶段 4 已冻结）
+
+**两条入口用同一套参数形状**，HTTP 只多一层「怎么把参数塞进请求」的翻译：
+
+```text
+管道   op 形如 "bucket.create"，位置参数放在 args.argv（字符串数组）
+       {"id":7,"op":"bucket.create","args":{"argv":["工作"]}}
+       ↔ CLI：bucket create 工作
+HTTP   路由固定，参数可以来自请求体，也可以来自路径
+       POST /api/bucket            body: {"name":"工作"}  或  {"argv":["工作"]}
+       POST /api/bucket/工作/use   路径参数（无 body）
+       GET  /api/bucket/工作
+       DELETE /api/bucket/工作
+```
+
+- **路径参数里的中文会被客户端百分号编码**（浏览器/curl 都会）：`工作` 到达服务端时是
+  `%E5%B7%A5%E4%BD%9C`。服务端**必须解码**再当业务参数用，实现里就是
+  `common/string` 的 `url_decode()`（配套 `url_encode()` 给客户端用），然后统一装成
+  `args.argv` 交给同一份业务实现——HTTP 侧不存在「第二种参数格式」。
+- 请求体**两种写法都接受**：与管道一致的 `{"argv":[...]}`，或更好写的 `{"name":"工作"}`；
+  两者最终都变成 `args.argv`。都不是 → `FMT-001`。
+- `url_decode` 的规则：`%XX` 还原为字节（UTF-8 多字节序列因此自然还原）、非法转义原样保留、
+  `+` **不**当空格（路径参数不是表单）。ASCII 不受影响，所以「不解码也能用」的错觉只在
+  纯英文名字下成立。
+- **路由表已冻结**（阶段 4 落地）：`GET/POST /api/bucket`、`GET/POST /api/bucket/<name>[/use]`、
+  `DELETE /api/bucket/<name>`；其中 `<name>` 这一段用 httplib 的正则片段匹配
+  `([^/]+)`，不接受带 `/` 的名字（Bucket 名本身也不允许分隔符，9.1）。
+
+**Bucket 命令的 `data` 字段（管道与 HTTP 完全相同）**：
+
+| op | data |
+|---|---|
+| `bucket.create` | `{bucket, current_bucket, message}` |
+| `bucket.list` | `{buckets:[{name,is_current}], count, current_bucket}` |
+| `bucket.get` | `{bucket, is_current, path}`（`path` 相对数据根、正斜杠） |
+| `bucket.use` | `{bucket, previous, current_bucket, message}` |
+| `bucket.delete` | `{bucket, moved_to, files_affected, was_current, current_bucket, message}` |
+
+`bucket.delete` 之所以回这么多字段，是因为它产出的 `BucketRemoval`（10.1）本身就带
+「移到哪儿、影响了几个文件、删的是不是当前桶」；CLI 的展示规则见 11.14。
 
 **上传语义（已冻结）：CLI 传路径或 URL，不传文件内容。**
 
@@ -2184,6 +2516,36 @@ V1 只实现图片，其他类型待后续扩展。
 | 500 | 内部错误 |
 
 删除类操作无返回内容时用 204，且必须保证 204 **不带响应体**。
+
+**错误码 → 状态码映射（阶段 4 已冻结在实现里）**：
+
+| 状态码 | 错误码 |
+|---|---|
+| 400 | `FMT-001` `FMT-012` `FMT-014` `FMT-100` `FMT-101` `FMT-102` `FMT-103` `FMT-104` `FMT-202` `FMT-300` `FMT-303` `FMT-700` `FMT-701` |
+| 403 | `FMT-004` `FMT-501` `FMT-502` `FMT-503` |
+| 404 | `FMT-002` `FMT-200` `FMT-400` `FMT-500` `FMT-305` `FMT-402` |
+| 409 | `FMT-003` `FMT-105` `FMT-201` `FMT-203` `FMT-304` `FMT-401` |
+| 500 | 其余（JSON / 配置 / 存储 / IO 等） |
+
+```text
+400  InvalidArgument PathTooLong PathEscape FileName* BucketNameInvalid
+     UrlInvalid SizeLimitExceeded HttpRequestInvalid PreviewUnsupported
+403  PermissionDenied ShareExpired ShareDownloadLimitReached ShareFileUnavailable
+404  FileNotFound BucketNotFound TrashEntryNotFound ShareNotFound
+     NoCurrentBucket RestoreBucketMissing
+409  FileAlreadyExists FileNameConflict BucketAlreadyExists BucketInUse
+     Md5Duplicate RestoreConflict
+500  default（JsonParseError / JsonWriteError / ConfigError / StorageError / IoError …）
+```
+
+映射实现在 `src/server/server.cpp` 的 `http_status_for(ErrorCode)`：一个 `switch` +
+`default: 500`。**新增错误码若不显式登记就落到 500**——宁可报「内部错误」，也不要猜一个
+语义不匹配的 4xx。响应体仍是 12.3.2 的统一信封，状态码只是额外一层（管道没有这一层，
+CLI 只看信封里的 `FMT-NNN`）。
+
+映射的语义分组：`400` 参数/名称/路径/URL 类（用户改一下就能过）、`403` 权限与分享不可用、
+`404` 对象不存在（含「没选当前 Bucket」`FMT-305`、「原 Bucket 已永久删除」`FMT-402`）、
+`409` 冲突（已存在、重名、仍被引用）、`500` 其余（多半是数据根坏了，用户改不了）。
 
 ### 12.6 下载与流式传输
 
@@ -3159,6 +3521,13 @@ CreateNamedPipeW(L"\\\\.\\pipe\\fmt.control",
 ConnectNamedPipe(hPipe, nullptr);             // 每个实例一次
 ```
 
+**阶段 4 的实况：`PIPE_UNLIMITED_INSTANCES` 只是创建参数，服务端一次只 accept 一条连接。**
+`ServerRuntime::run()` 是唯一的 accept 循环：`accept(500)` 建一条连接 → `serve()` 在这条连接上
+循环「读一个请求 → `handle()` → 写一个响应」 → **客户端断开才回到 accept**。
+所以同一时刻只有一条 CLI 连接，第二个客户端 `CreateFileW` 得到 `ERROR_PIPE_BUSY`
+（客户端 `WaitNamedPipeW` 等 3 秒重试，最终 `FMT-601`）。
+**没有「每连接一个线程」的实现**——并发只出现在 HTTP 那侧（线程池），见 15.1。
+
 **帧格式：`[4 字节小端长度][UTF-8 JSON]`**
 
 ```text
@@ -3268,6 +3637,27 @@ CLI 侧：`switched == true` → 记一行日志 `[Service] 数据根切换：�
 其余业务参数按 `op` 决定，就放在同一层或 `args` 子对象里；
 **字段细节随各命令实现确定**（见 19.1）。
 
+**阶段 4 已冻结的部分：位置参数统一放 `args.argv`。**
+
+```json
+{ "id": 7, "op": "bucket.create", "root": "D:\\FMT", "args": { "argv": ["工作"] } }
+{ "id": 8, "op": "bucket.delete", "root": "D:\\FMT", "args": { "argv": ["工作"] } }
+```
+
+```text
+args.argv   字符串数组，与 CLI 的位置参数一一对应：
+            `bucket create 工作` → op = "bucket.create"，argv = ["工作"]
+            缺失或元素不是字符串 → FMT-001 InvalidArgument（service 层统一判定）
+args 为空   无位置参数的命令（bucket.list）不带 args 字段即可
+op 命名     "<组>.<动作>"：bucket.create / bucket.list / bucket.get / bucket.use /
+            bucket.delete；file.* / share.* / trash.* / config.* 同规则
+            "hello" 是唯一的非业务 op（见上）
+```
+
+这样「CLI 的哪一段是参数」不需要另做协议：`fmt> bucket create 工作` 拆出来的
+`parts[2..]` 就是 `argv`，HTTP 侧则把 body 的 `name` 或路径参数解码后装进同一个
+`argv`（12.3.2.1）。**两条入口因此共用同一份参数解析与同一份业务实现**。
+
 响应（与 HTTP 响应体同一个信封，见 12.3.2）：
 
 ```json
@@ -3354,8 +3744,9 @@ Service（收到任意请求中的 root）：
 
 ```text
 · 服务只维护一个「当前数据根」，不按连接分别记录
-· 管道仍允许多实例（13.9.1），但业务上只有那一个 CLI 窗口在发命令
-· 根切换锁是进程内的一把独占锁，保证「切换」这段临界区不被并发的业务请求穿插
+· 管道一次只 accept 一条连接、连接内一问答（严格串行，15.1 ①），
+  所以同一时刻只有一个 CLI 在发命令；第二个客户端会被 ERROR_PIPE_BUSY 挡住
+· 业务命令共用运行体的一把互斥锁（15.1 ③），「切换」这段临界区不会被并发的业务请求穿插
 · 多 CLI 窗口的场景不在本次范围（见 19.1）
 ```
 
@@ -3625,17 +4016,78 @@ HTTP 请求（方法、路径、状态码）
 其二，CLI 双击时对自己数据根做一次幂等体检与补齐（11.13），它**只创建缺失的目录与默认 JSON**，
 不修改任何已存在的内容，因此不会与 Service 的加载冲突（Service 侧看到的是「已存在 → 保持原样」）。
 
-Service 内部：
+Service 内部（**阶段 4 实现为准**）：
 
 ```text
 主线程              ServiceMain / SCM 回调（状态机，见 13.7）
-管道监听线程         1 个，接受连接 → 每连接 1 个工作线程
-管道工作线程         每个 CLI 连接 1 个：读帧 → 派发到 service 层 → 写响应帧
-HTTP 处理线程        cpp-httplib 为每个连接起一个线程
+管道运行线程         1 个：ServerRuntime::run() 是一条 accept 循环，
+                    每次 accept(500) 建一条连接，然后 serve() 在这条连接上
+                    「读一个请求 → handle() → 写一个响应」直到客户端断开，
+                    才回到 accept —— 管道是**连接级严格串行**
+HTTP 线程池          cpp-httplib 自带线程池（默认 max(8, hardware_concurrency - 1) 个线程），
+                    请求并发进入：/api/ping、/api/status 不碰业务锁，是真并发
 ```
+
+**没有「管道连接线程」这种东西**——实现里没有为连接起线程。由此得到四条准确说法：
+
+> **① 命名管道是连接级严格串行。**
+> `ServerRuntime::run()` 是唯一的 accept 循环：`PipeConnection::accept(500)` 一次只建立一条
+> 连接，`serve()` 在这条连接上循环收发，**客户端断开前不回 accept**。因此
+> **同一时刻只有一条 CLI 连接**（配套「只留一个 CLI 窗口」，13.11）；第二个客户端的
+> `CreateFileW` 会拿到 `ERROR_PIPE_BUSY`，`PipeClient::connect()` 用
+> `WaitNamedPipeW` 等 **3 秒**再来一次，仍拿不到就归为 `FMT-601`
+> （`ServiceNotInstalled`），外层 `connect_waiting()` 再以 100 ms 步进重试到 **5 秒**总超时
+> （13.9.4）。管道虽然用 `PIPE_UNLIMITED_INSTANCES` 创建，但服务端一次只 accept 一条。
+>
+> **② HTTP 是线程池并发。** cpp-httplib 默认 `max(8, hardware_concurrency - 1)` 个线程，
+> 请求并发进入；`/api/ping`、`/api/status` 不碰业务锁，因此是真并发、不会被业务命令拖住。
+>
+> **③ 业务命令共用运行体的同一把互斥锁。** `ServerRuntime::handle()`（管道）与
+> HTTP 的业务处理器都在 `execute_business(...)` **之前** `lock(mutex_)`，所以管道与 HTTP 的
+> bucket 命令**互斥串行**。**这是互斥（mutex），不是队列（queue）**：不保证先来先服务、
+> 没有优先级、没有排队长度上限、没有排队超时——抢不到锁的请求只是阻塞在 `lock()` 上。
+>
+> **④ 后果（阶段 5 必须处理）。** 一个慢业务命令会同时卡住**两条入口的所有业务命令**。
+> 阶段 5 的上传/下载可能持续几十秒到几分钟，如果那时仍持这把锁，`bucket list`、
+> `bucket get` 与浏览器的 bucket 请求都会一起等。因此阶段 5 必须二选一：
+> **收细锁粒度**（按 JSON 文件 / 按 `file_id` 分锁），或**把长任务移出锁**
+> （登记任务 + 后台线程执行 + 轮询状态）。见 15.2、19.1 与 18.13 的「阶段 5 注意事项」。
 
 因此并发来自管道请求与 HTTP 请求两条入口，锁必须是**进程内**的。
 **两条入口进的是同一个 service 层**（11.1），所以锁只需要在业务层存在一次。
+
+**阶段 4 的实际做法：业务命令在运行体的同一把锁下串行执行。**
+
+```text
+ServerRuntime::mutex_   一把 std::mutex，持有「当前数据根 + AppContext」
+
+管道   ServerRuntime::handle(request)
+         hello 之外、且 op 已知 → lock_guard(mutex_) → execute_business(context, op, args)
+         （unknown op 在取锁之前就被 FMT-001 挡掉，不必占锁）
+HTTP   BusinessHandler lambda（13.10 注册进 HttpServer）
+         lock_guard(mutex_) → execute_business(context, op, args)
+
+效果   同一时刻只有服务在写数据根；两条入口、五条 bucket 命令之间不会互相踩
+       「取当前根 + 改配置 + 搬目录」因此是一个整体，不会与并发的 list 撕裂
+```
+
+V1 只有一个 CLI 窗口，串行足够；15.3 的细粒度锁（每 JSON 一把）是**这把锁里面**的事，
+不改变「两条入口进同一个 service 层、共用同一批锁」的结构。
+
+**HTTP 监听器的 stop / start 必须在锁外做**（`ServerRuntime::restart_http()` 与
+`request_stop()`）：
+
+```text
+错：持 mutex_ 去 http->stop() → stop() 会 join HTTP 工作线程
+    而 HTTP 工作线程正在等 mutex_（它的 handler 要拿锁）
+    → 互相等待，直接死锁
+
+对：持锁把旧 HttpServer 摘出来（std::move）→ 放锁 → stop() → 起新实例 →
+    再持锁装回成员；启动/换根时也必须在锁外调用 restart_http()
+```
+
+实现里这两处都写了注释（`restart_http` / `request_stop` / `handle`），改动顺序时别把
+`stop()` 挪回锁里。
 
 ### 15.2 必须保护的数据
 
@@ -3648,6 +4100,11 @@ current_bucket
 文件移动
 当前数据根（含根切换，见 13.10）
 ```
+
+**阶段 4 的现实**：这些数据由 `ServerRuntime::mutex_` **一把锁**统一保护（15.1 ③）——
+好处是不可能出现「两个命令同时改 config.json」这类撕裂，代价是**一个慢命令会挡住所有命令**。
+阶段 5 的上传/下载必须在 15.1 ④ 的两条路里选一条，否则「上传时 bucket list 也卡住」
+会成为用户可见的故障（18.16）。
 
 ### 15.3 锁策略
 
@@ -3670,6 +4127,12 @@ file_id 分配   → id_mutex
   管道服务端与 HTTP 端共用同一批锁，因为它们调的是同一个 service 层
 - 根切换（13.10）持一把独立的「根切换锁」，切换期间新请求被拒（返 `FMT-602`），
   不与业务锁嵌套获取，避免死锁
+
+**阶段 4 的实际锁：`ServerRuntime::mutex_` 一把串行锁**（见 15.1）——上表的
+`file_mutex` / `share_mutex` / `trash_mutex` / `config_mutex` / `id_mutex` 是**目标形态**，
+阶段 5 落地 File 时在这把串行锁内部按需细分；`current_bucket` 与 `config.json`
+（`bucket use` / `bucket create` / `bucket delete` 都会改它）现在由那把锁保护，
+已经不会再出现「两个命令同时改配置」。**HTTP 的 stop / start 必须在锁外**，理由见 15.1。
 
 ### 15.4 一致性检查
 
@@ -3894,12 +4357,12 @@ log/fmt.log                                         有对应的上传记录
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| 1 | 项目骨架：CMake、Ninja、MSVC、`fmt.exe`、manifest(`asInvoker`)、`--help`/`--version`、`wmain` 入口分发骨架 | ⏳ 进行中 |
-| 2 | 基础层：`common`（Error/Result/Time/String/Path/Logger）+ `config` + `storage` + `core` 根解析与幂等初始化（**`ensure_root`/`check_root` 由 Service 与 CLI 共用**；损坏 JSON 只报告不重置） | ⏳ 未开始 |
-| 3 | **通道与服务**：`service`（SCM 五命令 `install`/`uninstall`/`start`/`stop`/`status` + 查询接口 `query_status()`/`query_state()`/`last_start_failure()`（13.4.2）+ 按 `dwWaitHint` 自适应的落定等待（13.4.3）+ Recovery + `ServiceMain` 状态机 + 失败编号上报 `dwServiceSpecificExitCode` + `service.json`）+ `ipc`（命名管道帧、DACL、MIC、hello 的 `switched`/`previous_root` 回执）+ `cli`（管道客户端、单实例、UAC 提权引导、双击幂等体检与补齐、落定判定与 reinstall 兜底、交互循环） | ⏳ 未开始 |
-| 4 | Bucket：create / list / get / use / delete，`current_bucket` 逻辑 | ⏳ 未开始 |
-| 5 | File / Upload / Trash / Share：`file.json`、`file_id`、上传（本机 + URL）、trash、share 下载计数 | ⏳ 未开始 |
-| 6 | `server`：HTTP 浏览器侧（下载/预览路由 + `/api/*`）与 Preview | ⏳ 未开始 |
+| 1 | 项目骨架：CMake、Ninja、MSVC、`fmt.exe`、manifest(`asInvoker`)、`--help`/`--version`、`wmain` 入口分发骨架 | ✅ 完成 |
+| 2 | 基础层：`common`（Error/Result/Time/String/Path/Logger）+ `config` + `storage` + `core` 根解析与幂等初始化（**`ensure_root`/`check_root` 由 Service 与 CLI 共用**；损坏 JSON 只报告不重置） | ✅ 完成 |
+| 3 | **通道与服务**：`service`（SCM 五命令 `install`/`uninstall`/`start`/`stop`/`status` + 查询接口 `query_status()`/`query_state()`/`last_start_failure()`（13.4.2）+ 按 `dwWaitHint` 自适应的落定等待（13.4.3）+ Recovery + `ServiceMain` 状态机 + 失败编号上报 `dwServiceSpecificExitCode` + `service.json`）+ `ipc`（命名管道帧、DACL、MIC、hello 的 `switched`/`previous_root` 回执）+ `cli`（管道客户端、单实例、UAC 提权引导、双击幂等体检与补齐、落定判定与 reinstall 兜底、交互循环） | ✅ 完成 |
+| 4 | Bucket：create / list / get / use / delete，`current_bucket` 逻辑；`common/validation` 名称校验；两条入口（管道 + HTTP）打通 | ✅ 完成（commit 32249ea，明细见 18.15） |
+| 5 | File / Upload / Trash / Share：`file.json`、`file_id`、上传（本机 + URL）、trash、share 下载计数 | ⏳ **下一步**，未开始 |
+| 6 | `server`：HTTP 浏览器侧（下载/预览路由 + `/api/*`）与 Preview | ⏳ 未开始（阶段 4 已把 `/api/bucket` 五条路由落地，作为两条入口的验证） |
 
 沿用上一次的**做法调整**（结论仍然有效，见 18.8）：阶段 5 不按「先 File 元数据 →
 再 Upload → 再 Share」逐层收口，而是**先把「上传 → 列表 → 下载 → 分享」这条链路
@@ -4056,6 +4519,13 @@ service install（非管理员）       → 提权引导；取消 UAC → FMT-00
 
 ### 18.6 阶段 4 完成明细（历史记录，Bucket）
 
+> **本节与 18.7 记的是「上一次实现」（CLI 走 HTTP 的那一版，命令形如
+> `bucket create --name 工作`）。** 本次重构（`arch-restart`）的阶段 4 是**重新实现**的，
+> 记录见 18.15：命令是位置参数（`bucket create 工作`）、入口是命名管道 +
+> `/api/bucket` 两条、`BucketService::remove` 返回 `BucketRemoval`、
+> 删除时**确实**会把该桶 `file.json` 记录的 `is_trash` 置 true。
+> 本节的价值在于「Bucket 就是目录、没有独立 ID」这个结论继续有效。
+
 ```text
 4.1  common/text   UTF-8 ↔ fs::path 转换（path_from_utf8 / path_to_utf8 / join）  ✅
 4.2  bucket        名称校验、存在性、创建、列表、切换、删除（移入 Trash）        ✅
@@ -4151,6 +4621,10 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
                      `default` 与默认 Bucket「工作」并写回 config.json
 ```
 
+> **本次重构（`arch-restart`）改了这条**：占位用户名是 **`user`**（不是 `default`），
+> 且**不再自动创建 Bucket「工作」**——`current_bucket` 由用户的第一条 `bucket create`
+> 决定（第一个桶自动成为当前）。见 4.4.1 第 5.5 步与 11.10。
+
 ### 18.10 阶段 5～8 端到端实测（历史记录）
 
 真实 `fmt.exe --server` + 真实 CLI，跨进程；**从零开始**（先删掉
@@ -4202,10 +4676,14 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 | 事项 | 现状 |
 |---|---|
 | `file delete` | CLI 与路由都在，handler 返回「本版本尚未实现」。落地方案已定：标记 `is_trash=true` + 把物理文件移入 `trash/<user>/<bucket>/YYYY/MM/DD/` |
-| Bucket 删除的元数据标记 | `bucket::remove` 只做了目录搬迁。第 30 节要求同时把该 Bucket 下所有文件的 `is_trash` 置 true——等 `file delete` 落地时一并做，两处必须同一套逻辑 |
+| Bucket 删除的元数据标记 | 旧实现的 `bucket::remove` 只做了目录搬迁。第 30 节要求同时把该 Bucket 下所有文件的 `is_trash` 置 true——等 `file delete` 落地时一并做，两处必须同一套逻辑 |
 | Trash 全部命令 | `trash list/get/restore/delete` 均未实现 |
 | Preview | `file preview` / `share preview` 返回 FMT-701 |
 | `common/md5` 的测试覆盖 | 无自动化测试；实测与 `md5sum` 对比一致（上传后 `file.json` 里的 md5 与外部工具一致） |
+
+> **上面第一、二行说的是上一次实现，本次重构已经修掉**：`BucketService::remove()`
+> **自己就把**该桶 `file.json` 记录的 `is_trash` 置为 true（只动 `user` + `bucket`
+> 都匹配、原本为 false 的记录），`file delete` 落地时沿用同一套逻辑即可（10.1、18.15）。
 
 ### 18.13 本次重构后仍未做的事（`arch-restart` 分支）
 
@@ -4219,7 +4697,7 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 | 根切换实测 | CLI 换目录运行 → 服务切根、幂等初始化新根、旧根数据不删、`service.json` 的 `current_root` 更新，且 hello 回执 `switched=true` + `previous_root`，CLI 记一行日志「数据根切换：旧 -> 新」（只进日志，不刷控制台） |
 | `service status` 实测 | 三种状态各跑一次：未安装（`服务状态：未安装` / `FMT-601` / 退出码 8）、已安装未运行（`已停止` / 退出码 0）、运行中（`运行中` + 宿主 + 数据根 / 退出码 0）；并确认它在**非管理员账户**下同样成功 |
 | `dwServiceSpecificExitCode` 实测 | 人为让服务初始化失败（例如把 `data/file.json` 改成非法 JSON）→ 确认 `sc query` 能看到 `ERROR_SERVICE_SPECIFIC_ERROR`、CLI 打印「服务启动失败：FMT-006 JSON 格式错误」，并且**不触发重装** |
-| `--help` 与 `help` 实测 | `fmt.exe --help` = 横幅 + 用法 + 命令总览 + 退出码表；`fmt.exe help` 只列命令、不加描述；`help service` 列出五条命令并注明 `status` 不需要管理员权限；`help bucket/file/share/trash` 都带「服务端尚未实现，现在返回 FMT-602」；`help 未知组` → stderr 一行 + 退出码 2；`help` 全程不提权、不连服务、不写日志 |
+| `--help` 与 `help` 实测 | `fmt.exe --help` = 横幅 + 用法 + 命令总览 + 退出码表；`fmt.exe help` 只列命令、不加描述；`help service` 列出五条命令并注明 `status` 不需要管理员权限；`help bucket` 写明五条子命令的真实行为（**已同步，提交 `8a5e554`**），`help file/share/trash` 带「服务端尚未实现，现在返回 FMT-602」；`help 未知组` → stderr 一行 + 退出码 2；`help` 全程不提权、不连服务、不写日志 |
 | CLI 双击体检实测 | 空目录首次双击 → **控制台干净**（只有横幅与提示符），日志里有 `[Cli] 数据根新建目录：…` / `数据根新建文件：…`；再双击 → 日志里只有 `[Cli] 数据根完整`；预置一个损坏的 `data/file.json` → **stderr** 出现 `数据根文件损坏（未自动修复）：data/file.json` 且文件**未被改动**（比对时间戳与内容）；另测「数据根只读」→ stderr 出现 `数据根无法补齐：FMT-013 …` 且不阻断后续流程 |
 | 横幅与 `--version` 实测 | 两者输出同一串 `File Manager Tool  v1.0  ( build  <日期> )`；重新配置（重跑 CMake）后日期随之变化；源码里搜不到硬编码的版本号或日期 |
 | SCM 30 秒限制 | 需要一次「初始化故意变慢」的验证：确认 `START_PENDING` + `dwCheckPoint` 上报真的消除了 1053 |
@@ -4251,6 +4729,92 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
    → 先 const std::wstring self = executable_path(); 再取 self.c_str()（见 13.8.2）
 ```
 
+### 18.15 本次重构（`arch-restart`）阶段 4 完成明细（Bucket，commit 32249ea）
+
+**这是本分支自己实现的记录**，不是 18.6 那份历史记录（那一次是「CLI 走 HTTP」的旧版）。
+阶段 4 之后的两笔收尾：`8a5e554`（feat(cli): move bucket out of the not-implemented group in
+help）与 `acc90a3`（feat(service): keep current_bucket honest at startup and on a root switch，
+即下表最后一行的接线）。
+
+| 交付物 | 位置 | 说明 |
+|---|---|---|
+| 名称校验 | `include/fmt/common/validation.hpp`、`src/common/validation.cpp` | `is_windows_reserved_name` / `kMaxNameBytes` / `validate_bucket_name` / `validate_file_name`（9.3 的错误码分工） |
+| Bucket 业务 | `include/fmt/bucket/bucket.hpp`、`src/bucket/bucket.cpp` | `create` / `list` / `get` / `use` / `remove` / `directory_of` / `refresh_current_bucket`（10.1） |
+| 占位用户名 | `src/core/app.cpp` | `initialize_root`：`current_user` 为空 → `user` 并保存（4.4.1 第 5.5 步） |
+| 业务分发 | `src/service/commands.cpp` | `bucket.create/list/get/use/delete`，参数取 `args.argv[0]`；未知组仍是 `FMT-602` |
+| 锁与响应 | `src/service/runtime.cpp` | 业务命令在 `mutex_` 下串行；HTTP 处理器取同一把锁；`restart_http`/`request_stop` 在锁外（15.1） |
+| 当前桶校验接线 | `src/service/runtime.cpp`、`include/fmt/service/runtime.hpp` | `refresh_current_bucket_locked()`：启动（`start()`）与换根（`apply_root()`）时在锁内调用，失效置空并落盘、有效不动，失败只记 WARN（10.1、开发文档第 61 节） |
+| HTTP 两入口 | `src/server/server.cpp` | `/api/bucket` 五条路由 + `http_status_for()` + `url_decode()` |
+| 工具函数 | `src/common/string.cpp` | `url_encode` / `url_decode` |
+| CLI 展示 | `src/cli/cli.cpp` | `print_business_data()`：列表 / 单条 / message 三种形状（11.14） |
+| 单元测试 | `tests/bucket_test.cpp`（8 个 Bucket 行为用例）、`tests/validation_test.cpp`（6 个名称校验用例）、`tests/service_test.cpp`（管道端到端：`bucket.create` / `bucket.list` / 缺参 `FMT-001` / `file.list` 仍 `FMT-602`） |
+
+端到端验收清单（真实 `fmt.exe` + 真实服务 + 真实管道，跨进程；**按实现推演，需要在真机上逐条确认**）：
+
+```text
+bucket create 工作        → Bucket 已创建：工作（已设为当前 Bucket），退出码 0
+                            磁盘上出现 repository/user/工作/
+bucket create 工作（重复） → 执行失败：FMT-201 Bucket 已存在：工作，错误码 4
+bucket create a/b         → 执行失败：FMT-202 Bucket 名称不能包含路径分隔符，错误码 2
+bucket create 生活        → Bucket 已创建：生活（不抢「当前」），退出码 0
+bucket list               → * 工作  (当前) / 生活 / 共 2 个 Bucket，退出码 0
+bucket get 工作           → Bucket：工作 / 当前：是 / 路径：repository/user/工作，退出码 0
+bucket get 不存在         → 执行失败：FMT-200 Bucket 不存在：不存在，错误码 3
+bucket use 生活           → 已切换到 Bucket：生活，退出码 0（config.json 已落盘）
+bucket delete 生活        → Bucket 已删除（移入回收站）：生活，退出码 0
+                            → trash/user/生活/ 存在；trash.json 一条 type=bucket（无 file_id）
+bucket delete 工作（当前）→ current_bucket 置空，不自动切换到别的桶
+HTTP（浏览器/调试）        → GET /api/bucket 返回信封 {ok:true,data:{buckets:…}}；
+                            GET /api/bucket/%E5%B7%A5%E4%BD%9C 正确解码为「工作」；
+                            错误码按 12.5 映射成状态码（FMT-200 → 404、FMT-201 → 409）
+```
+
+> 上面每一行的**行为**都能在源码里对上（`src/bucket/bucket.cpp`、`src/service/commands.cpp`、
+> `src/server/server.cpp`、`src/cli/cli.cpp` 的 `print_business_data()`），但**不是**已经跑过的
+> 实测记录——沿用 17.1 的口径：要在真实服务上逐条确认后才升格为「实测」，
+> 与 18.6 / 18.10 那种带日期的历史记录区分开。
+
+**阶段 4 的收尾与留给后面的事**（前两条是收尾记录，其余不阻塞阶段 5）：
+
+| 事项 | 现状 |
+|---|---|
+| `refresh_current_bucket()` 接线 | **已接线（运行时生效）**：`ServerRuntime` 在服务启动（`start()`）与数据根切换（`apply_root()`，hello 触发的那条路径）时于业务锁下调用，失效置空、有效不动，失败只记 WARN。单测覆盖两种情况（10.1、开发文档第 61 节） |
+| `FMT-203 BucketInUse` | `bucket delete` 目前不会返回它——V1 允许删除仍有文件的 Bucket（数据一并进回收站） |
+| `help bucket` 文案 | **已同步（提交 `8a5e554`）**：命令总览把 `(bucket)` 移进「可用命令」组，`help bucket` 写明五条子命令的真实行为（第一个自动成为当前 / `use` 只改 `current_bucket` / `delete` 移入回收站且当前置空不自动切换），不再出现「尚未实现」（11.4、11.14） |
+| Bucket 级回收站的恢复 | `trash restore` 属于阶段 5；阶段 4 的删除只保证「数据原样躺在 `trash/<user>/<bucket>/`，`trash.json` 有据可查」 |
+| 多窗口并发 | 仍依赖「只有一个 CLI 窗口」（15.1、13.11） |
+
+### 18.16 阶段 5 开工前必须处理的并发限制（已知限制）
+
+阶段 4 的并发模型是「一把锁串行跑业务命令」（15.1 的 ①②③④）。它对 bucket 这类
+毫秒级命令完全够用，但**对阶段 5 的上传/下载是一个已知短板**，必须在写 `file` 之前定下来：
+
+```text
+现状（阶段 4 冻结）
+  管道  连接级严格串行（一次一条连接、一条连接上一问一答）
+  HTTP  线程池并发（默认 max(8, hardware_concurrency-1)）
+  业务  两条入口共用 ServerRuntime::mutex_，且是**互斥**不是队列：
+        不保证先来先服务、无优先级、无排队上限、无排队超时
+
+问题
+  上传/下载可能几十秒到几分钟（受 max_upload_size 与网络速度支配），
+  持锁执行期间，管道与 HTTP 的**所有**业务命令（含 bucket list / bucket get）
+  都被阻塞在 lock() 上；用户看到的是「服务像卡死了」，而且没有任何超时或进度提示
+
+阶段 5 必须二选一（写在实现里，不要只写在文档里）
+  A. 收细锁粒度：按 JSON 文件（file.json / trash.json / share.json / config.json）
+     或按 file_id 分锁，让 bucket 命令与上传不再互相挡
+  B. 把长任务移出锁：登记任务（返回 task_id / 进度查询 op）+ 后台线程执行 + 轮询状态，
+     锁只在「读写元数据的那一小段」持有
+
+顺带要定的两件事
+  · 长耗时命令的超时值（13.9.4 现在只有 30 秒的普通命令超时，上传要单独声明）
+  · 排队行为是否要显式化：如果保持互斥，至少要能告诉用户「前面有一个上传在跑」
+```
+
+在 A 或 B 落地之前，**「服务临时不响应其他命令」是阶段 5 的既定限制**，
+不要把它当成 bug 去查。
+
 ---
 
 ## 19. 待决事项
@@ -4265,10 +4829,11 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 | 多 CLI 窗口 | 单实例（11.11）保证同时只有一个数据根，因此根切换不需要按连接隔离。若将来放开多窗口，需要重新设计「一个当前根」的语义 |
 | `service.json` 的字段集 | 现定 `version` / `current_root` / `binary_path` / `installed_at`。是否需要记录「上次正常停止时间」等诊断字段待定 |
 | `--elevated` 的参数形状 | **已定稿**：`fmt.exe --elevated <operation> --result "<结果文件绝对路径>"`，`operation ∈ install / uninstall / start / stop / reinstall`（13.8.2），**`status` 不在其中**（它不提权，见 13.4.1）。是否再为某个 op 携带附加参数（如 install 时指定 root）仍待定 |
-| 管道 `op` 的完整清单 | `bucket.*` / `file.*` / `share.*` / `trash.*` / `config.*` / `hello` 的**精确名字与参数**随各命令实现确定（13.9.3）。`hello` 的**响应**字段已定：`root` + `switched` +（切换时）`previous_root` |
-| 长耗时命令的超时值 | 普通命令定为 30 秒（13.9.4）；`file.upload` 这类的最长等待时间需按最大上传大小估算后冻结 |
+| 管道 `op` 的完整清单 | **阶段 4 已冻结 `bucket.*`**：`bucket.create` / `bucket.list` / `bucket.get` / `bucket.use` / `bucket.delete`，位置参数统一放 `args.argv`（13.9.3、12.3.2.1）。`file.*` / `share.*` / `trash.*` / `config.*` 的精确名字与参数随各命令实现确定。`hello` 的**响应**字段已定：`root` + `switched` +（切换时）`previous_root` |
+| 长耗时命令的超时值 | 普通命令定为 30 秒（13.9.4）；`file.upload` 这类的最长等待时间需按最大上传大小估算后冻结。**与 18.16 一起决定**：如果保持「一把锁串行」，30 秒的普通命令超时会先于上传结束触发，需要显式区分超时值 |
+| 阶段 5 的并发模型（锁粒度） | **阶段 5 开工前必须定**：现状是「业务命令共用一把互斥锁」——互斥不是队列，没有先来先服务、没有排队上限（18.16）。上传/下载持锁会把 `bucket list` 与浏览器请求一起卡住，必须在「按 JSON / 按 file_id 收细锁」与「长任务移出锁 + 任务登记」之间选一个 |
 | 停止等待与 Recovery 的相互作用 | 停止过程中若超时（13.7.3），是否返回非零退出码让 SCM 记录一次失败、甚至触发 Recovery，待定——不处理好会出现「停止失败 → 自动重启」的循环 |
-| 管道实例数量与线程模型 | `PIPE_UNLIMITED_INSTANCES` + 每连接一线程，理论上可被本机进程耗尽。是否改成固定工作线程池待定 |
+| 管道实例数量与线程模型 | **阶段 4 的实况已改**：管道用 `PIPE_UNLIMITED_INSTANCES` 创建，但服务端**一次只 accept 一条连接**、连接内一问答（严格串行，15.1 ①）——**没有「每连接一线程」**，所以不存在「被本机进程耗尽线程」的问题。真正要定的是**第二个客户端的行为**：现在它拿到 `ERROR_PIPE_BUSY`、等 3 秒重试、最终 `FMT-601`（「同一时刻只有一个 CLI 窗口」是有意为之，决策 10）。是否放开多连接（改成线程池或固定工作线程数）待定，与 18.16 的锁粒度一起考虑 |
 | 提权副本的结果通道 | **已定稿，从待决清单移出**：结果经结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 回传（13.8.3），数据根不可写时退回 `%TEMP%` 同名文件。命名管道方案作废，原因是 MIC「禁止向上写」（13.9.2 坑 2），不存在「管道 + 临时文件降级」两条路 |
 | `version` 字段与兼容 | `service.json` 沿用「未知版本直接拒绝」的策略，还是允许忽略未知字段待定 |
 | 双击引导「等待落定」的具体时长 | **已定稿，从待决清单移出**：不写死时长，改为**按 SCM 的 `dwWaitHint` 自适应**——每轮查询把 `dwWaitHint` 夹在 100 ms – 2000 ms 之间作为下次间隔，兜底上限 30 秒，状态一旦不是等待类就立即结束（13.4.3）。理由是写死 8 秒在慢机器上会把「还在启动」误判成「启动失败」，白弹一次解决不了问题的 UAC 重装。判定用的错误码集合也已冻结（13.2.3）。「仍没起」时是否再多试一次 `reinstall` 仍待实测后定 |
@@ -4278,12 +4843,12 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 
 | 事项 | 说明 |
 |---|---|
-| 业务处理函数装配 | 业务模块在装配点注册（旧为 `server::make_default_handlers`）。新版需同时给**管道 op 表**与 **HTTP 路由**注册，两处必须指向同一实现 |
-| 首次使用的用户与 Bucket | 开发文档要求「提示用户先设置」。上一次实现改为**自动落到 `default` 与 Bucket「工作」**并写回 `config.json`，否则用户第一条命令就是报错。本次沿用，仍然是有意放宽 |
-| `file delete` 与 Bucket 删除的元数据标记 | 两处必须共用同一套「移入 Trash + 置 `is_trash`」逻辑 |
+| 业务处理函数装配 | 业务模块在装配点注册（旧为 `server::make_default_handlers`）。新版需同时给**管道 op 表**与 **HTTP 路由**注册，两处必须指向同一实现。**阶段 4 已按此落地**：`service::execute_business()` 是唯一的 `op → 实现` 分发点（`src/service/commands.cpp`），管道路由在 `ServerRuntime::handle()`、HTTP 在 `register_business_routes()`，两者都调它 |
+| 首次使用的用户与 Bucket | 开发文档第 93 节旧文要求「提示用户先设置」；**阶段 4 已按需求原文落地**：`current_user` 为空时由 `initialize_root` 自动补占位名 **`user`**（不是旧记录的 `default`），随即写回 `config.json`，用户第一条命令就能成功。**Bucket 不再自动创建**：`current_bucket` 为空时由用户的 `bucket create` 决定（第一个桶自动成为当前，第 28 节），文件类命令才返回 `FMT-305`。`FMT-604` 只在用户被显式清空时出现 |
+| `file delete` 与 Bucket 删除的元数据标记 | 两处必须共用同一套「移入 Trash + 置 `is_trash`」逻辑。**Bucket 侧已实现**（`BucketService::mark_bucket_files_trashed`，只动 `user`+`bucket` 匹配且原本为 false 的记录）；`file delete` 落地时复用同一判定 |
 | 大小显示 | `size_unit` 默认 `MB`，于是 27 字节显示成 `0MB`。是否改成默认 `AUTO` 待定（`common/size` 已支持 `AUTO`） |
 | 日志轮转 | V1 不做轮转；单文件上限与轮转规则留待后续 |
-| Bucket Trash 元数据结构 | 开发文档标注为暂定，Bucket 级 Trash 记录的字段需细化 |
+| Bucket Trash 元数据结构 | **阶段 4 已定稿，从待决清单移出**：`{type:"bucket", user, bucket, original_path, trash_path, deleted_at}`，**没有 `file_id`**，两个路径相对数据根、正斜杠（7.3）。重名不覆盖，落点加时间戳后缀 |
 | 最大上传大小默认值 | 现取 50 MB，硬编码在 `file/service.cpp` 的 `kMaxUploadSize`，尚未接到 `config.max_upload_size` |
 | HTTPS | 需要 OpenSSL，会引入 DLL，V1 不支持；`file upload <https://...>` 返回 `UrlInvalid` |
 | 旧 `paths::` 自由函数 | 仍保留 `executable_path` / `root` 等自由函数供启动阶段使用，与 `PathManager` 并存；后续可考虑收敛，但 `root()` 必须保留（它要先于 PathManager 存在） |
