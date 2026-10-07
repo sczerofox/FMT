@@ -394,7 +394,7 @@ Windows 下用 `GetModuleFileNameW`（宽字符）获取自身路径，取其父
 ```text
 服务宿主 exe   首次 service install 时通过 CreateServiceW 的 lpBinaryPathName
                登记为当时的绝对路径，SCM 据此启动服务
-数据根         CLI 声明的目录，业务数据（repository/trash/config/data/log）在这里
+数据根         CLI 声明的目录，运行目录（repository/trash/config/data/log/temp）在这里
 ```
 
 由此得到两条实际操作纪律：
@@ -426,17 +426,36 @@ FMT_ROOT/                      CLI 声明的数据根
 │   ├── file.json
 │   ├── share.json
 │   └── trash.json
-└── log/
-    ├── fmt.log                全部日志
-    └── error.log              仅 ERROR 级
+├── log/
+│   ├── fmt.log                全部日志
+│   └── error.log              仅 ERROR 级
+└── temp/                      临时文件，随时可以清空；既不是业务数据、也不是日志
+    └── fmt-elev-<父进程 pid>.json   提权结果文件（13.8.3），父进程读完立刻删除
 ```
 
-**不在数据根内的两个位置：**
+**不在数据根内的位置：**
 
 ```text
 %ProgramData%\FMT\service.json    服务自身状态（当前数据根 + 安装信息），不是业务数据
-%TEMP%\fmt\<pid>\<name>.tmp       上传临时文件（见 10.2），不落在 repository
 ```
+
+**`temp/` 的定位与规则**：
+
+```text
+定位      临时文件目录：不是业务数据、也不是日志，内容随时可以清空
+放什么    ① 提权结果文件 temp/fmt-elev-<父进程 pid>.json（父进程读完立刻删除，13.8.3）
+          ② 以后上传时的暂存文件（10.2 旧文写「temp/ 或者系统临时目录」，现在明确为 temp/）
+谁创建    CLI 在执行提权类命令前会尝试创建 <数据根>/temp；创建不出来（例如 exe 放在只读位置）
+          就退回系统临时目录 %TEMP%，并写一行 WARN 说明原因与改用后的路径。
+          提权副本在写入结果文件前也会确保目录存在——它自己有权限，
+          所以调用方数据根只读时它仍然能建出来
+清理      Service 启动时删除 temp/ 下以 fmt- 开头的遗留文件（上次异常退出留下的提权结果等），
+          用户手放进去的其它文件一律不动；删除数量记一行 INFO（时机见 13.7.1 第 4 步）
+```
+
+`temp/` 跟着 exe 走：它在数据根下，用户一眼能找到、随时可清。
+它按定义就是**可清空**的目录，且与 `repository/`、`data/`、`config/` 分属不同职责，
+所以把一个短暂的提权结果或上传暂存放进去，不会污染业务数据。
 
 ### 4.3 PathManager
 
@@ -453,6 +472,7 @@ public:
     std::filesystem::path config() const;
     std::filesystem::path data() const;
     std::filesystem::path logs() const;
+    std::filesystem::path temp() const;          // <root>/temp（临时文件，随时可清）
 
     std::filesystem::path config_json() const;   // config/config.json
     std::filesystem::path server_json() const;   // config/server.json
@@ -522,7 +542,7 @@ CLI 连上管道后只发命令；目录与默认 JSON 由服务在**首次进�
 bootstrap_root(root):
  1. 规范化 root（去尾部分隔符、取绝对路径）
  2. 检查 root 是否存在 → 不存在直接报错，不隐式创建盘符/父目录
- 3. 依次确保存在：repository/  trash/  config/  data/  log/
+ 3. 依次确保存在：repository/  trash/  config/  data/  log/  temp/
  4. 依次确保存在默认 JSON（不存在才写）：
       config/config.json、config/server.json、
       data/user.json、data/file.json、data/share.json、data/trash.json
@@ -530,6 +550,19 @@ bootstrap_root(root):
  6. 初始化业务服务（FileIdGenerator::initialize 等）
  7. 写 INFO 日志：数据根已就绪
 ```
+
+**`temp/` 的清理**：**Service 启动时**（时机 1）删除 `temp/` 下以 `fmt-` 开头的遗留文件——
+上次异常退出留下的提权结果（`fmt-elev-<父进程 pid>.json`）等；**用户手放进去的其它文件一律不动**。
+删除数量记一行 INFO（例如 `[Service] 清理 temp/ 中 2 个遗留临时文件`；为 0 时不记）。
+清理**只认 `fmt-` 前缀**，不做「整个目录清空」——`temp/` 虽然是可清空的目录，但服务不替用户决定删什么。
+> **一个残留窗口**：清理只发生在**服务启动**时。若服务**运行中**被切换了数据根，
+> 旧根 `temp/` 里没做完的 `.tmp` 与遗留结果文件**不会立刻被清**——服务不替另一个根做决定，
+> 要等下次服务带着那个根启动时才清掉。因此**换根必须等在途上传结束**（13.10.2 第 5 步），
+> 这是阶段 5 实现上传时要真正接上的约束，别只关 gate 拿锁就换。
+
+> **别和 `.tmp` 原子替换混淆**：4.4.2 的 `<目标>.tmp` 写在**目标文件旁边**
+> （`config/config.json.tmp` 这种），是原子替换的中间态；`temp/` 目录只放上面两类临时文件，
+> 两者不是一回事。
 
 #### 4.4.2 默认 JSON 的写入方式
 
@@ -581,14 +614,18 @@ Reason: Access is denied.
 3. 单实例检查（命名互斥体 Local\FMT.CLI.v1，见 11.11）
 4. 解析命令行
 5. service 命令 → 走 SCM 提权路径（见 13.8），结束
+                  ——提权前先确保 <root>/temp 存在（见 4.2、13.8.2），
+                    建不出来就退回 %TEMP% 并写一行 WARN
 6. 其他命令   → 连管道 + hello 声明 root → 进入命令循环（见 11.2）
 7. 日志        → 在 root 下创建 log/，以追加方式打开 log/fmt.log（见 11.12）
                  ——`--help` / `--version` 不执行这一步，也不创建任何目录
 ```
 
-**CLI 绝不在本地创建任何业务目录。**（唯一的例外是写日志用的 `log/`，见 11.12：
-CLI 连业务目录是否存在都不检查——那是服务的职责。）
-CLI 会碰磁盘的地方只有三处：`log/fmt.log` 与 `log/error.log`（追加写）、
+**CLI 绝不在本地创建任何业务目录。**（例外只有两处：写日志用的 `log/`，见 11.12；
+提权前要用的 `temp/`，见 4.2——两者都不属于业务数据。CLI 连业务目录是否存在都不检查，
+那是服务的职责。）
+CLI 会碰磁盘的地方只有这几处：`log/fmt.log` 与 `log/error.log`（追加写）、
+`temp/`（提权前建目录、写完结果文件后读回并删除，见 4.2 与 13.8.3）、
 `file upload` 的**源文件路径**（只读）与 `service install` 时的自身路径。
 
 不主动修改系统权限，不请求管理员权限（`service` 命令的 UAC 提权除外）。
@@ -1140,7 +1177,7 @@ public:
 1.  检查 current_user
 2.  检查 current_bucket（为空则提示先创建或选择）
 3.  校验来源：本机路径存在 / URL 为 http、https
-4.  创建临时文件
+4.  创建临时文件（位置见下：<数据根>/temp/）
 5.  下载或复制数据（流式，不整文件入内存）
 6.  检查下载/复制是否完整
 7.  检查大小 ≤ max_upload_size（超限则删除临时文件）
@@ -1149,22 +1186,28 @@ public:
 10. 文件名合法性检查
 11. 文件名冲突检查（同用户 + 正常文件 + 同名 → 冲突）
 12. 生成 file_id
-13. 移动临时文件到 repository/<user>/<bucket>/YYYY/MM/DD/
+13. 移动临时文件到 repository/<user>/<bucket>/YYYY/MM/DD/（跨目录移动，见 15.5）
 14. 写入 file.json
 15. 完成
 ```
 
-**临时文件位置**：
+**临时文件位置**（**已改口径**）：
 
 ```text
-%TEMP%\fmt\<服务进程 pid>\<name>.tmp       默认
-%TEMP%\fmt-elev-<父进程 pid>.json          例外：提权结果文件（固定名字，13.8.3）
-FMT_ROOT/temp/                            不再使用
+<数据根>\temp\<name>.tmp                   上传暂存文件的默认位置（本节的下载/复制阶段用）
+<数据根>\temp\fmt-elev-<父进程 pid>.json   提权结果文件（固定名字，13.8.3）
+%TEMP%\fmt\<pid>\<name>.tmp                唯一退路：数据根不可写（例如 exe 放在只读位置）时改用，
+                                           并写一行 WARN 说明原因与改用后的路径
 ```
 
-放在系统临时目录而不是数据根，原因是**数据根会切换**（13.10）：
-临时文件落在数据根里，换根时就成了另一个根里的垃圾，
-而且会被「数据根布局」的检查当成未知目录。
+**改口径的理由**：`temp/` 跟着 exe 走，用户一眼能找到、随时可清；
+它按定义就是**可清空**的目录，与 `repository/`、`data/`、`config/` 分属不同职责，
+把一个短暂的提权结果或上传暂存放进 `temp/`，不会污染业务数据。
+
+**旧口径作废**：本节旧文写「系统临时目录或 `FMT_ROOT/temp/`」，4.2 曾一度改成
+`%TEMP%\fmt\<pid>\`，理由是「临时文件不放在数据根，避免污染被切换的目录」。
+这条理由**不再成立**——`temp/` 本身就是可清空的目录，换根带来的也只是另一个根里的
+可清空目录，不会被当成未知目录（它在数据根布局里是**已登记的第六个目录**，见 4.2）。
 
 **绝不**直接下载到 `repository`，避免半成品进入正式空间。
 
@@ -1434,7 +1477,7 @@ FMT-NNN   业务/系统错误码，跨进程传递（管道、HTTP 信封），�
 | 服务已存在，重复 `service install` | `FMT-600 ServiceAlreadyInstalled` | 8 |
 | 服务不存在（`service start` / `stop` / `uninstall`，或管道连不上） | `FMT-601 ServiceNotInstalled` | 8 |
 | SCM 操作失败 / 提权副本等待超时 / `ShellExecuteExW` 其它失败 | `FMT-602 ServiceOperationFailed` | 8 |
-| 提权副本没有返回结果（结果文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 不存在） | `FMT-602 ServiceOperationFailed` | 8 |
+| 提权副本没有返回结果（结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 不存在） | `FMT-602 ServiceOperationFailed` | 8 |
 | 需要管理员权限（打印「需要管理员权限」） | `FMT-603 AdminRequired` | 5 |
 | `ShellExecuteExW` 失败且 `ERROR_ACCESS_DENIED`（5）（非管理员账户、策略禁止提权） | `FMT-603 AdminRequired` | 5 |
 | 用户在 UAC 点「否」（`ERROR_CANCELLED` 1223） | `FMT-004 PermissionDenied` | 5 |
@@ -1452,6 +1495,7 @@ FMT-NNN   业务/系统错误码，跨进程传递（管道、HTTP 信封），�
 ```text
 FMT v1.0.0
 Service Running...
+
 fmt >
 ```
 
@@ -1460,12 +1504,17 @@ fmt >
 ```text
 FMT v1.0.0
 Service Stopped...
+
 fmt >
 ```
 
 版本号来自 `fmt/version.hpp` 的 `FMT_NAME_VERSION`（见 3.4），**不得硬编码**。
 
 **提示符：`fmt> `**（`fmt` + `>` + 一个空格，无换行）。
+
+**提示符前先空一行**：交互循环在打印 `fmt> ` 之前先输出一个空行——横幅之后一次，
+以及**每条命令执行完之后**一次，这样输出不会和提示符挤在一起。
+**用户只敲回车（空命令）时不再重复空行**，不会叠出连续两个空行。
 
 - 命令集与命令行参数形式一致
 - 空行忽略
@@ -1478,11 +1527,13 @@ fmt >
 ```text
 FMT v1.0.0
 Service Running...
+
 fmt >service stop
 需要管理员权限
 正在提权...
 执行成功...
 错误码：0
+
 fmt >
 ```
 
@@ -1491,10 +1542,12 @@ fmt >
 ```text
 FMT v1.0.0
 Service Running...
+
 fmt >file list
 无法连接 FMT Service，请先执行 service install
 执行失败：FMT-601 服务未安装
 错误码：8
+
 fmt >
 ```
 
@@ -1598,12 +1651,18 @@ Cli       连接失败
 三条边界，必须同时成立：
 
 ```text
-1. CLI 只允许创建 <数据根>/log/ 这一个目录（日志不是业务数据）；
+1. CLI 只允许创建 <数据根>/log/ 与执行提权命令前要用的 <数据根>/temp/ 这两个目录
+   （都不属于业务数据：日志不是业务数据，temp/ 按定义随时可以清空）；
    repository / data / config 一概不碰，CLI 仍然不改任何业务数据。
 2. --help 与 --version 不写日志、不创建任何目录（它们不该在磁盘上留下东西）。
 3. 两个进程的数据根可能不同（服务可能被别人启动在另一个目录）：各写各自数据根下的
    log/fmt.log；这种情况下 CLI 会额外写一行 WARN，指明服务当前数据根与服务侧日志的位置。
 ```
+
+`temp/` 的创建与清理口径见 4.2：CLI 在执行提权类命令前尝试创建 `<数据根>/temp`，
+建不出来（例如 exe 放在只读位置）就退回系统临时目录 `%TEMP%`，并写一行 WARN 说明原因与
+改用后的路径；提权副本在写入结果文件前也会确保目录存在。**Service 启动时**删除 `temp/` 下
+以 `fmt-` 开头的遗留文件，用户手放进去的其它文件一律不动，删除数量记一行 INFO。
 
 为什么 CLI 也写：用户在 CLI 里敲 `service stop`，服务随即被停掉，旧口径下这次操作
 在日志里**一个字都没有**，日志跟不上用户做过什么。日志要能回答「谁在什么时候对服务
@@ -1885,7 +1944,8 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleCP(CP_UTF8);
 
     // 1) 提权短命副本：内部参数，优先级最高
-    //    形如：fmt.exe --elevated install --result "C:\Users\me\AppData\Local\Temp\fmt-elev-1234.json"
+    //    形如：fmt.exe --elevated install --result "D:\FMT\temp\fmt-elev-1234.json"
+    //    （数据根不可写时才是 C:\Users\me\AppData\Local\Temp\fmt-elev-1234.json，见 4.2 / 13.8.3）
     //    operation ∈ install | uninstall | start | stop | reinstall（见 13.8.2 / 13.8.3）
     if (has_argument(argv, argc, L"--elevated")) {
         return service::run_elevated(argc, argv);   // 只做一次 SCM 操作后退出
@@ -2131,7 +2191,7 @@ ChangeServiceConfig2W(hService, SERVICE_CONFIG_FAILURE_ACTIONS, &fa);
 
 | 对比 | 数据根内 | `%ProgramData%\FMT\` |
 |---|---|---|
-| 内容 | `repository/ trash/ config/ data/ log/` | `service.json` |
+| 内容 | `repository/ trash/ config/ data/ log/ temp/` | `service.json` |
 | 归属 | 业务，随数据根切换 | 服务自身，与数据根无关 |
 | 谁写 | 服务（业务层） | 服务（生命周期层） |
 | CLI 会读吗 | 会（通过服务） | **不会** |
@@ -2184,8 +2244,10 @@ ServiceMain（SCM 在本进程内调用，dwNumServicesArgs 形式参数，本�
   4. 初始化：
        4.1 读 %ProgramData%\FMT\service.json → 定初值数据根（13.6）
        4.2 bootstrap_root(root)（4.4.1：目录 + 默认 JSON + 配置 + 业务服务）
-       4.3 起管道监听线程（ipc::PipeServer，13.8）
-       4.4 读 server.json → enabled 时起 HTTP 线程（第 12 节）
+       4.3 清理 <root>/temp 下以 fmt- 开头的遗留文件（上次异常退出留下的提权结果等；
+           用户手放的其它文件不动），删除数量记一行 INFO（见 4.2、13.8.3）
+       4.4 起管道监听线程（ipc::PipeServer，13.8）
+       4.5 读 server.json → enabled 时起 HTTP 线程（第 12 节）
      期间每个超过 3 秒的步骤前 SetServiceStatus(START_PENDING, ++checkpoint)
   5. SetServiceStatus(SERVICE_RUNNING, checkpoint = 0, wait_hint = 0)
   6. WaitForSingleObject(g_stop_event, INFINITE)               // 等停止事件
@@ -2283,7 +2345,11 @@ bool is_elevated() {
 **命令行形状（已定稿）**：
 
 ```text
-结果文件：%TEMP%\fmt-elev-<父进程 pid>.json      ← 用户自己的临时目录，不是数据根、不是服务目录
+结果文件：<数据根>\temp\fmt-elev-<父进程 pid>.json
+          ← 跟着 exe 走（数据根下的 temp/），用户一眼能找到、随时可清；
+            不是服务目录、也不是 %ProgramData%
+            数据根不可写（例如 exe 放在只读位置）时才退回 %TEMP%\fmt-elev-<父进程 pid>.json，
+            并写一行 WARN 说明原因与改用后的路径
 命令行  ：fmt.exe --elevated <operation> --result "<结果文件的绝对路径>"
 operation ∈ install | uninstall | start | stop | reinstall
 ```
@@ -2292,9 +2358,12 @@ operation ∈ install | uninstall | start | stop | reinstall
 已丢失、需要重新指向当前目录」的场景（4.8 节表格第三行），**一次 UAC 做完**。
 
 ```cpp
+// 0) 先确保 <数据根>\temp 存在；建不出来就退回 %TEMP% 并记一行 WARN（见 4.2）
+//    提权副本在写结果文件前也会自己 ensure 一次目录，它有权限，所以调用方只读时仍能建出来
+const std::wstring result = elevation_result_path();   // <root>\temp\fmt-elev-<pid>.json
+                                                       // 退路：%TEMP%\fmt-elev-<pid>.json
+
 // 1) 先删除可能残留的结果文件：上一次崩溃留下的旧结果会让本次误判
-std::wstring result = temp_dir() + L"\\fmt-elev-"
-                    + std::to_wstring(GetCurrentProcessId()) + L".json";
 DeleteFileW(result.c_str());
 
 // 2) 组装参数：--elevated <operation> --result "<绝对路径>"
@@ -2360,8 +2429,11 @@ CloseHandle(sei.hProcess);
 **定稿：临时文件。命名管道方案作废。**
 
 ```text
-结果文件：%TEMP%\fmt-elev-<父进程 pid>.json
-          父进程 pid → 并发双击也不会打架；同一用户 → 父子两边都能读写
+结果文件：<数据根>\temp\fmt-elev-<父进程 pid>.json
+          父进程 pid → 并发双击也不会打架；父子同一个用户 → 两边都能读写
+          跟着 exe 走（数据根下的 temp/）→ 用户一眼能找到、随时可清
+退路      <数据根> 不可写（例如 exe 放在只读位置）→ %TEMP%\fmt-elev-<父进程 pid>.json，
+          并写一行 WARN 说明原因与改用后的路径
 ```
 
 **为什么不用命名管道**：提权副本是**高完整性进程**，高完整性进程创建的命名管道会带上
@@ -2370,13 +2442,17 @@ CloseHandle(sei.hProcess);
 与 13.9.2 的「坑 2」是同一个机制。要绕过它就得再给管道加 MIC 标签、放宽安全描述符，等于为了
 一条一次性回传通道去削弱一处安全边界。
 
-临时文件放在用户自己的 `%TEMP%` 下（**同一个用户，只是令牌不同**），父子两边都能正常读写，
-**不需要额外放宽任何安全描述符**。
+结果文件写在数据根下的 `temp/` 里（**同一个用户，只是令牌不同**），父子两边都能正常读写，
+**不需要额外放宽任何安全描述符**；只有数据根不可写时才退回用户自己的 `%TEMP%` 并记一行 WARN。
+提权副本在写入结果文件前会**自己确保 `temp/` 存在**（它有权限，所以调用方数据根只读时仍能建出来）。
+`temp/` 是**按定义可清空**的目录，与 `repository/` / `data/` / `config/` 分属不同职责，
+把一次性的提权结果放进去不会污染业务数据。
 
 父进程流程（与 13.8.2 的代码一一对应）：
 
 ```text
-1. 先删除可能残留的结果文件 %TEMP%\fmt-elev-<父进程 pid>.json
+1. 先确保 <数据根>\temp 存在（建不出来 → 退回 %TEMP% + 一行 WARN），
+   再删除可能残留的结果文件 <数据根>\temp\fmt-elev-<父进程 pid>.json
 2. ShellExecuteExW(lpVerb=L"runas", fMask=SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC |
                   SEE_MASK_FLAG_NO_UI, nShow=SW_HIDE)
 3. WaitForSingleObject(hProcess, 60000) → GetExitCodeProcess → CloseHandle
@@ -2410,7 +2486,9 @@ CloseHandle(sei.hProcess);
 | 提权副本卡住 / 不退出 | `WaitForSingleObject` 返回 `WAIT_TIMEOUT`（60 秒） | `FMT-602 ServiceOperationFailed` / 退出码 **8** |
 | 结果文件不存在（子进程崩了） | `GetFileAttributesW` 失败 | `FMT-602 ServiceOperationFailed` / 退出码 **8**，提示「提权副本没有返回结果」 |
 
-- 结果文件**读完即删**，不留在 `%TEMP%` 里；也避免下次同 pid 复用时把旧结果当成新结果。
+- 结果文件**读完即删**，不留在 `temp/` 里（退路情形下也不留在 `%TEMP%`）；
+  也避免下次同 pid 复用时把旧结果当成新结果。上次异常退出留下的 `fmt-` 前缀文件，
+  由 Service 启动时统一清理（见 4.2 与 13.7.1 第 4 步）。
 - 提权副本退出码非 0 但结果文件存在时，**以结果文件为准**（`code` 决定错误码、`exit` 决定退出码）。
 - 读取发生在 `GetExitCodeProcess` 之后（子进程已退出），所以读文件本身不需要再设超时；
   但**等待子进程必须有 60 秒上限**，否则提权副本卡住会把 CLI 一起拖死。
@@ -2441,7 +2519,8 @@ CloseHandle(sei.hProcess);
   不做业务命令（不连 \\.\pipe\fmt.control，不读写数据根）
   不进入交互循环，不检查单实例互斥体（11.11）
   不带窗口（nShow = SW_HIDE），完成后立刻退出
-  它的全部输出写进结果文件（%TEMP%\fmt-elev-<父进程 pid>.json），不留控制台痕迹
+  它的全部输出写进结果文件（<数据根>\temp\fmt-elev-<父进程 pid>.json，
+  数据根不可写时退回 %TEMP%），不留控制台痕迹
 ```
 
 理由：它是**高完整性进程**。让高完整性进程去碰业务数据、长时间存活，
@@ -2655,7 +2734,7 @@ Service（收到任意请求中的 root）：
 CLI                     Service
  │                        │
  ├─ hello{root:D:\A} ────→│  当前根 = C:\FMT
- │                        ├─ 建 D:\A/{repository,trash,config,data,log}
+ │                        ├─ 建 D:\A/{repository,trash,config,data,log,temp}
  │                        ├─ 写默认 JSON（缺失时才写，.tmp 原子替换）
  │                        ├─ 加载配置、初始化业务服务
  │←── ok{root:D:\A} ──────┤  current_root := D:\A（写 service.json）
@@ -2729,7 +2808,8 @@ if (GetLastError() == ERROR_ALREADY_EXISTS) {
  7. 打印横幅：
        FMT v1.0.0
        Service Running...        （未运行时为 Service Stopped...）
- 8. 进入交互循环，提示符 `fmt> `（11.9）
+ 8. 进入交互循环：先输出一个空行，再打印提示符 `fmt> `（11.9）；
+    之后每条命令执行完同样先空一行再打印下一个提示符，空命令不重复空行
 ```
 
 两个容易搞错的点：
@@ -2770,9 +2850,12 @@ V1 **不实现**异步日志、日志线程、日志队列、日志压缩、日�
 FMT_ROOT/log/
 ├── fmt.log        全部日志
 └── error.log      仅 ERROR 级
+
+FMT_ROOT/temp/     临时文件，随时可以清空（既不是业务数据、也不是日志，见 4.2）
 ```
 
-日志**不是业务数据**，因此与 `data/` 分离。
+日志**不是业务数据**，因此与 `data/` 分离；`temp/` 同理，只是它连「要留多久」都不承诺——
+按定义随时可以清空。
 
 **Service 与 CLI 都写日志文件，两个进程追加同一个文件：**
 `<数据根>/log/fmt.log`（全部）与 `error.log`（仅 ERROR）由两个进程都以「追加」方式打开，
@@ -2785,8 +2868,9 @@ FMT_ROOT/log/
 CLI 侧的三条边界（完整清单与字段见 11.12）：
 
 ```text
-1. CLI 只允许创建 <数据根>/log/ 这一个目录（日志不是业务数据）；
-   repository / data / config 一概不碰，CLI 仍然不改任何业务数据。
+1. CLI 只允许创建 <数据根>/log/ 与执行提权命令前要用的 <数据根>/temp/ 这两个目录
+   （两者都不是业务数据）；repository / data / config 一概不碰，
+   CLI 仍然不改任何业务数据。
 2. --help 与 --version 不写日志、不创建任何目录。
 3. 两个进程的数据根可能不同（服务可能被别人启动在另一个目录）：各写各自数据根下的
    log/fmt.log；这种情况下 CLI 会额外写一行 WARN，指明服务当前数据根与服务侧日志的位置。
@@ -2950,6 +3034,9 @@ metadata.md5  != 实际 md5
 
 - 优先**同文件系统内移动**（`MoveFileEx` 同卷），减少复制+删除的失败窗口
 - 跨盘时：复制 → 校验（比对 size 与 MD5）→ 删除原文件，并做一致性保护
+- 默认路径（`<数据根>/temp/` → `repository/`）通常同卷，走第一行即可；
+  只有 `temp/` 退回 `%TEMP%`（4.2）且系统临时目录在另一个盘时才是跨盘，
+  这时必须走第二行的复制 → 校验 → 删除
 
 ---
 
@@ -3050,9 +3137,9 @@ int wmain(int argc, wchar_t** argv) {
 cd D:\FMT
 .\fmt.exe service install          # 弹 UAC → 确认 → 「执行成功...」「错误码：0」
 .\fmt.exe service start            # 已运行也应报成功（幂等）
-.\fmt.exe                          # 双击等价：横幅 + Service Running... + fmt> 
+.\fmt.exe                          # 双击等价：横幅 + Service Running... + 空行 + fmt> 
 .\fmt.exe service stop             # 停止，退出码 0
-.\fmt.exe service uninstall        # 卸载；数据目录内容不变
+.\fmt.exe service uninstall        # 卸载；数据目录内容不变（含 temp/）
 ```
 
 预期补充检查：
@@ -3062,6 +3149,7 @@ sc query FMT                        应能看到 FMT / FMT File Management Servi
 sc qc FMT                           启动类型 AUTO_START，账户 LocalSystem，binPath=当前 exe
 sc qfailure FMT                     Recovery：5s / 10s / 30s 重启，重置周期 86400 秒
 %ProgramData%\FMT\service.json      含 current_root / binary_path / installed_at
+数据根\temp\                        提权后结果文件已读回并删除；Service 启动会清掉遗留的 fmt-* 文件
 提权过程                             屏幕上**不应**出现闪过的控制台黑框（nShow = SW_HIDE）
 ```
 
@@ -3232,7 +3320,7 @@ service install（非管理员）       → 提权引导；取消 UAC → FMT-00
 端到端验证（真实运行 `fmt.exe`）：
 
 ```text
-首次运行 → 创建 repository/ trash/ config/ data/ log/
+首次运行 → 创建 repository/ trash/ config/ data/ log/ temp/
          → 写出 config/config.json（缺失时）
          → 退出码 0
 修改配置后再运行 → 用户修改保持不变
@@ -3442,7 +3530,7 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 
 | 事项 | 现状 / 说明 |
 |---|---|
-| 提权路径端到端实测 | `service install/uninstall/start/stop/reinstall` 都需要一次真实的 UAC 确认。要验证：成功路径、**取消 UAC（`ERROR_CANCELLED` 1223 → `FMT-004` / 5）**、等待超时（`WAIT_TIMEOUT` → `FMT-602` / 8）、重复 install（`FMT-600` / 8）、服务不存在（`FMT-601` / 8）、提权期间不出现控制台闪窗、结果文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 正确生成并在父进程读完后删除 |
+| 提权路径端到端实测 | `service install/uninstall/start/stop/reinstall` 都需要一次真实的 UAC 确认。要验证：成功路径、**取消 UAC（`ERROR_CANCELLED` 1223 → `FMT-004` / 5）**、等待超时（`WAIT_TIMEOUT` → `FMT-602` / 8）、重复 install（`FMT-600` / 8）、服务不存在（`FMT-601` / 8）、提权期间不出现控制台闪窗、结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 正确生成并在父进程读完后删除、数据根不可写时退回 `%TEMP%` 并写 WARN |
 | 管道连接权限实测 | DACL（`D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`）与 MIC 标签（`S:(ML;;NW;;;ME)`）都要在**非提权 CLI** 上跑通；只测提权 CLI 会掩盖 13.9.2 的两个坑 |
 | 根切换实测 | CLI 换目录运行 → 服务切根、幂等初始化新根、旧根数据不删、`service.json` 的 `current_root` 更新 |
 | SCM 30 秒限制 | 需要一次「初始化故意变慢」的验证：确认 `START_PENDING` + `dwCheckPoint` 上报真的消除了 1053 |
@@ -3451,7 +3539,7 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 | Trash / `file delete` | 与 18.12 相同，尚未实现；落地方案已定（标记 `is_trash` + 移入 `trash/<user>/<bucket>/YYYY/MM/DD/`） |
 | Preview | `file preview` / `share preview` 返回 `FMT-701`，属于阶段 6 |
 | 交互式输入的 UTF-8 | 输出与参数已是 UTF-8；`std::getline(std::cin, ...)` 在 GBK 控制台下读中文的方案待冻结（`ReadConsoleW` 是候选） |
-| 临时文件位置 | 第 10.2 节旧文写「系统临时目录或 `FMT_ROOT/temp/`」，4.2 已改为 `%TEMP%\fmt\<pid>\`；临时文件**不放在数据根**，避免污染被切换的目录。提权结果文件是唯一例外：固定名 `%TEMP%\fmt-elev-<父进程 pid>.json`（13.8.3），便于父进程直接拼出路径 |
+| 临时文件位置 | **新结论（已改口径）**：临时文件**统一放** `<数据根>/temp/`，跟着 exe 走——用户一眼能找到、随时可清；提权结果文件用固定名 `temp/fmt-elev-<父进程 pid>.json`（13.8.3），便于父进程直接拼出路径。唯一的退路是**数据根不可写**（例如 exe 放在只读位置）时退回系统临时目录 `%TEMP%`，并记一行 WARN 说明原因与改用后的路径。**历史脉络**：第 10.2 节旧文写「系统临时目录或 `FMT_ROOT/temp/`」，4.2 曾改为 `%TEMP%\fmt\<pid>\`，理由是「临时文件不放在数据根，避免污染被切换的目录」；**这条理由已被推翻**——`temp/` 是**按定义可清空**的目录，且它与 `repository/`、`data/`、`config/` 分属不同职责，把一个短暂的提权结果或上传暂存放进 `temp/`，不会污染业务数据 |
 
 ### 18.14 上一次实现遗留、本次仍需保留的纪律
 
@@ -3492,7 +3580,7 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 | 长耗时命令的超时值 | 普通命令定为 30 秒（13.9.4）；`file.upload` 这类的最长等待时间需按最大上传大小估算后冻结 |
 | 停止等待与 Recovery 的相互作用 | 停止过程中若超时（13.7.3），是否返回非零退出码让 SCM 记录一次失败、甚至触发 Recovery，待定——不处理好会出现「停止失败 → 自动重启」的循环 |
 | 管道实例数量与线程模型 | `PIPE_UNLIMITED_INSTANCES` + 每连接一线程，理论上可被本机进程耗尽。是否改成固定工作线程池待定 |
-| 提权副本的结果通道 | **已定稿，从待决清单移出**：结果经临时文件 `%TEMP%\fmt-elev-<父进程 pid>.json` 回传（13.8.3）。命名管道方案作废，原因是 MIC「禁止向上写」（13.9.2 坑 2），不存在「管道 + 临时文件降级」两条路 |
+| 提权副本的结果通道 | **已定稿，从待决清单移出**：结果经结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 回传（13.8.3），数据根不可写时退回 `%TEMP%` 同名文件。命名管道方案作废，原因是 MIC「禁止向上写」（13.9.2 坑 2），不存在「管道 + 临时文件降级」两条路 |
 | `version` 字段与兼容 | `service.json` 沿用「未知版本直接拒绝」的策略，还是允许忽略未知字段待定 |
 
 ### 19.2 上一次实现遗留的待决事项（仍然有效）
