@@ -65,6 +65,9 @@ private:
     Status apply_root(const std::string& requested_root, std::string* effective_root,
                       std::string* previous_root, bool* switched);
     void serve(ipc::PipeConnection connection);
+    // current_bucket 失效（目录不存在）时置空并落盘（开发文档第 61 节）。
+    // 调用时必须持有 mutex_。
+    void refresh_current_bucket_locked();
     // 按当前根的 server.json 决定是否（重新）启动 HTTP 监听。
     // **必须在不持 mutex_ 时调用**：它内部会 stop() 并 join HTTP 工作线程，
     // 而 HTTP 的请求处理器要拿 mutex_，持锁调用会互相等待。

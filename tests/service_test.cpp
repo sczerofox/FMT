@@ -88,6 +88,40 @@ FMT_TEST(Service, 状态查询与状态名一致) {
     }
 }
 
+FMT_TEST(Service, 启动时把失效的当前Bucket置空) {
+    fmt_test::TempDir temp("service-refresh");
+    const auto root = temp / "root";
+
+    // 先把 current_bucket 写成一个并不存在的桶
+    {
+        auto initialized = fmt::initialize_root(root);
+        FMT_CHECK(fmt::ok(initialized));
+        const fmt::PathManager& paths = *std::get<std::unique_ptr<fmt::PathManager>>(initialized);
+        fmt::Config config = std::get<fmt::Config>(fmt::load_config(paths));
+        config.current_bucket = "早就没了";
+        FMT_CHECK(fmt::ok(fmt::save_config(paths, config)));
+    }
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const fmt::PathManager paths{root};
+    // 失效 -> 置空（开发文档第 61 节）
+    FMT_CHECK_EQ(std::get<fmt::Config>(fmt::load_config(paths)).current_bucket, std::string{});
+
+    // 存在的当前 Bucket 不能被误清
+    FMT_CHECK(fmt::ok(
+        fmt::ensure_directory(paths.repository() / "user" / fmt::path_from_utf8("工作"))));
+    fmt::Config config = std::get<fmt::Config>(fmt::load_config(paths));
+    config.current_bucket = "工作";
+    FMT_CHECK(fmt::ok(fmt::save_config(paths, config)));
+
+    fmt::service::ServerRuntime second(root, temp / "state2");
+    FMT_CHECK(fmt::ok(second.start()));
+    FMT_CHECK_EQ(std::get<fmt::Config>(fmt::load_config(paths)).current_bucket,
+                 std::string("工作"));
+}
+
 FMT_TEST(Service, 管道能执行Bucket命令) {
     fmt_test::TempDir temp("service-bucket");
     const auto root = temp / "root";

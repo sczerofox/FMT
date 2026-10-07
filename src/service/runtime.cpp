@@ -4,6 +4,7 @@
 #include <thread>
 #include <utility>
 
+#include "fmt/bucket/bucket.hpp"
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/ipc/protocol.hpp"
@@ -155,6 +156,9 @@ Status ServerRuntime::start() {
         paths = context_->paths.get();
         logger = context_->logger.get();
         root_text = state.current_root;
+
+        // current_bucket 失效时置空（开发文档第 61 节）：启动即校一次。
+        refresh_current_bucket_locked();
     }
 
     // 上次异常退出可能留下提权结果之类的临时文件，启动时顺手清掉。
@@ -167,6 +171,18 @@ Status ServerRuntime::start() {
 
     logger->info("Service", "服务已启动，当前数据根：" + root_text);
     return std::monostate{};
+}
+
+void ServerRuntime::refresh_current_bucket_locked() {
+    if (context_ == nullptr || context_->paths == nullptr) {
+        return;
+    }
+
+    BucketService buckets(*context_->paths, context_->config, context_->logger.get());
+    const Status status = buckets.refresh_current_bucket();
+    if (!ok(status) && context_->logger != nullptr) {
+        context_->logger->warn("Bucket", "校验当前 Bucket 失败：" + error_of(status)->message);
+    }
 }
 
 void ServerRuntime::restart_http() {
@@ -275,6 +291,9 @@ Status ServerRuntime::apply_root(const std::string& requested_root, std::string*
         if (const Status saved = save_state_to(state_directory_, state); !ok(saved)) {
             context_->logger->warn("Service", "写入服务状态失败：" + error_of(saved)->message);
         }
+
+        // 换根后同样校一次：新根里的 current_bucket 可能指向不存在的 Bucket。
+        refresh_current_bucket_locked();
     }
 
     // 换根后重新评估 server.json；必须在锁外（见 restart_http 注释）。
