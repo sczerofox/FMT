@@ -23,6 +23,12 @@ inline constexpr std::size_t kMaxFrameBytes = 64ULL * 1024 * 1024;
 inline constexpr int kConnectTimeoutMs = 3000;
 inline constexpr int kCommandTimeoutMs = 30000;
 
+// 上传是长任务：下载可能几分钟到几十分钟，**不能**按普通命令的 30 秒算。
+// 客户端等这么久才放弃；服务端自己的连接/发送/接收超时另有设定（http_client）。
+// 真到了这个上限，CLI 会明确提示「服务端可能仍在处理，用 file list 确认」，
+// 不让用户把「等超时」误当成「没入库」。
+inline constexpr int kUploadTimeoutMs = 30 * 60 * 1000;
+
 // 请求：{"id":N,"op":"...","root":"...","pid":N}
 struct Request {
     int id = 0;

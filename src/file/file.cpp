@@ -8,9 +8,8 @@
 #include <system_error>
 #include <utility>
 
-#include <cpp-httplib/httplib.h>
-
 #include "fmt/common/hash.hpp"
+#include "fmt/common/http_client.hpp"
 #include "fmt/common/string.hpp"
 #include "fmt/common/time.hpp"
 #include "fmt/common/validation.hpp"
@@ -22,50 +21,6 @@ namespace {
 
 constexpr std::size_t kChunkBytes = 64 * 1024;
 constexpr const char* kTrashReasonFile = "file";
-
-bool has_scheme(const std::string& text, std::string_view scheme) {
-    if (text.size() < scheme.size()) {
-        return false;
-    }
-    for (std::size_t i = 0; i < scheme.size(); ++i) {
-        if (std::tolower(static_cast<unsigned char>(text[i])) !=
-            std::tolower(static_cast<unsigned char>(scheme[i]))) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool is_http_url(const std::string& source) { return has_scheme(source, "http://"); }
-bool is_https_url(const std::string& source) { return has_scheme(source, "https://"); }
-
-struct HttpUrl {
-    std::string scheme_host_port;  // httplib::Client 用的 "http://host:port"
-    std::string path;              // 含查询串
-};
-
-Result<HttpUrl> parse_http_url(const std::string& source) {
-    if (is_https_url(source)) {
-        // V1 不引入 OpenSSL（技术文档：HTTPS 需要 OpenSSL，会引入 DLL）
-        return make_error(ErrorCode::UrlInvalid,
-                          "V1 不支持 https（需要 OpenSSL）；请改用 http:// 或本地路径");
-    }
-    if (!is_http_url(source)) {
-        return make_error(ErrorCode::UrlInvalid, "只支持 http:// 开头的 URL：" + source);
-    }
-
-    const std::string rest = source.substr(7);
-    const std::size_t slash = rest.find('/');
-    const std::string host = slash == std::string::npos ? rest : rest.substr(0, slash);
-    if (host.empty()) {
-        return make_error(ErrorCode::UrlInvalid, "URL 缺少主机名：" + source);
-    }
-
-    HttpUrl url;
-    url.scheme_host_port = "http://" + host;
-    url.path = slash == std::string::npos ? "/" : rest.substr(slash);
-    return url;
-}
 
 // <数据根>/temp/fmt-upload-<随机>-<序号>.tmp
 // `fmt-` 前缀会被服务启动时的 temp 清理顺手收走，不会越积越多。
@@ -308,7 +263,12 @@ Result<PreparedUpload> prepare_upload(const PathManager& paths, const std::strin
         return *error_of(status);
     }
 
-    const bool remote = is_http_url(source) || is_https_url(source);
+    const bool remote = is_remote_url(source);
+    if (!remote && source.find("://") != std::string::npos) {
+        // 长得像 URL 但不是 http/https：别当成「本地文件不存在」，那会误导排查。
+        return make_error(ErrorCode::UrlInvalid,
+                          "只支持 http:// 与 https:// 的来源：" + source);
+    }
     if (!remote && !file_exists(path_from_utf8(source))) {
         return make_error(ErrorCode::FileNotFound, "本地文件不存在：" + source);
     }
@@ -349,21 +309,12 @@ Result<PreparedUpload> prepare_upload(const PathManager& paths, const std::strin
     };
 
     if (remote) {
-        Result<HttpUrl> url = parse_http_url(source);
-        if (!ok(url)) {
-            return *error_of(url);
-        }
-        const HttpUrl target = std::get<HttpUrl>(url);
+        // 下载走 WinHTTP + Schannel：http 与 https 都支持，不需要 OpenSSL。
+        HttpDownloadRequest request;
+        request.url = source;
 
-        httplib::Client client(target.scheme_host_port);
-        client.set_follow_location(true);
-        client.set_connection_timeout(10);  // 秒
-        client.set_read_timeout(300);
-
-        const httplib::Result response =
-            client.Get(target.path, [&](const char* data, std::size_t length) {
-                return sink(data, length);
-            });
+        const Result<HttpDownloadResult> downloaded = http_download(
+            request, [&](const char* data, std::size_t length) { return sink(data, length); });
 
         if (stage == Stage::TooLarge) {
             return make_error(ErrorCode::SizeLimitExceeded,
@@ -373,29 +324,20 @@ Result<PreparedUpload> prepare_upload(const PathManager& paths, const std::strin
             return make_error(ErrorCode::IoError,
                               "写临时文件失败：" + path_to_utf8(prepared.temp_path));
         }
-        if (!response) {
-            return make_error(ErrorCode::DownloadFailed,
-                              "下载失败：" + source + "（" +
-                                  httplib::to_string(response.error()) + "）");
+        if (!ok(downloaded)) {
+            return *error_of(downloaded);
         }
-        if (response->status != 200) {
+
+        const HttpDownloadResult& response = std::get<HttpDownloadResult>(downloaded);
+        if (response.status != 200) {
             return make_error(ErrorCode::DownloadFailed,
-                              "下载失败：HTTP " + std::to_string(response->status) + " " + source);
+                              "下载失败：HTTP " + std::to_string(response.status) + " " + source);
         }
         // 第 7 步：完整性检查。服务器给了 Content-Length 就必须对上。
-        const std::string length = response->get_header_value("Content-Length");
-        if (!length.empty()) {
-            std::uintmax_t expected = 0;
-            try {
-                expected = static_cast<std::uintmax_t>(std::stoull(length));
-            } catch (const std::exception&) {
-                expected = written;
-            }
-            if (expected != written) {
-                return make_error(ErrorCode::DownloadFailed,
-                                  "下载不完整：声明 " + std::to_string(expected) + " 字节，实收 " +
-                                      std::to_string(written) + " 字节");
-            }
+        if (response.has_content_length && response.content_length != written) {
+            return make_error(ErrorCode::DownloadFailed,
+                              "下载不完整：声明 " + std::to_string(response.content_length) +
+                                  " 字节，实收 " + std::to_string(written) + " 字节");
         }
     } else {
         std::ifstream in(path_from_utf8(source), std::ios::binary);

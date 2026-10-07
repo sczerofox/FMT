@@ -10,6 +10,7 @@ add_executable(fmt_tests
     logger_test.cpp
     validation_test.cpp
     hash_test.cpp
+    http_client_test.cpp
     path_manager_test.cpp
     storage_test.cpp
     config_test.cpp

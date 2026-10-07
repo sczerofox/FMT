@@ -38,6 +38,11 @@ bool matches(const std::string& full_name, const std::vector<std::string>& filte
 }  // namespace
 
 int run_all(const std::vector<std::string>& filters) {
+    // 逐行刷出去：某条用例卡住（死锁、网络等待）时，最后一行就是它的名字。
+    // 缓冲的话进程被强杀时什么都看不到，排查得靠猜。
+    std::ios::sync_with_stdio(false);
+    std::cout.setf(std::ios::unitbuf);
+
     int passed = 0;
     int failed = 0;
     int skipped = 0;
@@ -48,6 +53,8 @@ int run_all(const std::vector<std::string>& filters) {
             ++skipped;
             continue;
         }
+
+        std::cout << "[开始] " << full_name << "\n";
 
         try {
             test_case.body();

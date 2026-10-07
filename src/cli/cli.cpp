@@ -646,12 +646,26 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
 
     log_info("Cli", "命令 " + operation + " 已发送（id " + std::to_string(request.id) + "）");
 
-    Result<ipc::Response> response = session.client.call(request, ipc::kCommandTimeoutMs);
+    // 上传是长任务，用单独的长超时；普通命令仍是 30 秒。
+    const int timeout_ms =
+        operation == "file.upload" ? ipc::kUploadTimeoutMs : ipc::kCommandTimeoutMs;
+
+    Result<ipc::Response> response = session.client.call(request, timeout_ms);
     if (!ok(response)) {
         session.connected = false;
-        log_error("Cli", "命令 " + operation + " 通信失败：" + error_of(response)->message);
-        print_failure(*error_of(response));
-        return exit_code(error_of(response)->code);
+        const Error& error = *error_of(response);
+        log_error("Cli", "命令 " + operation + " 通信失败：" + error.message);
+        print_failure(error);
+
+        // 超时 ≠ 没成功：服务端可能还在下载、甚至已经入库。必须说清楚，
+        // 否则用户会以为文件没进去，然后重复上传。
+        if (error.code == ErrorCode::ServiceOperationFailed &&
+            error.message.find("超时") != std::string::npos) {
+            std::fprintf(stderr,
+                         "提示：等待服务响应超时。服务端可能仍在处理，稍后用 file list 确认；\n"
+                         "      也可以查看 log/fmt.log。\n");
+        }
+        return exit_code(error.code);
     }
 
     const ipc::Response& value = std::get<ipc::Response>(response);

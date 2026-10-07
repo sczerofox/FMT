@@ -119,11 +119,11 @@ FMT_TEST(File, 暂存失败会清理临时文件) {
     FMT_CHECK(!fmt::ok(missing));
     FMT_CHECK(fmt::error_of(missing)->code == fmt::ErrorCode::FileNotFound);
 
-    // https 不支持（V1 不引入 OpenSSL）
-    const auto secure = fmt::prepare_upload(*f.paths, "https://example.com/a.bin", "", kSizeLimit,
+    // 只支持 http/https：别的协议直接拒绝（这里不碰网络）
+    const auto scheme = fmt::prepare_upload(*f.paths, "ftp://example.com/a.bin", "", kSizeLimit,
                                             nullptr);
-    FMT_CHECK(!fmt::ok(secure));
-    FMT_CHECK(fmt::error_of(secure)->code == fmt::ErrorCode::UrlInvalid);
+    FMT_CHECK(!fmt::ok(scheme));
+    FMT_CHECK(fmt::error_of(scheme)->code == fmt::ErrorCode::UrlInvalid);
 
     // 超过大小上限：临时文件必须被删掉，temp/ 里不留垃圾
     const auto too_large = fmt::prepare_upload(*f.paths, fmt::path_to_utf8(f.source), "",
