@@ -12,6 +12,7 @@ add_executable(fmt_tests
     storage_test.cpp
     config_test.cpp
     app_test.cpp
+    ipc_test.cpp
 )
 
 target_link_libraries(fmt_tests

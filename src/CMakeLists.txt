@@ -16,5 +16,8 @@ add_subdirectory(common)
 add_subdirectory(storage)
 add_subdirectory(config)
 
+# CLI 与服务之间的命令通道
+add_subdirectory(ipc)
+
 # 路径计算与应用生命周期
 add_subdirectory(core)
