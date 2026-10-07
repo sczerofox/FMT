@@ -176,6 +176,12 @@ FMT/
 └── docs/
 ```
 
+> **阶段 4 的实况**：`bucket/` 已落地（含**桶级回收站**：`list_trashed` / `restore` /
+> `get_trashed` / `purge` + `trash/<user>/.original`，提交 c2d545d 与 4fee290），
+> `file/` / `share/` / `trash/` 三个目录是
+> **计划位置**，尚未创建——阶段 4 的桶级收发都写在 `bucket/` 与 `service/commands.cpp` 里，
+> `trash/` 模块留给阶段 5/7 的**文件级**条目。
+
 ---
 
 # 5. 运行目录
@@ -185,8 +191,12 @@ FMT/
 ```text
 <数据根>/
 ├── fmt.exe
-├── repository/
-├── trash/
+├── repository/               repository/<user>/<bucket>/YYYY/MM/DD/<file_name>
+├── trash/                    回收站：桶级条目 + 文件级条目，两层分开（提交 4fee290）
+│                             trash/<user>/<bucket>_<YYYYMMDDHHMMSS>/  ← 桶删除的落点（顶层）
+│                             trash/<user>/.original                 ← 桶级身份唯一权威
+│                             trash/<user>/.files/<bucket>/YYYY/MM/DD/<file_name>
+│                                                                     ← 文件级条目（阶段 5 起）
 ├── config/
 │   ├── config.json
 │   └── server.json
@@ -201,6 +211,14 @@ FMT/
 └── temp/
     └── fmt-elev-<父进程 pid>.json    提权结果文件，父进程读完立刻删除
 ```
+
+> **`trash/<用户>/` 的顶层只放桶级条目（提交 `4fee290`）**：桶级条目是
+> `trash/<user>/<桶名>_<时间戳>/` 这样的目录，文件级条目收在点开头的
+> `trash/<user>/.files/<bucket>/YYYY/MM/DD/` 下（第 21 节）。
+> 分成两层是**必须的**：阶段 5 落地 `file delete` 之后，文件级条目如果还直接落在
+> `trash/<user>/<bucket>/`，桶级扫描就会把这个目录误当成「孤儿桶条目」列出来
+> （阶段 5 尚未落地，这里先把落点定死）。点开头的 `.files` 与 `.original` 都会被
+> 桶级扫描跳过，扫描另有一道 `<名字>_<14 位时间戳>` 形状检查（第 53.1 节）。
 
 数据根（`FMT_ROOT`）**由 CLI 声明**：CLI 连接服务时用 `hello` 帧带上自己 exe 所在目录
 （`GetModuleFileNameW` 取父目录），服务把该目录作为「当前数据根」。切换数据根时**不删除旧根数据**，
@@ -649,7 +667,8 @@ V1 暂定：
   "file_type": "text",
   "size": 1024,
   "md5": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
-  "is_trash": false
+  "is_trash": false,
+  "trash_reason": ""
 }
 ```
 
@@ -666,6 +685,21 @@ V1 暂定：
 | `size`      | integer | 文件大小，字节    |
 | `md5`       | string  | MD5        |
 | `is_trash`  | boolean | 是否处于 Trash |
+| `trash_reason` | string | **为什么在回收站**：`"bucket"`（桶被删）/ `"file"`（文件自己删的，阶段 5 起）；不在回收站时为空串 |
+
+**`trash_reason` 的阶段 4 口径（commit c2d545d，已实现）**：`is_trash = true` 时**必须同时写**
+`trash_reason`。两条规则对着写：
+
+```text
+桶删除  只给 is_trash 为 false 的记录置位，同时写 trash_reason = "bucket"
+        （已经因为自己删过而在回收站里的文件不动，也不算进 files_affected）
+桶回退  只翻回 trash_reason == "bucket" 的那些，并把 trash_reason 清空；
+        用户单独删过的文件（"file"）保持不动
+```
+
+**为什么必须区分**：没有它，回退一个桶就会把用户自己删过的文件一起放出来——桶级删除与
+文件级删除都只写一个 `is_trash` 布尔值，回退时无法判断「这条记录该不该跟着桶一起回去」。
+阶段 5 落地 `file delete`（`trash_reason = "file"`）时复用同一套判定，不许另起一套。
 
 ---
 
@@ -723,6 +757,13 @@ max_download_count = 20
 
 # 17. Trash 数据结构
 
+> **阶段 4 口径更正（commit c2d545d，已实现）**：`data/trash.json` 只服务**文件级**条目
+> （阶段 5 起）；**Bucket 级记录不再写进 `trash.json`**，旧的 `type = "bucket"` 记录**作废**。
+> 桶级身份记录改由回收站目录里的 `trash/<用户>/.original` 承载——它跟着数据走，
+> `data/*.json` 丢了原名也还在。
+
+## 17.1 文件级条目（阶段 5 起，写在 data/trash.json）
+
 V1 文件 Trash 记录暂定：
 
 ```json
@@ -730,34 +771,58 @@ V1 文件 Trash 记录暂定：
   "file_id": "fmt-20261005-0",
   "file_name": "test.txt",
   "original_path": "repository/小谷/工作/2026/10/05/test.txt",
-  "trash_path": "trash/小谷/工作/2026/10/05/test.txt",
+  "trash_path": "trash/小谷/.files/工作/2026/10/05/test.txt",
   "deleted_at": "2026-10-05T20:00:00",
   "type": "file"
 }
 ```
 
-Bucket Trash 后续可以扩展：
+> `trash_path` 里的 `.files` 是提交 `4fee290` 定下的落点
+> （`trash/<用户>/.files/<桶>/YYYY/MM/DD/<文件>`，见第 21 节）：`trash/<用户>/` 的顶层
+> 留给桶级条目，文件级条目收在点开头的 `.files/` 下，桶级扫描才不会把文件级的桶目录
+> 当成孤儿桶条目（第 53.1 节）。原来写成 `trash/小谷/工作/2026/10/05/test.txt` 的口径已作废。
 
-```text
-type = bucket
-```
+集合字段名固定 `trash.json -> trash`（第 13.1 节），记录**不放**绝对路径。
+文件级条目的 list / get / restore / delete 与永久删除属阶段 5/7（第 53～55、59 节）；
+**桶级的 list / get / restore / delete 已经做完**（第 52、53.3、56、60 节）。
 
-Bucket 不生成 `file_id`。
+## 17.2 桶级条目：`trash/<用户>/.original`（阶段 4 已落地并冻结）
 
-**阶段 4 已落地**（实现细节见 `FMT 技术文档.md` 第 7.3 节，布局见 `FMT 项目架构.md` 第 5.4 节）：
-Bucket 级记录**没有 `file_id`**，用 `user` + `bucket` 标识，`original_path` / `trash_path`
-一律**相对数据根、正斜杠**：
+Bucket 不生成 `file_id`；桶级记录**没有 `file_id`**，用原桶名标识。**唯一权威**是回收站
+目录下的 `.original`（实现细节见 `FMT 技术文档.md` 第 7.3 节，布局见
+`FMT 项目架构.md` 第 5.4.1 节，代码常量 `kOriginalIndexName = ".original"`）：
 
 ```json
-{ "type":"bucket", "user":"user", "bucket":"工作",
-  "original_path":"repository/user/工作", "trash_path":"trash/user/工作",
-  "deleted_at":"2026-10-08T01:23:45" }
+{
+  "version": 1,
+  "buckets": [
+    { "trashed": "lazy-fox_20261008012233",
+      "original": "lazy-fox",
+      "deleted_at": "2026-10-08T01:22:33" }
+  ]
+}
 ```
 
-- 删除 Bucket 时在 `trash` 数组**末尾追加一条**这样的记录；
-- 回收站里已经有同名目录时**不覆盖**：新来的目录名加时间戳后缀
-  （`工作_20261008012345`），`trash_path` 记**实际**落点；同一个名字删两次就是
-  两条记录、两份数据都在磁盘上（见第 30 节）；
+| 字段           | 类型     | 说明                        |
+| ------------ | ------ | ------------------------- |
+| `version`    | integer | 固定 `1`；不认识就拒绝（第 13.2 节）   |
+| `buckets`    | array  | 桶级条目的唯一权威表                |
+| `trashed`    | string | 回收站里的目录名（**带删除时间戳**）       |
+| `original`   | string | 原桶名；为空表示没有身份记录，此时拒绝回退     |
+| `deleted_at` | string | 本地时间 ISO 8601（无时区）        |
+
+规则：
+
+- 删除 Bucket 时目录名**一律**是 `<原桶名>_<YYYYMMDDHHMMSS>`（例如
+  `lazy-fox_20261008012233`），**无论有没有重名**；同一秒内删两次、或目录恰好同名时
+  再加序号 `<原名>_<时间戳>_2`。因此同一个名字删多少次都不会互相覆盖
+  （旧口径「用原名、重名才加时间戳」**作废**：那样两条条目会抢同一个回退位置，
+  回退时必然撞车——见第 30 节）。
+- 目录搬成功后，在 `buckets` 数组**末尾追加一条**这样的记录；
+- **不靠剥离时间戳反推原名**（`x_2026...` 也可能本来就叫这个），一律查这张表；
+- **`.original` 损坏时 `bucket delete` 直接拒绝**（`FMT-006 JsonParseError`），不搬动目录——
+  否则会留下一个「没有身份记录、原名永久丢失」的条目；索引**写不进去**时目录**搬回原位**，
+  回退方向同理（索引没减掉就把目录退回去）。**磁盘与索引不允许不一致。**
 - 记录里**不放** `file_id`，也不放绝对路径。
 
 ---
@@ -851,21 +916,61 @@ repository/
 
 # 21. Trash 路径
 
-Trash 保持原有层级。
+Trash 保持原有层级（**桶以下**的 `YYYY/MM/DD/<文件名>` 一层不少，方便恢复）。
 
-例如：
+例如（**文件级条目**，阶段 5 起；`PathManager::trash_file`）：
 
 ```text
 trash/
 └── 小谷/
-    └── 工作/
-        └── 2026/
-            └── 10/
-                └── 05/
-                    └── test.txt
+    └── .files/                  ← 文件级条目的容器，点开头（提交 4fee290）
+        └── 工作/
+            └── 2026/
+                └── 10/
+                    └── 05/
+                        └── test.txt
 ```
 
+> **落点在提交 `4fee290` 挪了一层**：原口径是 `trash/<user>/<bucket>/YYYY/MM/DD/<file>`，
+> 现在是 **`trash/<user>/.files/<bucket>/YYYY/MM/DD/<file>`**（原口径已作废）。
+> 原因：`trash/<user>/` 的**顶层留给桶级条目**（`trash/<user>/<桶名>_<时间戳>/`）。
+> 不分开的话，阶段 5 落地文件级删除后，桶级扫描会把 `trash/<user>/<bucket>/` 这个目录
+> 误当成「孤儿桶条目」列出来（第 53.1 节的扫描就是这么扫的）。`.original`（桶级索引）
+> 同样是点开头，两者一起被扫描跳过。
+>
+> 实现：`PathManager::build()` 增加可选参数 `inner`（插在 user 与 bucket 之间，默认空），
+> `trash_file()` 传 `L".files"`；`repository_file()` 不传，仓库路径（第 20 节）不变。
+>
+> ```cpp
+> // include/fmt/core/path_manager.hpp（提交 4fee290）
+> // base/user[/inner]/bucket/YYYY/MM/DD/file_name
+> Result<std::filesystem::path> build(std::filesystem::path base, std::string_view user,
+>                                     std::string_view bucket, const DateParts& date,
+>                                     std::string_view file_name,
+>                                     std::wstring_view inner = {}) const;
+>
+> // src/core/path_manager.cpp
+> Result<std::filesystem::path> PathManager::trash_file(
+>         std::string_view user, std::string_view bucket, const DateParts& date,
+>         std::string_view file_name) const {
+>     return build(trash(), user, bucket, date, file_name, L".files");
+> }
+> ```
+>
+> 用例 `PathManager.回收站保持原层级` 断言
+> `D:/FMT/trash/小谷/.files/工作/2026/10/05/小谷姐姐麻辣烫.jpg`。
+
 这样可以方便恢复。
+
+**桶级条目是另一回事（阶段 4 已落地）**：删掉一个 Bucket 时整个桶目录搬成
+
+```text
+trash/<用户>/<桶名>_<YYYYMMDDHHMMSS>/      同一秒再删一次就加序号 _2、_3……
+trash/<用户>/.original                     桶级身份记录（原名 / 回收站名 / 删除时间）
+```
+
+即**桶这一层就是桶级条目的落点**，目录名一律带删除时间戳（不再「重名才加」）；
+文件名与原名一律查 `.original`，不靠剥离时间戳反推（第 17.2、30、56 节）。
 
 ---
 
@@ -1083,8 +1188,9 @@ delete
 Bucket 名称校验
 Bucket 是否存在
 当前 Bucket
-Bucket 删除
-Bucket 恢复
+Bucket 删除（移入回收站，目录名一律带时间戳）
+Bucket 回收站列表 / 回退（桶级，阶段 4 已落地）
+Bucket 回收站条目详情 / 永久删除（桶级，提交 4fee290 已落地）
 ```
 
 ---
@@ -1094,13 +1200,41 @@ Bucket **就是 `repository/<user>/<bucket>/` 这个目录本身**，没有独�
 `current_bucket` 存在 `config.json` 里。真实接口：
 
 ```cpp
+// 回收站里桶级记录的权威文件名（位于 trash/<user>/ 下）
+inline constexpr const char* kOriginalIndexName = ".original";
+
 struct BucketInfo { std::string name; bool is_current; };
 
-// 删除结果：删到哪儿去了、影响了几个文件、删的是不是当前 Bucket
+// 删除结果：删到哪儿去了（回收站里的名字）、影响了几个文件、删的是不是当前 Bucket
 struct BucketRemoval {
     std::filesystem::path moved_to;
+    std::string trashed_name;   // trash/<user>/<trashed_name>
     std::size_t files_affected;
     bool was_current;
+};
+
+// 回收站里的一个桶条目：directory_present=false 表示索引里有、目录没了（只报告，不擅自清理）
+struct TrashBucket {
+    std::string trashed_name;
+    std::string original_name;      // 索引里没有则为空，此时拒绝回退
+    std::string deleted_at;
+    bool directory_present;
+};
+
+// 单个回收站条目的详情（trash get 用，提交 4fee290）
+struct TrashBucketDetail {
+    TrashBucket bucket;
+    std::filesystem::path directory;
+    std::size_t file_count;          // 目录里的实际文件数
+    std::uintmax_t byte_count;       // 总字节数
+};
+
+// 永久删除之后的结果（trash delete 用，提交 4fee290）
+struct TrashPurge {
+    std::string trashed_name;
+    std::string original_name;
+    std::size_t removed_files;       // 真正删掉的磁盘文件数（删前统计）
+    std::size_t removed_records;     // file.json 里清掉的记录数
 };
 
 class BucketService {
@@ -1111,9 +1245,22 @@ public:
     Result<std::vector<BucketInfo>> list();
     Result<BucketInfo> get(std::string_view name);
     Status use(std::string_view name);
-    Result<BucketRemoval> remove(std::string_view name);      // 注意：不是 Status
+    Result<BucketRemoval> remove(std::string_view name);        // 注意：不是 Status
+    Result<std::vector<TrashBucket>> list_trashed();            // 桶级回收站列表
+    Result<TrashBucket> restore(std::string_view identifier);   // 桶级回退（整单判定）
+    Result<TrashBucketDetail> get_trashed(std::string_view identifier);  // 条目详情（4fee290）
+    Result<TrashPurge> purge(std::string_view identifier);      // 永久删除（4fee290）
     std::filesystem::path directory_of(std::string_view name) const;
     Status refresh_current_bucket();
+
+private:
+    // 在索引里定位条目：先按回收站里的名字精确匹配，再按原桶名（必须唯一）。
+    // **找不到不算错**（found=false）——孤儿目录要能走到「按目录名处理」那条路。
+    struct TrashLookup { bool found; std::size_t index; };
+    Result<TrashLookup> find_trashed(const std::vector<TrashBucket>& entries,
+                                     std::string_view identifier) const;
+    // 永久删除时清 file.json 记录：只清 trash_reason == "bucket" 的那些
+    Status remove_bucket_file_records(std::string_view bucket_name, std::size_t* removed);
 };
 ```
 
@@ -1125,11 +1272,26 @@ create    名称校验（失败 FMT-202）→ 已存在则 FMT-201 → 建 repos
 list      列出 user_root 下的目录，按名称排序，标出 current_bucket
 get       不存在则 FMT-200
 use       不存在则 FMT-200 → 只改 current_bucket 并保存，不动 Bucket 目录
-remove    不存在则 FMT-200 → 整个目录移到 trash/<user>/<bucket>/ → 该桶 file.json 记录
-          置 is_trash=true → 追加一条 Bucket 级 trash.json 记录 → 若删的是当前 Bucket
-          则置空、绝不自动切换；重名不覆盖（时间戳后缀）
+remove    不存在则 FMT-200 → 整个目录移到 trash/<user>/<bucket>_<时间戳>/
+          → 在 .original 追加一条桶级记录 → 该桶 file.json 记录置 is_trash=true 且
+          trash_reason="bucket" → 若删的是当前 Bucket 则置空、绝不自动切换
+list_trashed  索引 + 目录扫描：索引有目录没了标 present=false；目录有索引没有则 original
+              留空照样列出（都不擅自清理）。**扫描形状检查（4fee290）**：跳过点开头的
+              条目，且只认 <名字>_<14 位时间戳>（可带 _<1-3 位序号>）形状的目录
+restore   整单判定：目标 Bucket 已存在则 FMT-401（不覆盖/不改名/不部分恢复）；
+          否则整个目录一次 rename 搬回（见第 56 节）
+get_trashed  单个条目详情（4fee290）：定位与 restore 完全一致（共用 find_trashed）；
+             索引有目录没了不报错，返回 present=false；孤儿目录可按目录名查到；
+             两者都没有则 FMT-400 TrashEntryNotFound。**只有单条查询遍历目录**数文件数与
+             字节数，trash list 不做（见第 53.3 节）
+purge     永久删除（4fee290）：① remove_all 回收站目录 ② 只清 file.json 里
+          trash_reason=="bucket" 的记录 ③ 摘 .original 那条。顺序刻意（失败可重来）；
+          幽灵条目也能删。服务端要求请求带 force==true（见第 59、60 节）
+find_trashed  私有，restore / get_trashed / purge 共用同一套定位：回收站名字优先，
+              再用原桶名且必须唯一（多条 → FMT-001 并列候选）；**找不到不算错**
 refresh    current_bucket 非空但目录不存在时置空并保存；绝不自动选择别的 Bucket
-日志       模块名统一 `Bucket`（INFO：创建 / 切换 / 删除；WARN：当前 Bucket 失效置空）
+日志       模块名统一 `Bucket`（INFO：创建 / 切换 / 删除 / 回退；WARN：当前 Bucket 失效置空）；
+           永久删除记在 `Trash` 模块下（INFO：条目名 + 文件数 + 记录数，4fee290）
 ```
 
 `remove` 返回结构化结果而不是 `Status`，是因为调用方（管道与 HTTP 响应）必须如实回报
@@ -1239,24 +1401,43 @@ current_bucket = ""
 
 不会自动切换到其他 Bucket。
 
-**阶段 4 实现口径（已落地）**。删除是**移入回收站**，不是丢弃数据；顺序与上面的流程图一致：
+**阶段 4 实现口径（已落地；回收站形状见 commit c2d545d）**。删除是**移入回收站**，
+不是丢弃数据；顺序与上面的流程图一致（顺序里**索引先读、目录后搬、索引最后写**是有意的）：
 
 ```text
 1. current_user 为空 → FMT-604；名称为空 → FMT-001；Bucket 不存在 → FMT-200
-2. 记下 was_current = (config.current_bucket == name)
-3. 移动数据：repository/<user>/<bucket>/ → trash/<user>/<bucket>/
-   回收站里已有同名目录时**不覆盖**，新目录名加时间戳后缀
-   （`工作_20261008012345`），trash_path 记实际落点
-4. 相关文件 is_trash = true：只改 file.json 里 **user 与 bucket 都匹配**、且原本为 false 的
-   记录，别的 Bucket 的记录一律不动（file.json 缺失时视为 0 个文件，不报错）
-5. 追加一条 **Bucket 级** trash.json 记录（type=bucket，无 file_id，见第 17 节）
-6. 若 was_current：current_bucket 置空并保存；**不自动切换到别的 Bucket**
-7. 返回 BucketRemoval{moved_to, files_affected, was_current}——调用方据此如实回报，
-   管道与 HTTP 的 data 字段见 `FMT 技术文档.md` 第 12.3.2 节
+2. 先读 trash/<user>/.original：**读不出来就到此为止**（FMT-006 JsonParseError），
+   一个字都不搬——否则会留下一个「没有身份记录、原名永久丢失」的条目
+3. 记下 was_current = (config.current_bucket == name)
+4. 目录名**一律**带删除时间戳：<原桶名>_<YYYYMMDDHHMMSS>（例如 lazy-fox_20261008012233），
+   无论有没有重名；trash/<user>/ 下已有同名就再加序号 _2、_3……，绝不覆盖已有条目。
+   把整个目录 rename 过去：repository/<user>/<bucket>/ → trash/<user>/<bucket>_<时间戳>/
+5. 在 .original 的 buckets 数组末尾追加一条记录（trashed / original / deleted_at，
+   见第 17.2 节）；**写不进去就把目录搬回原位**并报错——磁盘与索引不允许不一致
+6. 相关文件 trash_reason = "bucket"：只改 file.json 里 **user 与 bucket 都匹配**、
+   且 is_trash 原本为 false 的记录（同时置 is_trash=true）；别的 Bucket 的记录、
+   以及用户自己删过的文件（trash_reason="file"）一律不动
+   （file.json 缺失时视为 0 个文件，不报错）
+7. 若 was_current：current_bucket 置空并保存；**不自动切换到别的 Bucket**
+8. 返回 BucketRemoval{moved_to, trashed_name, files_affected, was_current}——调用方据此
+   如实回报，管道与 HTTP 的 data 字段见 `FMT 技术文档.md` 第 12.3.2 节
 ```
 
+**为什么目录名一律带时间戳**（旧口径是「用原名、重名才加」）：同一个桶删两次时，两条回收站
+条目如果都记着「原名 = lazy-fox」，回退就必然撞车。用户提的完整场景：
+
+```text
+删 lazy-fox（空桶）        → lazy-fox_20261008012233
+再建 lazy-fox、放文件、再删 → lazy-fox_20261008020304
+回退第一个（空桶）          → repository/user/lazy-fox 重建，往里放新文件
+回退第二个（带文件的）      → 目标 lazy-fox 已存在 → FMT-401 整单拒绝，不碰第一个
+```
+
+一律带时间戳 + `.original` 记原名，两件事各自独立，谁都不会被覆盖，也不会认错身份。
+
 `FMT-203 BucketInUse`（「仍被引用，不能删除」）在当前实现里**不会由 `bucket delete` 返回**：
-V1 允许删除仍有文件的 Bucket（数据一并移入回收站，文件记录标记 `is_trash`）。该编号保留给
+V1 允许删除仍有文件的 Bucket（数据一并移入回收站，文件记录标记 `is_trash` 并写
+`trash_reason="bucket"`）。该编号保留给
 以后「有 Share 引用等场景」的语义，不改变已有含义。
 
 ---
@@ -1856,34 +2037,145 @@ trash restore
 trash delete
 ```
 
+**阶段状态（commit c2d545d 起，commit 4fee290 收尾）**：`trash` 组原本整组排在阶段 7。
+现在**桶级部分全部完成**：
+
+```text
+trash list      桶级已落地（c2d545d）：列回收站里的桶条目 + 目录异常状态
+trash get       桶级已落地（4fee290）：单个条目的详情：原桶名、删除时间、目录、文件数、占用
+trash restore   桶级已落地（c2d545d）：回退一个被删除的 Bucket，整单判定（第 56 节）
+trash delete    桶级已落地（4fee290）：**永久删除、不可恢复**，需要显式确认（第 59、60 节）
+```
+
+> 上面这张表原来的写法是「`trash get` 未实现 → FMT-602」「`trash delete` 未实现 → FMT-602
+> （阶段 7）」，**该口径已作废**（提交 `4fee290`）。桶级四条命令都能成功执行，不再返回
+> `FMT-602`；命令总览里 `(trash) list get restore delete` 已完整落在「可用命令」组，
+> 「服务端尚未实现」组里**不再有 trash 行**（只剩 `file` / `share`，见第 68 节）。
+
+仍未实现的是**文件级**条目（`file delete` 产生的）与它们对应的 list / get / restore / delete，
+属阶段 5/7：`trash list` 要同时列文件级条目、`trash get` / `trash restore <file_id>` /
+`trash delete <id>`（文件级口径）都在阶段 7。桶级与文件级共用同一个命令名，
+靠参数形态区分（桶名 vs `file_id`）。
+
+**服务端实现位置**：桶级四条命令都在 `src/service/commands.cpp` 的 `trash_command()` 里，
+业务落在 `BucketService`（`list_trashed()` / `restore()` / `get_trashed()` / `purge()`），
+定位三者共用同一个私有 `find_trashed()`（第 27、56.1 节）。
+
 ---
 
 # 53. Trash List
 
-命令：
+## 53.1 桶级条目（阶段 4 已落地）
+
+命令与请求：
 
 ```text
-trash list
+fmt> trash list
+op = "trash.list"（无参数）
+HTTP：GET /api/trash
 ```
 
-只显示：
+响应 `data`（与源码一致）：
+
+```json
+{ "deleted_buckets": [
+    { "trashed": "lazy-fox_20261008012233", "original": "lazy-fox",
+      "deleted_at": "2026-10-08T01:22:33", "present": true } ],
+  "count": 1 }
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `trashed` | 回收站里的目录名（带删除时间戳），排序按它 |
+| `original` | 原桶名；**空**表示 `.original` 里没有这条记录 |
+| `deleted_at` | 删除时间（本地时间 ISO 8601） |
+| `present` | 目录是否还在；`false` = 索引里有、目录没了 |
+
+CLI 打印（`src/cli/cli.cpp`）：
 
 ```text
-is_trash = true
+fmt> trash list
+  lazy-fox_20261008012233  ->  lazy-fox
+共 1 个已删除的 Bucket
 ```
 
-对应对象。
+三条边界**如实报告、不擅自清理**：
 
-可以区分：
+- 索引里有、目录没了 → 该条标 `present: false`，CLI 在行尾加 `(目录已不存在)`；
+- 目录在回收站里、`.original` 里没有记录（手工拷进来的、旧版本留下的）→ 照实列出，
+  `original` 为空，CLI 显示 `(原名称未记录，无法回退)`；回退时按第 56.1 节拒绝，
+  **不靠剥离时间戳猜原名**。
+- **扫描形状检查（提交 `4fee290`）**：扫 `trash/<user>/` 时
+  ① 跳过点开头的条目（`.files` / `.original`，第 21 节）；
+  ② **只认符合 `<名字>_<14 位时间戳>` 或 `<名字>_<14 位时间戳>_<1-3 位序号>` 形状的目录**。
+  别的目录（手工塞进来的、别的东西）不会被误当成桶级条目。用例
+  `Bucket.回收站扫描只认桶级条目` 覆盖这一点，`Bucket.条目详情与永久删除` 覆盖详情与永久删除。
+
+## 53.2 文件级条目（阶段 5 起）
+
+只显示 `is_trash = true` 的记录，可以区分 `file` / `bucket` 两类；文件级条目的字段
+见第 17.1 节。阶段 4 落了**桶级全部四条命令**（第 52 节），文件级仍属阶段 5/7。
+
+## 53.3 单条条目详情：`trash get`（桶级，提交 4fee290 已落地）
+
+命令与请求：
 
 ```text
-file
-bucket
+fmt> trash get lazy-fox_20261008012233
+op = "trash.get"，args.argv = ["lazy-fox_20261008012233"]
+HTTP：GET /api/trash/<名字>（路径参数百分号解码）
 ```
+
+**定位方式与 `trash restore` 完全一致**（第 56.1 节）：先按回收站里的名字精确匹配；
+再按原桶名，且**原桶名必须唯一**，同名多条 → `FMT-001 InvalidArgument` 并**并列列出候选**
+（顿号分隔）。**索引里有、目录没了不报错**，返回 `present: false`（如实报告，不擅自清理）；
+**孤儿目录**（目录在、索引里没记录）也能按目录名查到（`original` 为空、`present: true`）；
+两者都没有 → `FMT-400 TrashEntryNotFound`（退出码 3）。
+
+响应 `data`：
+
+```json
+{ "trashed": "lazy-fox_20261008012233", "original": "lazy-fox",
+  "deleted_at": "2026-10-08T01:22:33", "present": true,
+  "path": "trash/user/lazy-fox_20261008012233", "files": 2, "bytes": 1228 }
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `trashed` | 回收站里的目录名 |
+| `original` | 原桶名；空 = 索引里没有这条记录（孤儿目录） |
+| `deleted_at` | 删除时间；孤儿目录为空 |
+| `present` | 目录是否还在 |
+| `path` | 目录相对数据根的路径，**正斜杠** |
+| `files` | 目录里的**实际文件数**（递归数普通文件） |
+| `bytes` | 目录占用的总字节数 |
+
+> **只有单条查询会遍历目录**，`trash list` 不做这件事——列表可能很长，逐个目录数文件
+> 会把一次列表拖成一次全盘扫描。
+
+CLI 输出（`src/cli/cli.cpp`）：
+
+```text
+fmt> trash get lazy-fox_20261008012233
+回收站条目：lazy-fox_20261008012233
+原 Bucket：lazy-fox
+删除时间：2026-10-08T01:22:33
+目录：trash/user/lazy-fox_20261008012233
+状态：在
+文件数：2
+占用：1.2 KB
+执行成功...
+错误码：0
+```
+
+`状态` 只有「在」与「目录已不存在」两种；原名为空时 `原 Bucket` 打印「（未记录，无法回退）」。
 
 ---
 
 # 54. Trash Restore
+
+> **适用范围**：本节是**文件级恢复**（`trash restore <file_id>`，阶段 7）的流程。
+> **桶级回退不适用本节的逐个文件口径**——它是整单判定，见第 56 节。
 
 恢复前：
 
@@ -1913,6 +2205,10 @@ is_trash = false
 
 # 55. 冲突恢复
 
+> **适用范围（阶段 4 起明确）**：本节规则属于**文件级恢复**（`trash restore <file_id>`，
+> 阶段 7）。**桶级回退不走这里**——桶级是整单判定（第 56 节）：目标 Bucket 已存在就整单
+> 拒绝，不覆盖、不改名，也**不**把不冲突的文件先塞进去。
+
 如果目标位置已有同名正常文件：
 
 ```text
@@ -1940,33 +2236,108 @@ metadata：
 
 ---
 
-# 56. Bucket 部分恢复
+# 56. Bucket 回退（原「Bucket 部分恢复」口径已作废）
 
-Bucket 恢复：
+> **口径更正（阶段 4 已实现，commit c2d545d）**：本节旧口径是「Bucket 恢复 = 检查 Bucket →
+> 检查内部文件 → 逐个判断（a.txt 恢复、b.txt 恢复、c.txt 冲突留 Trash），最终 Bucket 可以
+> 处于『部分恢复』状态」。**桶级回退不再这么做**：它是**整单判定**——要么整个桶一次搬回，
+> 要么整单拒绝，**不存在「部分恢复」的桶**。
+> 「部分恢复」的归属改为**文件级恢复**（`trash restore <file_id>`，阶段 7）；
+> 第 54、55 节的「逐个文件判断、冲突不覆盖不改名、留在 Trash」在那里**仍然适用**。
 
-```text
-检查 Bucket
- ↓
-检查内部文件
- ↓
-逐个判断
-```
-
-例如：
+旧口径（**作废，仅作对照**）：
 
 ```text
 a.txt → 无冲突 → 恢复
 b.txt → 无冲突 → 恢复
 c.txt → 冲突 → 保留 Trash
+最终 Bucket 可以处于「部分恢复」状态          ← 阶段 4 起不再有这种状态
 ```
 
-最终 Bucket 可以处于：
+## 56.1 桶级回退：整单判定（阶段 4 已落地）
+
+命令：
 
 ```text
-部分恢复
+fmt> trash restore <名称>
+op = "trash.restore"，args.argv = ["<名称>"]
+HTTP：POST /api/trash/<名字>/restore（路径参数百分号解码）
 ```
 
-状态。
+`<名称>` 的**定位方式**（先按回收站名精确匹配、再按原名且必须唯一）：
+
+```text
+1. 先按**回收站里的名字**精确匹配 .original 的 trashed 字段
+   （例如 lazy-fox_20261008012233）
+2. 再按**原桶名**匹配 original 字段；此时同名多条**必须唯一**，
+   否则 FMT-001（InvalidArgument，退出码 2）并列出候选的 trashed 名：
+   「有多个同名 Bucket 被删除，请用回收站里的名字指定：lazy-fox_20261008012233、…」
+3. 都没匹配上：
+   - 回收站里有该目录但 .original 里没有它的记录 → FMT-001
+     「回收站条目缺少原桶名记录（.original），无法回退：<名称>」——**不猜名字**
+   - 否则 → FMT-400 TrashEntryNotFound（退出码 3）
+```
+
+> **`trash get` / `trash delete` 复用同一套定位（提交 `4fee290`）**：三者共用
+> `BucketService::find_trashed()`——回收站名字优先、原桶名必须唯一（多条 → `FMT-001`
+> 并列候选）。区别只在匹配之后：`restore` 搬目录（本节），`get` 报详情（第 53.3 节），
+> `delete` 永久删除（第 60 节）。**`get` / `delete` 都允许「索引里有、目录没了」的条目**：
+> `get` 返回 `present: false`（不报错），`delete` 照样能把它清掉；
+> **孤儿目录**（索引里没有）两者都按目录名处理——`get` 能查到（`original` 为空）、
+> `delete` 能删掉，只有 `restore` 会拒绝（原名未知，不猜）。
+
+判定与执行：
+
+```text
+目标 repository/<user>/<原名> 已存在？
+  ├─ 是 → **整单拒绝**：FMT-401 RestoreConflict（退出码 4）
+  │        提示「回退失败：Bucket 已存在：<原名>」
+  │        不覆盖、不改名、不把不冲突的文件先塞进去
+  └─ 否 → 整个目录一次 std::filesystem::rename 搬回
+           （整棵树一次搬走，所以**不存在文件级冲突**）
+```
+
+完整顺序（与删除方向对称：**索引最后减，减不掉就把目录退回去**）：
+
+```text
+1. current_user 为空 → FMT-604；名称为空 → FMT-001
+2. 读 trash/<user>/.original：损坏 → FMT-006 JsonParseError，停止
+3. 按上面的定位方式找到唯一一条；original 为空 → FMT-001（缺原桶名记录）
+4. 回收站目录不存在 → FMT-400「回收站目录已不存在：<trashed>」
+   （trash list 里这一条同时标 present=false）
+5. 目标 repository/<user>/<原名> 已存在 → FMT-401（整单拒绝，到此为止）
+6. 整个目录 rename 回 repository/<user>/<原名>（一次搬完）
+7. 从 .original 里**删掉这一条**并落盘；**写不进去就把目录 rename 回收站**并报错
+8. 只把 trash_reason == "bucket" 的记录翻回正常：is_trash=false、trash_reason=""；
+   用户自己单独删过的文件（trash_reason="file"）保持不动
+9. 返回 TrashBucket{trashed_name, original_name, deleted_at, directory_present=true}
+```
+
+响应 `data`（与源码一致）：
+
+```json
+{ "trashed": "lazy-fox_20261008012233", "original": "lazy-fox",
+  "restored_to": "repository/user/lazy-fox", "message": "Bucket 已回退：lazy-fox" }
+```
+
+## 56.2 「部分恢复」属于文件级（阶段 7）
+
+文件级恢复（`trash restore <file_id>`）仍然逐个文件判断：无冲突的恢复、冲突的留在 Trash
+（不覆盖、不改名，见第 54、55 节）。**如果用户想要的是「桶里的文件能救一个是一个」，
+那要走文件级条目，不是 `trash restore <桶名>`**——桶级命令不做部分恢复。
+
+> **文件级条目的落点已在提交 `4fee290` 定下来**：
+> `trash/<user>/.files/<bucket>/YYYY/MM/DD/<file_name>`（`PathManager::trash_file`，第 21 节），
+> 而桶级删除的落点是 `trash/<user>/<bucket>_<YYYYMMDDHHMMSS>/`。
+> **两者不再共用 `trash/<user>/` 这一层**——原口径「文件级条目直接落在
+> `trash/<user>/<bucket>/`、桶级扫描会跳过 `.` 开头的条目但**不会跳过**
+> `trash/<user>/<bucket>/` 这种目录」**已作废**。那正是 `.files/` 这一层要解决的问题：
+> 文件级的桶目录如果和桶级条目同层，阶段 5 落地 `file delete` 之后，`trash list` 的桶级扫描
+> 就会把 `trash/<user>/<bucket>/` 误当成「孤儿桶条目」列出来。
+> 现在桶级扫描跳过点开头的条目（`.files` / `.original`），并且只认
+> `<名字>_<14 位时间戳>`（可带 `_<1-3 位序号>`）形状的目录（第 53.1 节）。
+> 桶被删时，先前文件级删掉的东西仍留在 `trash/<user>/.files/<bucket>/` 下，
+> 桶目录搬回 `repository/<user>/<bucket>/` 后它还在原处。
 
 ---
 
@@ -1978,19 +2349,24 @@ Bucket 下文件只修改：
 
 ```text
 is_trash
+trash_reason
 ```
 
 例如：
 
 ```text
-true
+is_trash=true, trash_reason="bucket"      ← 桶被删时置的
 ```
 
 变为：
 
 ```text
-false
+is_trash=false, trash_reason=""
 ```
+
+**只翻回 `trash_reason == "bucket"` 的那些**；用户自己删过的文件
+（`trash_reason="file"`，阶段 5 起）保持不动，继续留在 Trash。
+（阶段 4 已按这条实现：`BucketService::set_bucket_files_trash_flag`。）
 
 其他 File metadata：
 
@@ -2010,6 +2386,10 @@ md5
 ---
 
 # 58. 原 Bucket 不存在时恢复 File
+
+> **适用范围**：本节讲的是**文件级**恢复（`trash restore <file_id>`，阶段 7）
+> 遇到「原 Bucket 已永久删除」的情况；桶级回退见第 56 节。
+> 桶被**软删除**（在回收站里）不触发本节——那时原位置空着，桶级回退直接把整个桶搬回去。
 
 如果：
 
@@ -2038,14 +2418,38 @@ trash restore <file_id>
 命令：
 
 ```text
-trash delete <id>
+trash delete <名称>        桶级：回收站里的条目名，或唯一的原桶名（提交 4fee290 已落地）
+trash delete <id>          文件级：file_id（阶段 7）
 ```
 
 这是永久删除。
 
-执行前要求明确确认。
+**阶段状态（commit `4fee290`）**：桶级的 `trash delete` **已经实现**（第 60 节）。
+原口径「`trash delete` 仍未实现，服务端返回 `FMT-602 ServiceOperationFailed`
+（『操作尚未实现：trash.delete』），`trash get` 同样是 `FMT-602`，桶级的永久删除也一样」
+**已作废**——CLI 与管道都能真正执行它。仍未实现的是**文件级**永久删除
+（`trash delete <file_id>`）与文件级 `trash get`，属阶段 7。
 
-流程：
+**执行前要求明确确认（本句在提交 `4fee290` 落地）**：
+
+```text
+服务端          请求里没有 force == true → FMT-001 InvalidArgument（退出码 2），
+                错误信息「永久删除不可恢复，需要确认（force = true）」。
+                任何入口都一样；force 检查发生在取位置参数之前。
+CLI 交互窗口    先问一次：
+                永久删除回收站条目 X ？此操作不可恢复 (y/N)
+                答 n（或直接回车）→ 打印「已取消」，退出码 0，**不发请求**。
+CLI 一次性命令  必须加 --yes（或 -y），否则**本地直接拒绝**（不连服务），
+                stderr 打印「永久删除不可恢复：请加 --yes 明确确认，或在交互窗口里执行」，
+                退出码 2。
+HTTP            DELETE /api/trash/<名字> 需要 ?force=1（或 force=true，大小写不敏感）
+                或请求体 {"force":true}，否则 400 + FMT-001。
+```
+
+`--yes` / `-y` 是 **CLI 本地开关，不会作为位置参数发给服务端**——CLI 只是据此置
+`request.args["force"] = true`。服务端不信任任何入口，自己再检查一次。
+
+流程（**桶级已实现**，顺序是刻意的，理由见第 60 节）：
 
 ```text
 用户确认
@@ -2058,7 +2462,7 @@ trash delete <id>
  ↓
 删除 Trash metadata
  ↓
-清理相关 Share
+清理相关 Share        ← **尚未实现**：share 模块属阶段 6，见第 60 节
 ```
 
 ---
@@ -2083,7 +2487,67 @@ trash.json
 share.json
 ```
 
-中的关联记录进行清理。
+中的关联记录进行清理。**桶级的实际口径（提交 `4fee290`）**：
+
+```text
+file.json    只清 user + bucket 匹配、is_trash == true **且 trash_reason == "bucket"** 的记录；
+             文件级删除（trash_reason == "file"）的记录**绝不动**——那些文件的数据
+             不在这个回收站目录里，跟着删就真丢了。
+trash.json   桶级条目本来就不写这里（第 17.2 节），所以没有动作。
+share.json   **尚未实现**：share 模块属阶段 6，现在没有任何清理 share.json 的动作
+             （阶段 6/7 待办，见本节末）。
+```
+
+**桶级永久删除的三步（提交 `4fee290` 已实现，`BucketService::purge()`）**：
+
+```text
+① 删磁盘数据    remove_all 整个回收站目录 trash/<user>/<trashed>/
+                失败就什么都没变——索引还在，可以重来。
+ ↓
+② 清 metadata   只清 file.json 里 user + bucket 匹配、is_trash == true
+                且 trash_reason == "bucket" 的记录（removed_records 是清掉的条数）
+ ↓
+③ 摘索引        最后从 trash/<user>/.original 里删掉对应那条（trashed 匹配）
+```
+
+**顺序是刻意的**：先把数据删掉，中途任何一步失败都不会出现「索引没了、目录还在」的
+幽灵条目（那种条目反而永远清不掉）；如果反过来先摘索引再删目录，失败就会留下一个
+谁也认不出的孤儿目录。三步都做完才算成功，中途失败可以整条命令重来。
+
+两条刻意允许的边界：
+
+- **幽灵条目**（索引里有、目录已经没了）**也能永久删掉**——否则它永远清不掉，只能一直
+  被 `trash list` 标成 `present: false`。此时第 ① 步跳过（没东西可删），`removed_files = 0`。
+- **孤儿目录**（目录在、索引里没有）也能删：按目录名直接删掉，第 ③ 步没有索引可摘。
+
+> 原口径「**桶级还要清理身份记录**：永久删除回收站里的桶时必须从 `trash/<user>/.original`
+> 里删掉对应那条（`trashed` 匹配）」仍然成立，就是上面的第 ③ 步；作废的只是它末尾那句
+> 「持久化删除本身仍未实现（阶段 7，`FMT-602`）」。
+
+响应 `data`：
+
+```json
+{ "trashed": "lazy-fox_20261008012233", "original": "lazy-fox",
+  "removed_files": 3, "removed_records": 3,
+  "message": "已永久删除：lazy-fox_20261008012233（3 个文件，3 条记录）" }
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `trashed` | 回收站里的目录名 |
+| `original` | 原桶名（幽灵条目 / 孤儿目录可能为空） |
+| `removed_files` | **真正删掉的磁盘文件数**（删前统计） |
+| `removed_records` | 清掉的 `file.json` 记录数 |
+| `message` | 人话摘要 |
+
+服务端要求 `force == true` 才肯执行（第 59 节）；CLI 交互窗口问一次，一次性命令必须
+`--yes` / `-y`。用例 `Bucket.条目详情与永久删除`、`Bucket.永久删除只清桶级记录`、
+`Bucket.有索引没目录的条目可以永久删掉` 覆盖这三条。
+
+**已知缺口（阶段 6/7 待办）**：本节原来的要求里包含「清理相关 Share」。share 模块
+（阶段 6）**还没实现**，因此现在**没有任何**清理 `share.json` 的动作——一个被永久删除的
+桶如果曾经有分享记录，那些记录会留在 `share.json` 里。等阶段 6 落地 `share` 之后，
+永久删除要补上「按 `bucket` 清掉对应 share 记录」这一步。
 
 ---
 
@@ -2414,17 +2878,21 @@ help / help <组>           交互循环内同上（--help 在交互里是 help 
 可用命令：
   (service)  install  uninstall  start  stop  status
   (bucket)   create  list  get  use  delete
+  (trash)    list  get  restore  delete   ← 桶级四条；文件级条目待阶段 5/7
   (help)     help [命令]
   (exit)     exit  quit
 
 业务命令（服务端尚未实现，现在会返回 FMT-602）：
   (file)     upload  list  get  delete
   (share)    create  get  list  delete
-  (trash)    list  get  restore  delete
 ```
 
-（`bucket` 已实现（阶段 4），因此列在「可用命令」组；「尚未实现」那句现在只对
-`file` / `share` / `trash` 三组成立。提交 `8a5e554` 已把帮助文案与阶段 4 同步。）
+（`bucket` 已实现（阶段 4），因此列在「可用命令」组；**桶级 `trash` 的四条命令
+`list` / `get` / `restore` / `delete` 也都已实现**（`list` / `restore` 提交 `c2d545d`，
+`get` / `delete` 提交 `4fee290`），同样列在「可用命令」组。
+「服务端尚未实现」那一组里**不再有 trash 行**，这句现在只对 `file` / `share`
+两组的全部命令成立——原口径「只对 file / share 与 `trash get` / `trash delete` 成立」
+已作废。提交 `8a5e554`、`c2d545d`、`4fee290` 已把帮助文案与实现同步。）
 
 `help <组>` 支持 `service` / `bucket` / `file` / `share` / `trash` / `help` / `exit`
 （`quit` 等同 `exit`）。`help service`：
@@ -2444,8 +2912,10 @@ service —— Windows 服务管理
 
 四组业务命令的详情里原本都要注明「服务端尚未实现，现在返回 FMT-602」。
 
-**阶段 4 后的口径（提交 `8a5e554` 已同步）**：`bucket` 已经实现，这条说明**只适用于
-`file` / `share` / `trash` 三组**。`help bucket` 现在是这样：
+**阶段 4 收尾后的口径（提交 `8a5e554`、`c2d545d`、`4fee290` 已同步）**：`bucket` 与
+**桶级 `trash` 全部四条命令**都已经实现，这条说明**只适用于 `file` / `share` 两组**
+（原口径里「以及 `trash get` / `trash delete`」已作废）。`help bucket` 现在是这样
+（`src/cli/cli.cpp`）：
 
 ```text
 bucket —— 存储空间（Bucket 就是一个目录，没有独立 ID）
@@ -2453,8 +2923,33 @@ bucket —— 存储空间（Bucket 就是一个目录，没有独立 ID）
   list            列出所有 Bucket；当前的那个前面标 *
   get <名称>      查看名称、是否当前、目录路径
   use <名称>      切换当前 Bucket（只改 current_bucket，不动数据）
-  delete <名称>   移到回收站；删的是当前 Bucket 时置空，不自动切换
+  delete <名称>   移到回收站，名字变成 <名称>_<时间戳>；
+                  删的是当前 Bucket 时置空，不自动切换
+
+回收站的桶级记录在 trash/<用户>/.original 里，回退用 trash restore。
 ```
+
+`help trash` 现在是这样（`src/cli/cli.cpp`，提交 `4fee290`）：
+
+```text
+trash —— 回收站（当前是桶级条目；文件级条目随阶段 5/7 进来）
+  list             列出回收站里的条目
+  get <名称>       查看单个条目：原桶名、删除时间、目录、文件数与占用
+  restore <名称>   回退一个被删除的 Bucket。名称可以是回收站里的名字
+                   （lazy-fox_20261008012233），也可以是原桶名（同名只有
+                   一个时）。原位置已有同名 Bucket 就整单拒绝，不覆盖、
+                   不改名、不做部分恢复。
+  delete <名称>    **永久删除，不可恢复**：删掉数据与记录。
+                   交互窗口里会问一次；一次性命令必须加 --yes，例如
+                   fmt.exe trash delete lazy-fox_20261008012233 --yes
+
+桶级记录写在 trash/<用户>/.original，目录名一律带删除时间戳；
+文件级条目收在 trash/<用户>/.files/ 下，两者不会互相干扰。
+```
+
+> 本段原来的样文里 `get <id>` / `delete <id>` 写的是「尚未实现（阶段 7）」，
+> **已作废**——现在四条子命令都落地了，「当前是桶级条目；文件级条目随阶段 5/7 进来」
+> 这句标题也把剩余范围说清了（第 52、53.3、59、60 节）。
 
 `help <未知组>` → stderr 打印 `没有 <组> 的帮助；输入 help 查看命令列表`，退出码 2（`FMT-001`）。
 `help` / `--help` 全程**不提权、不连服务、不写日志**。
@@ -3148,6 +3643,20 @@ CLI 不实现 Preview。
 语义不匹配的 4xx。响应体仍是统一信封（第 83 节与 `FMT 技术文档.md` 第 12.3.2 节），
 状态码只是给浏览器与调试工具多一层信息。
 
+**回收站四条路由的状态码（桶级，提交 `4fee290`）**：
+
+```text
+GET    /api/trash                    200（列表）
+GET    /api/trash/<名字>             200（条目详情）；找不到条目 → 404 + FMT-400；
+                                     同名多条 → 400 + FMT-001（并列候选）
+POST   /api/trash/<名字>/restore     200；目标已存在 → 409 + FMT-401；
+                                     索引/目录缺失 → 404 + FMT-400
+DELETE /api/trash/<名字>             200（永久删除，返回 removed_files / removed_records）；
+                                     **缺确认 → 400 + FMT-001**：需要 ?force=1
+                                     （或 force=true，大小写不敏感）或请求体 {"force":true}；
+                                     找不到条目 → 404 + FMT-400
+```
+
 ---
 
 # 83. Delete HTTP Response
@@ -3616,10 +4125,11 @@ fmt.exe
 │   └── delete <share_id>
 │
 ├── trash
-│   ├── list
-│   ├── get <id>
-│   ├── restore <id>
-│   └── delete <id>
+│   ├── list                 桶级已落地（c2d545d）；文件级条目随阶段 5 进来
+│   ├── get <名称>           桶级已落地（4fee290）：原桶名 / 删除时间 / 目录 / 文件数 / 占用
+│   ├── restore <名称>       桶级已落地（c2d545d，整单判定）：回收站名或唯一的原桶名
+│   └── delete <名称>        桶级已落地（4fee290，**永久删除、需要确认**）；
+│                            文件级 trash get / delete 属阶段 7
 │
 └── service
     ├── install
@@ -3676,8 +4186,10 @@ Bucket：工作
 
 展示规则：**服务端只返回结构化数据，怎么打印放在 CLI 一侧**（`print_business_data`）——
 有 `buckets` 数组就按列表逐条打印（当前项前缀 `* `、后缀 `  (当前)`，末行 `共 N 个 Bucket`）；
-有 `bucket` + `is_current` 就按单条打印（可选的 `path` 追加一行）；否则打印服务给的
-`message`。`bucket use` / `bucket delete` 就是 `message` 那一类。
+有 `deleted_buckets` 数组就按回收站列表打印（末行 `共 N 个已删除的 Bucket`）；
+有 `trashed` + `files` 就按**条目详情**打印（提交 `4fee290`：条目名 / 原 Bucket / 删除时间 /
+目录 / 状态 / 文件数 / 占用）；有 `bucket` + `is_current` 就按单条打印（可选的 `path` 追加一行）；
+否则打印服务给的 `message`。`bucket use` / `bucket delete` / `trash delete` 就是 `message` 那一类。
 
 ```text
 fmt> bucket use 生活
@@ -3686,14 +4198,85 @@ fmt> bucket use 生活
 错误码：0
 
 fmt> bucket delete 生活
-Bucket 已删除（移入回收站）：生活
+Bucket 已删除（移入回收站）：生活  ->  生活_20261008012233
 执行成功...
 错误码：0
 ```
 
-> **帮助文案已随阶段 4 同步**（提交 `8a5e554`）：命令总览把 `(bucket)` 移进「可用命令」组，
-> `help bucket` 的标题是「存储空间（Bucket 就是一个目录，没有独立 ID）」并写明五条子命令的
-> 真实行为；仍写「尚未实现，返回 FMT-602」的只有 `file` / `share` / `trash` 三组（第 68 节）。
+桶级回收站的四条命令现在都已落地（`list` / `restore` 提交 `c2d545d`，`get` / `delete`
+提交 `4fee290`），输出样例：
+
+```text
+fmt> trash list
+  lazy-fox_20261008012233  ->  lazy-fox
+  manual-copy_20261008013000  (原名称未记录，无法回退)
+  gone_20261008014000  ->  gone  (目录已不存在)
+共 3 个已删除的 Bucket
+执行成功...
+错误码：0
+
+fmt> trash restore lazy-fox_20261008012233
+Bucket 已回退：lazy-fox
+执行成功...
+错误码：0
+
+fmt> trash restore lazy-fox
+执行失败：FMT-401 回退失败：Bucket 已存在：lazy-fox
+错误码：4
+```
+
+> 桶级条目列的是**回收站里的名字 + 原名 + 删除时间 + 目录是否还在**（`deleted_buckets`）：
+> 目录没了标 `(目录已不存在)`，索引里没有原名的显示 `(原名称未记录，无法回退)`——都如实报告，
+> 不擅自清理。目标已存在时 `restore` 是**整单拒绝**（不覆盖、不改名、不做部分恢复，退出码 4）；
+> 原桶名对不上多条、或 `.original` 里没有这条记录，则报 `FMT-001`（退出码 2）。
+
+`trash get` / `trash delete` 的输出样例（提交 `4fee290`）：
+
+```text
+fmt> trash get lazy-fox_20261008012233
+回收站条目：lazy-fox_20261008012233
+原 Bucket：lazy-fox
+删除时间：2026-10-08T01:22:33
+目录：trash/user/lazy-fox_20261008012233
+状态：在
+文件数：2
+占用：1.2 KB
+执行成功...
+错误码：0
+```
+
+```text
+fmt> trash delete lazy-fox_20261008012233
+永久删除回收站条目 lazy-fox_20261008012233 ？此操作不可恢复 (y/N) y
+已永久删除：lazy-fox_20261008012233（3 个文件，3 条记录）
+执行成功...
+错误码：0
+
+fmt> trash delete lazy-fox_20261008012233
+永久删除回收站条目 lazy-fox_20261008012233 ？此操作不可恢复 (y/N) n
+已取消
+错误码：0
+
+fmt.exe trash delete lazy-fox_20261008012233
+永久删除不可恢复：请加 --yes 明确确认，或在交互窗口里执行
+错误码：2
+
+fmt> trash delete lazy-fox_20261008012233        ← 服务端侧的兜底（任何入口都不例外）
+执行失败：FMT-001 永久删除不可恢复，需要确认（force = true）
+错误码：2
+```
+
+> 交互窗口里**答 n 或直接回车就取消**（打印「已取消」，退出码 0，**不发请求**）；
+> 一次性命令必须 `--yes`（或 `-y`），否则**本地直接拒绝、根本不连服务**（退出码 2）；
+> `--yes` / `-y` 是本地开关，**不会作为位置参数发给服务端**。服务端不信任任何入口，
+> 自己再检查一次 `force == true`。HTTP 侧对应 `DELETE /api/trash/<名字>?force=1`
+> （或请求体 `{"force":true}`），否则 400 + `FMT-001`（第 59、60、82 节）。
+
+> **帮助文案已随阶段 4 同步**（提交 `8a5e554`、`c2d545d`，`4fee290` 收尾）：命令总览把
+> `(bucket)` 与 `(trash) list get restore delete` 移进「可用命令」组，`help bucket` 的标题是
+> 「存储空间（Bucket 就是一个目录，没有独立 ID）」并写明五条子命令的真实行为，
+> `help trash` 写明四条子命令的真实行为；仍写「尚未实现，返回 FMT-602」的
+> **只有 `file` / `share` 两组**（原口径「以及 `trash get` / `trash delete`」已作废，第 68 节）。
 
 ---
 
@@ -3739,6 +4322,7 @@ cli
 ```text
 阶段 4
 Bucket
++ 桶级回收站（trash list / get / restore / delete；get 与 delete 在提交 4fee290 补齐）
 ```
 
 ↓
@@ -3747,7 +4331,7 @@ Bucket
 阶段 5
 File
 Upload
-Trash
+Trash（文件级条目）
 Share
 ```
 
@@ -3900,7 +4484,7 @@ service status 不弹 UAC，输出「服务状态：运行中 / 服务宿主 / �
 
 ---
 
-# 100. 阶段 4：Bucket
+# 100. 阶段 4：Bucket（含桶级回收站）
 
 实现：
 
@@ -3910,6 +4494,10 @@ bucket list
 bucket get
 bucket use
 bucket delete
+trash list          ← 桶级（阶段 4 追加）
+trash restore       ← 桶级（阶段 4 追加）
+trash get           ← 桶级（阶段 4 收尾提交 4fee290 追加）
+trash delete        ← 桶级（阶段 4 收尾提交 4fee290 追加，永久删除 + 强制确认）
 ```
 
 首先确保：
@@ -3920,25 +4508,45 @@ current_bucket
 
 逻辑稳定。
 
-**状态：✅ 已完成（`arch-restart` 分支，commit 32249ea「feat(bucket): create, list, get, use and delete over both entries」）。**
+**状态：✅ 已完成（`arch-restart` 分支，commit 32249ea「feat(bucket): create, list, get, use and delete over both entries」；
+回收站形状与桶级 trash 的 `list` / `restore` 在 commit c2d545d 落地；
+桶级 `trash get` / `trash delete`（永久删除 + 强制确认）在 commit `4fee290` 收尾落地）。**
 
 完成内容：
 
 ```text
 common/validation   validate_bucket_name / validate_file_name / is_windows_reserved_name
                     （第 25、26 节；FMT-100～104 与 FMT-202 的分工见该节表）
-bucket              BucketService：create / list / get / use / remove
-                    + directory_of / refresh_current_bucket；Bucket 无独立 ID（第 27～30 节）
 config              current_user 空时自动补占位名 user（第 18、93 节）
-storage             trash.json 的 Bucket 级记录（第 17 节）
-service             service::execute_business 的 bucket.* 五种 op，参数走 args.argv
-                      （`FMT 技术文档.md` 第 12.3.2、13.9.3 节）
+bucket              BucketService：create / list / get / use / remove
+                    + list_trashed / restore / get_trashed / purge
+                    + directory_of / refresh_current_bucket；
+                    私有 find_trashed（三者共用定位）/ remove_bucket_file_records；
+                    Bucket 无独立 ID（第 27～31 节）
+回收站形状          目录名一律 <原桶名>_<YYYYMMDDHHMMSS>（同秒冲突加 _2）；
+                    桶级身份记录的唯一权威是 trash/<user>/.original
+                    （kOriginalIndexName = ".original"，第 17.2、30、56 节）
+                    file.json 新增 trash_reason："bucket" / "file"
+文件级落点          trash/<user>/.files/<bucket>/YYYY/MM/DD/<file>（提交 4fee290，
+                    PathManager::build 的 inner 参数；顶层留给桶级条目，第 21 节）
+桶级扫描形状        跳点开头 + 只认 <名字>_<14 位时间戳>（可带 _<1-3 位序号>）
+service             service::execute_business 的 bucket.* 五种 op +
+                    trash.list / trash.restore / trash.get / trash.delete，
+                    参数走 args.argv；trash.delete 要求 args.force == true，
+                    否则 FMT-001（`FMT 技术文档.md` 第 12.3.2、13.9.3 节）
 runtime             服务启动（start）与数据根切换（apply_root，hello 触发）时，
                       在业务锁下校一次 current_bucket：失效置空、有效不动（第 61 节）
-ipc / cli           CLI `bucket create|list|get|use|delete` 经管道执行并按形状打印
-                      （第 95、127 节）；帮助文案把 bucket 移出「尚未实现」组（提交 8a5e554）
+ipc / cli           CLI `bucket create|list|get|use|delete` 与
+                      `trash list|get|restore|delete` 经管道执行并按形状打印
+                      （第 95、127 节）；trash delete 在交互窗口问一次、
+                      一次性命令要 --yes（第 59 节）；
+                      帮助文案把 bucket 与桶级 trash 四条移出「尚未实现」组
+                      （提交 8a5e554、c2d545d、4fee290）
 server              GET/POST /api/bucket、GET/POST /api/bucket/<name>[/use]、
-                    DELETE /api/bucket/<name>；路径参数百分号解码，
+                    DELETE /api/bucket/<name>、GET /api/trash、
+                    POST /api/trash/<名字>/restore、GET /api/trash/<名字>、
+                    DELETE /api/trash/<名字>（需 ?force=1 或 {"force":true}，
+                    否则 400 + FMT-001）；路径参数百分号解码，
                     请求体接受 {"name":"工作"} 或 {"argv":["工作"]}
                     （`FMT 技术文档.md` 第 12.3.2 节）
 ```
@@ -3950,20 +4558,53 @@ server              GET/POST /api/bucket、GET/POST /api/bucket/<name>[/use]、
 重复创建 → FMT-201；名称非法（a/b、CON、结尾空格或点、超长）→ FMT-202
 use 只改 current_bucket，两个 Bucket 目录都还在；不存在 → FMT-200
 get 返回名称与当前标记；不存在 → FMT-200
-删除 → 目录移到 trash/<user>/<bucket>/，原目录消失，数据仍在回收站
-     → 本桶 file.json 记录 is_trash=true，别的桶不受影响
-     → trash.json 多一条 type=bucket 记录且**没有 file_id**
+删除 → 目录移到 trash/<user>/<bucket>_<时间戳>/，原目录消失，数据仍在回收站
+     → 本桶 file.json 记录 is_trash=true 且 trash_reason="bucket"，别的桶不受影响
+     → trash/<user>/.original 多一条记录（trashed / original / deleted_at），
+       且**没有 file_id**；data/trash.json **不再**出现桶级条目
      → 删的是当前 Bucket 则置空，不自动切换
-回收站重名不覆盖：删两次 → 两份数据都在，trash.json 两条记录
+一律带时间戳：同一个桶删两次 → 两份数据、两条 .original 记录，目录名不同
+.original 损坏 → bucket delete 直接拒绝（FMT-006），目录一个字都没动
+trash list → {deleted_buckets:[{trashed, original, deleted_at, present}], count}；
+             目录没了标 present=false；目录有而索引没有则 original 为空
+trash restore → 目标 Bucket 已存在 → FMT-401（整单拒绝，磁盘不变）；
+             目标不存在 → 整个目录一次搬回，.original 少一条，
+             只有 trash_reason="bucket" 的记录被翻回正常（"file" 的不动）
+trash restore 定位：回收站名精确匹配；原桶名同名多条 → FMT-001 并列出候选
+trash get → {trashed, original, deleted_at, present, path, files, bytes}；
+            索引有目录没了不报错、present=false；孤儿目录按目录名也能查到；
+            两者都没有 → FMT-400；只有单条查询遍历目录数 files/bytes
+trash delete（永久删除，提交 4fee290）→ 先删目录、再清 trash_reason="bucket" 的
+            file.json 记录（"file" 的绝不动）、最后摘 .original；
+            返回 removed_files / removed_records；幽灵条目也能删；
+            **不带 force → FMT-001 + 退出码 2**；CLI 交互窗口答 n → 「已取消」+ 退出码 0
+            且不发请求；一次性命令不带 --yes → 本地拒绝、退出码 2、不连服务
+回收站扫描形状：trash/<user>/ 下点开头的条目被跳过，只认
+            <名字>_<14 位时间戳>（可带 _<1-3 位序号>）形状的目录
 当前 Bucket 目录失效 → refresh_current_bucket 置空（只有一个 Bucket 也不自动切换）
 当前 Bucket 接线：服务启动时把失效的当前 Bucket 置空，
                  而指向**存在**的 Bucket 时不被误清（tests/service_test.cpp）
 current_user 被显式清空 → FMT-604（正常路径由占位名 user 兜住）
-管道 op：bucket.create / bucket.list / bucket.get 端到端通过；file.* 仍是 FMT-602
-帮助：命令总览把 (bucket) 列进「可用命令」，help bucket 不含「尚未实现」字样
+管道 op：bucket.create / bucket.list / bucket.get / trash.list / trash.restore /
+         trash.get / trash.delete 端到端通过；trash.delete 不带 force 被拒（FMT-001/2）、
+         带 force 成功；file.* 仍是 FMT-602
+HTTP 路由：GET /api/trash、POST /api/trash/<名字>/restore、GET /api/trash/<名字>、
+         DELETE /api/trash/<名字>；DELETE 不带 force → 400 + FMT-001，
+         带 ?force=1 → 200 并真的删掉
+帮助：命令总览把 (bucket) 与 (trash) list get restore delete 列进「可用命令」，
+     「尚未实现」组只剩 (file) / (share)；
+     help bucket / help trash 不含「尚未实现」字样
+新用例：Bucket.条目详情与永久删除、Bucket.永久删除只清桶级记录、
+       Bucket.回收站扫描只认桶级条目、Bucket.有索引没目录的条目可以永久删掉、
+       Service.管道能执行回收站命令、Server.Bucket路由与状态码、
+       PathManager.回收站保持原层级（104 个单元测试全绿）
 ```
 
 **下一步是阶段 5（File / Upload / Trash / Share）**，不是阶段 4 的收尾。
+阶段 5/7 的 `trash` 部分只补**文件级**：文件级 trash list/get/restore/delete、
+永久删除时的 share 清理（第 60 节的已知缺口）、
+Bucket 部分恢复（**文件级**口径）、文件级 `trash get`——**桶级四条命令已经全部做完**
+（`list` / `restore` 见第 53、56 节，`get` / `delete` 见第 53.3、59、60 节）。
 
 ---
 
@@ -4061,13 +4702,14 @@ file delete <file_id>
 
 # 104. 阶段 5：Trash
 
-实现：
+实现（**只做文件级**：桶级四条 `trash list` / `get` / `restore` / `delete` 都已落地——
+`list` / `restore` 见第 53、56 节，`get` / `delete` 提交 `4fee290`，见第 53.3、59、60 节）：
 
 ```text
-trash list
-trash get
-trash restore
-trash delete
+trash list          文件级条目（与桶级条目一起列出，靠参数形态区分）
+trash get <id>      文件级详情：阶段 7
+trash restore <file_id>   文件级恢复（逐个文件、冲突不覆盖不改名）
+trash delete <id>   文件级永久删除：阶段 7（桶级永久删除已完成，第 60 节）
 ```
 
 重点测试：
@@ -4076,10 +4718,14 @@ trash delete
 文件删除
 文件恢复
 文件名冲突
-Bucket 删除
-Bucket 部分恢复
-Bucket 永久删除
+文件级 trash_reason="file" 的记录在桶回退时保持不动
+文件级条目落在 trash/<user>/.files/<bucket>/YYYY/MM/DD/ 下，
+  桶级扫描不会把它当成孤儿桶条目（第 21、53.1 节）
 ```
+
+阶段 7 保留的：文件级 trash list/get/restore/delete 的完整验收、文件级永久删除、
+永久删除时的 share 清理（第 60 节的已知缺口）、
+Bucket 部分恢复（**文件级**口径）、文件级 `trash get`。
 
 ---
 
@@ -4165,7 +4811,7 @@ HTTP 作用于**当前数据根**，默认只监听 `127.0.0.1:4122`；CLI 不�
 无效 current_bucket
 ```
 
-**阶段 4 的覆盖情况（已落地）**：
+**阶段 4 的覆盖情况（已落地；回收站形状用例随 commit c2d545d 补齐）**：
 
 | 要求 | 用例（`tests/bucket_test.cpp`） | 状态 |
 |---|---|---|
@@ -4174,12 +4820,18 @@ HTTP 作用于**当前数据根**，默认只监听 `127.0.0.1:4122`；CLI 不�
 | 名称校验 | `名称非法与重复创建被拒` + `tests/validation_test.cpp` | ✅ |
 | 查询 | `get返回名称与当前标记` | ✅ |
 | 切换 | `use只改当前不动Bucket` | ✅ |
-| 删除 | `删除移入回收站并清空当前` | ✅ |
+| 删除 | `删除移入回收站名字带时间戳` | ✅ |
 | 删除当前 Bucket | 同上（断言 `was_current` 且 `current_bucket` 置空、不自动切换） | ✅ |
 | 删除非当前 Bucket | 同上（`seed_file_record(*paths, "生活", …)` 的记录不被标记） | ✅ |
 | 重启后 `current_bucket` | `use只改当前不动Bucket` 会把配置重新读一遍确认落盘 | ✅（进程内） |
 | 无效 `current_bucket` | `当前Bucket失效时置空` | ✅ |
-| 回收站重名 | `回收站同名不覆盖` | ✅ |
+| 一律带时间戳 | `删除移入回收站名字带时间戳`（目录名 = 原名 + 时间戳） | ✅ |
+| 同秒删两次不覆盖 | `同一秒删两次也不覆盖`（加 `_2` 序号，两份数据都在） | ✅ |
+| `.original` 损坏 | `索引损坏时拒绝删除`（`FMT-006`，目录一个字没动） | ✅ |
+| 回退 / 目标已存在 | `回退成功与已存在拒绝`（`FMT-401` 整单拒绝） | ✅ |
+| 同名多条要指定 | `同名多条回退要指定回收站名字`（`FMT-001` 并列候选） | ✅ |
+| 没有身份记录 | `没有身份记录的目录只报告不回退`（`original` 为空、拒绝回退） | ✅ |
+| 用户提的完整场景 | `删空桶重建再删然后回退不会互相覆盖`（两次删除名字不同、回退整单判定） | ✅ |
 | 无当前用户 | `没有当前用户时拒绝`（`FMT-604`） | ✅ |
 
 「删除非当前 Bucket 后 `current_bucket` 不变」与「`repository/<user>/<bucket>` 用占位名
@@ -4252,11 +4904,30 @@ metadata 写入失败
 恢复文件
 恢复冲突
 永久删除
-删除 Bucket
-恢复 Bucket
-Bucket 部分恢复
-Bucket 永久删除
+删除 Bucket（目录名一律带时间戳；.original 有一条记录）
+恢复 Bucket（整单判定：目标已存在 → FMT-401；目标不存在 → 整棵树一次搬回）
+Bucket 部分恢复 —— 文件级口径（逐个文件；桶级不做部分恢复，见第 56 节）
+Bucket 永久删除（同时从 .original 删掉身份记录）
+.original 损坏 / 写不进去（删除拒绝、目录搬回原位）
+trash list 的两类异常如实报告：present=false、original 为空
 ```
+
+**桶级已落地部分对应的真实用例（提交 `4fee290`，`tests/bucket_test.cpp`）**：
+
+```text
+Bucket.条目详情与永久删除         trash get 的六个字段 + trash delete 的三步顺序
+Bucket.永久删除只清桶级记录       trash_reason="file" 的记录一条都不能少
+Bucket.回收站扫描只认桶级条目     点开头跳过 + <名字>_<14 位时间戳> 形状检查
+Bucket.有索引没目录的条目可以永久删掉   幽灵条目也要能删掉（否则永远清不掉）
+PathManager.回收站保持原层级      trash/<用户>/.files/<桶>/YYYY/MM/DD/<文件>
+Service.管道能执行回收站命令      list/restore/get/delete 端到端；不带 force 被拒
+                                （FMT-001 / 退出码 2），带 force 成功
+Server.Bucket路由与状态码         DELETE /api/trash/<名字> 不带 force → 400 + FMT-001，
+                                带 ?force=1 → 200
+```
+
+> 本节的「永久删除」原来指的是**文件级**（阶段 7）；现在**桶级**的永久删除已经落地，
+> 上面五条用例就是它的验收，文件级那一半仍属阶段 5/7。
 
 ---
 
@@ -4528,8 +5199,10 @@ V2
 6. Trash 不占用正常文件名空间
 7. file_id 不因删除/恢复改变
 8. Bucket 删除不创建 file_id
-9. Bucket 下文件通过 is_trash 管理
-10. 冲突恢复不覆盖、不改名
+9. Bucket 下文件通过 is_trash 管理；进回收站时同时写 trash_reason
+   （"bucket" = 桶被删、"file" = 文件自己删的，阶段 5 起），回退桶只翻回 "bucket" 的那些
+10. 冲突恢复不覆盖、不改名 —— 这是**文件级**恢复的规则；
+    桶级回退是**整单判定**（目标 Bucket 已存在 → FMT-401，不做部分恢复，见第 56 节）
 11. current_bucket 无效时不自动选择
 12. max_download_count 属于 Share
 13. Share 默认最大下载次数为 20
@@ -4580,8 +5253,11 @@ V2
     HTTP 请求体接受 {"name":…} 或 {"argv":[…]}，路径参数里的中文由服务端 url_decode 解码
 40. 错误码 → HTTP 状态码映射已冻结：400 / 403 / 404 / 409 / 500 五档，
     实现是 http_status_for() 的 switch + default: 500；新错误码未登记就落 500，不猜 4xx
-41. Bucket 删除是移入回收站、不是丢弃：整个目录移到 trash/<user>/<bucket>/，
-    回收站重名不覆盖（目录名加时间戳后缀），trash.json 追加一条 type=bucket 记录（无 file_id）
+41. Bucket 删除是移入回收站、不是丢弃：整个目录移到 trash/<user>/<bucket>_<YYYYMMDDHHMMSS>/，
+    目录名**一律**带删除时间戳（同秒冲突加 _2），桶级身份记录写进
+    trash/<user>/.original（trashed / original / deleted_at，无 file_id）；
+    data/trash.json 只服务文件级条目，不再记桶级记录；
+    回退是整单判定（目标已存在 → FMT-401），绝不靠剥离时间戳猜原名（第 17.2、30、56 节）
 42. 并发：管道连接级严格串行（一次只 accept 一条连接，没有每连接一个线程），
     HTTP 是线程池并发，业务命令共用运行体的一把互斥锁（是互斥，不是队列：
     没有先来先服务、没有优先级、没有排队上限与排队超时）；HTTP 的 stop / start 必须在锁外做；
@@ -5049,18 +5725,20 @@ fmt> help
 可用命令：
   (service)  install  uninstall  start  stop  status
   (bucket)   create  list  get  use  delete
+  (trash)    list  get  restore  delete   ← 桶级四条；文件级待阶段 5/7
   (help)     help [命令]
   (exit)     exit  quit
 
 业务命令（服务端尚未实现，现在会返回 FMT-602）：
   (file)     upload  list  get  delete
   (share)    create  get  list  delete
-  (trash)    list  get  restore  delete
 ```
 
-> 上面是**当前源码**的实际输出（提交 `8a5e554` 起）。`bucket` 五条命令在阶段 4 已经可用，
-> 所以它列在「可用命令」组；「尚未实现」这句现在只对 `file` / `share` / `trash` 成立
-> （第 68、95、127.6 节）。
+> 上面是**当前源码**的实际输出（提交 `8a5e554` 起，`c2d545d` 补了桶级 trash 的 `list` /
+> `restore`，`4fee290` 补齐 `get` / `delete`）。
+> `bucket` 五条命令与**桶级 `trash` 四条命令**在阶段 4 已经可用，
+> 所以它们列在「可用命令」组；「尚未实现」这句现在只对 `file` / `share` 两组成立
+> （原口径「与 `trash get` / `trash delete`」已作废，第 68、95、127.6 节）。
 
 `service status` 的输出也走 stdout（它是查询命令，成功与「未安装」两种结果都是它的正常输出）：
 
@@ -5114,11 +5792,13 @@ service 命令直连 SCM：四条动作命令走 UAC 提权、status 是查询�
 CLI 单实例：已有窗口则激活，不新建窗口
 ```
 
-## 127.6 业务命令的输出（阶段 4：Bucket）
+## 127.6 业务命令的输出（阶段 4：Bucket；桶级 Trash 见提交 4fee290）
 
 **服务端只返回结构化数据，展示在 CLI 一侧完成**（`print_business_data`）：
-有 `buckets` 数组按列表打印、有 `bucket` + `is_current` 按单条打印、否则打印 `message`。
-`bucket` 五条命令已经可用，实际输出：
+有 `buckets` 数组按列表打印、有 `deleted_buckets` 数组按回收站列表打印、
+有 `trashed` + `files` 按回收站条目详情打印（提交 `4fee290`）、
+有 `bucket` + `is_current` 按单条打印、否则打印 `message`。
+`bucket` 五条命令与桶级 `trash` 四条命令都已经可用，实际输出：
 
 ```text
 fmt> bucket create 工作
@@ -5151,9 +5831,47 @@ fmt> bucket use 生活
 错误码：0
 
 fmt> bucket delete 生活
-Bucket 已删除（移入回收站）：生活
+Bucket 已删除（移入回收站）：生活  ->  生活_20261008012233
 执行成功...
 错误码：0
+
+fmt> trash list
+  lazy-fox_20261008012233  ->  lazy-fox
+  manual-copy_20261008013000  (原名称未记录，无法回退)
+  gone_20261008014000  ->  gone  (目录已不存在)
+共 3 个已删除的 Bucket
+执行成功...
+错误码：0
+
+fmt> trash restore lazy-fox
+执行失败：FMT-401 回退失败：Bucket 已存在：lazy-fox
+错误码：4
+
+fmt> trash get lazy-fox_20261008012233
+回收站条目：lazy-fox_20261008012233
+原 Bucket：lazy-fox
+删除时间：2026-10-08T01:22:33
+目录：trash/user/lazy-fox_20261008012233
+状态：在
+文件数：2
+占用：1.2 KB
+执行成功...
+错误码：0
+
+fmt> trash delete lazy-fox_20261008012233
+永久删除回收站条目 lazy-fox_20261008012233 ？此操作不可恢复 (y/N) y
+已永久删除：lazy-fox_20261008012233（3 个文件，3 条记录）
+执行成功...
+错误码：0
+
+fmt> trash delete lazy-fox_20261008012233
+永久删除回收站条目 lazy-fox_20261008012233 ？此操作不可恢复 (y/N) n
+已取消
+错误码：0
+
+fmt.exe trash delete lazy-fox_20261008012233
+永久删除不可恢复：请加 --yes 明确确认，或在交互窗口里执行
+错误码：2
 ```
 
 展示规则：
@@ -5161,15 +5879,22 @@ Bucket 已删除（移入回收站）：生活
 | 服务端 data 形状 | CLI 打印 |
 |---|---|
 | `{buckets:[{name,is_current}], count, current_bucket}` | 每行一个：当前项 `* 名称  (当前)`，其余 `  名称`；末行 `共 N 个 Bucket` |
+| `{deleted_buckets:[{trashed,original,deleted_at,present}], count}` | 每行 `  <trashed>  ->  <original>`；`original` 为空改印 `  (原名称未记录，无法回退)`；`present=false` 追加 `  (目录已不存在)`；末行 `共 N 个已删除的 Bucket` |
+| `{trashed, original, deleted_at, present, path, files, bytes}`（提交 `4fee290`） | `回收站条目：…` / `原 Bucket：…`（空则 `（未记录，无法回退）`）/ `删除时间：…` / `目录：…` / `状态：在\|目录已不存在` / `文件数：N` / `占用：<人类可读>` |
 | `{bucket, is_current, path}` | `Bucket：…` / `当前：是\|否` / `路径：…`（有 `path` 才打印第三行） |
-| `{…, message}` | 打印 `message` 一行 |
+| `{…, message}` | 打印 `message` 一行（`trash delete` 走这一行：`已永久删除：…（N 个文件，M 条记录）`） |
 | 其它/空 | 退回 `data.dump(2)`，不吞输出 |
 
 错误路径仍是固定两行（走 stderr）：`执行失败：FMT-201 Bucket 已存在：工作` +
-`错误码：4`。中文 Bucket 名全程 UTF-8，不经过控制台代码页转换。
+`错误码：4`；桶级回退撞名是 `执行失败：FMT-401 回退失败：Bucket 已存在：lazy-fox` +
+`错误码：4`。**永久删除未确认**是本地拒绝：stderr 一行
+`永久删除不可恢复：请加 --yes 明确确认，或在交互窗口里执行` + `错误码：2`，
+服务端侧的兜底是 `执行失败：FMT-001 永久删除不可恢复，需要确认（force = true）` + `错误码：2`。
+中文 Bucket 名全程 UTF-8，不经过控制台代码页转换。
 
-> **帮助文案已与上面这些输出一致**（提交 `8a5e554`）：命令总览里 `(bucket)` 在「可用命令」组，
-> `help bucket` 写明五条子命令的真实行为，不含「尚未实现」字样（见第 68、95 节）。
+> **帮助文案已与上面这些输出一致**（提交 `8a5e554`、`c2d545d`，`4fee290` 收尾）：命令总览里
+> `(bucket)` 与 `(trash) list get restore delete` 在「可用命令」组，`help bucket` / `help trash`
+> 写明各子命令的真实行为，不含与实际不符的「尚未实现」字样（见第 68、95 节）。
 
 ---
 
