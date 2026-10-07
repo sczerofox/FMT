@@ -35,7 +35,9 @@ std::string quote_for_command_line(const std::string& value) {
 }  // namespace
 
 std::string result_file_for(unsigned long process_id) {
-    return path_to_utf8(temp_directory() /
+    // 放在数据根自己的 temp/ 下：临时文件跟着 exe 走，用户一眼能找到、随时可清。
+    // 数据根不可写时 elevate_service_command 会退回系统临时目录。
+    return path_to_utf8(executable_directory() / L"temp" /
                         (L"fmt-elev-" + std::to_wstring(process_id) + L".json"));
 }
 
@@ -60,7 +62,19 @@ Result<ElevatedOutcome> elevate_service_command(const std::string& operation,
         return make_error(ErrorCode::InvalidArgument, "缺少自身可执行文件路径");
     }
 
-    const std::string result_path = result_file_for(GetCurrentProcessId());
+    std::string result_path = result_file_for(GetCurrentProcessId());
+
+    // 数据根下的 temp/ 由父进程先试着建出来；建不出来（例如 exe 放在只读位置）
+    // 就退回系统临时目录，保证提权结果总有地方落。
+    const std::filesystem::path root_temp = executable_directory() / L"temp";
+    if (const Status created = ensure_directory(root_temp); !ok(created)) {
+        log_warn("Cli", "无法创建 " + path_to_utf8(root_temp) + "：" + error_of(created)->message +
+                            "，提权结果改用系统临时目录");
+        result_path = path_to_utf8(temp_directory() / (L"fmt-elev-" +
+                                                       std::to_wstring(GetCurrentProcessId()) +
+                                                       L".json"));
+    }
+
     {
         std::error_code code;
         std::filesystem::remove(path_from_utf8(result_path), code);
@@ -207,12 +221,20 @@ int run_elevated(const std::vector<std::string>& args) {
     }
 
     if (!result_path.empty()) {
+        const std::filesystem::path target = path_from_utf8(result_path);
+        // 提权副本有权创建目录：数据根下的 temp/ 就是它建出来的。
+        if (!target.parent_path().empty()) {
+            if (const Status made = ensure_directory(target.parent_path()); !ok(made)) {
+                log_error("Elevated", "无法创建结果目录：" + error_of(made)->message);
+            }
+        }
+
         nlohmann::json value = nlohmann::json::object();
         value["ok"] = succeeded;
         value["code"] = code_string(code);
         value["message"] = message;
         value["exit"] = exit;
-        const Status written = write_json_file(path_from_utf8(result_path), value);
+        const Status written = write_json_file(target, value);
         if (!ok(written)) {
             log_error("Elevated", "结果文件写入失败：" + error_of(written)->message);
             return exit_code(error_of(written)->code);

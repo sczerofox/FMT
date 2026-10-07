@@ -40,7 +40,7 @@ PathManager::PathManager(std::filesystem::path root) : root_(std::move(root)) {}
 
 const std::vector<std::string>& PathManager::required_directories() {
     static const std::vector<std::string> kDirectories{"repository", "trash", "config", "data",
-                                                       "log"};
+                                                       "log", "temp"};
     return kDirectories;
 }
 

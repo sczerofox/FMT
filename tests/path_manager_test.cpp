@@ -21,12 +21,13 @@ std::string as_utf8(const fmt::Result<std::filesystem::path>& result) {
 
 FMT_TEST(PathManager, 目录清单固定) {
     const std::vector<std::string>& directories = fmt::PathManager::required_directories();
-    FMT_CHECK_EQ(directories.size(), std::size_t{5});
+    FMT_CHECK_EQ(directories.size(), std::size_t{6});
     FMT_CHECK_EQ(directories[0], std::string("repository"));
     FMT_CHECK_EQ(directories[1], std::string("trash"));
     FMT_CHECK_EQ(directories[2], std::string("config"));
     FMT_CHECK_EQ(directories[3], std::string("data"));
     FMT_CHECK_EQ(directories[4], std::string("log"));
+    FMT_CHECK_EQ(directories[5], std::string("temp"));
 }
 
 FMT_TEST(PathManager, 根与子路径) {
@@ -35,6 +36,7 @@ FMT_TEST(PathManager, 根与子路径) {
     FMT_CHECK_EQ(fmt::path_to_utf8(paths.repository()), std::string(R"(D:\FMT2\repository)"));
     FMT_CHECK_EQ(fmt::path_to_utf8(paths.trash()), std::string(R"(D:\FMT2\trash)"));
     FMT_CHECK_EQ(fmt::path_to_utf8(paths.log()), std::string(R"(D:\FMT2\log)"));
+    FMT_CHECK_EQ(fmt::path_to_utf8(paths.temp()), std::string(R"(D:\FMT2\temp)"));
     FMT_CHECK_EQ(fmt::path_to_utf8(paths.config_file()),
                  std::string(R"(D:\FMT2\config\config.json)"));
     FMT_CHECK_EQ(fmt::path_to_utf8(paths.server_file()),

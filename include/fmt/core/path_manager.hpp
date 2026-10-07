@@ -29,6 +29,9 @@ public:
     std::filesystem::path config() const { return root_ / L"config"; }
     std::filesystem::path data() const { return root_ / L"data"; }
     std::filesystem::path log() const { return root_ / L"log"; }
+    // 临时文件目录：提权结果文件、以及以后上传时的暂存文件。
+    // 内容随时可以清空，不属于业务数据，也不是日志。
+    std::filesystem::path temp() const { return root_ / L"temp"; }
 
     // ---- 文件 ----
     std::filesystem::path config_file() const { return config() / L"config.json"; }
@@ -38,7 +41,8 @@ public:
     std::filesystem::path share_data() const { return data() / L"share.json"; }
     std::filesystem::path trash_data() const { return data() / L"trash.json"; }
 
-    // 初始化要创建的目录，顺序固定（repository、trash、config、data、log）。
+    // 初始化要创建的目录，顺序固定
+    // （repository、trash、config、data、log、temp）。
     static const std::vector<std::string>& required_directories();
 
     // repository/<user>/<bucket>/YYYY/MM/DD/<file_name>

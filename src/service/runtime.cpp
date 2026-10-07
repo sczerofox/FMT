@@ -33,6 +33,34 @@ bool same_root(const std::string& left, const std::string& right) {
     return iequals(left, right);  // Windows 路径大小写不敏感
 }
 
+// temp/ 是随时可清空的目录：服务启动时清掉上次遗留的临时文件。
+// 只删我们自己前缀（fmt-）的文件，用户手放进去的东西一律不动。
+int clean_temp_directory(const PathManager& paths) {
+    std::error_code code;
+    if (!std::filesystem::is_directory(paths.temp(), code)) {
+        return 0;
+    }
+
+    int removed = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(paths.temp(), code)) {
+        if (code) {
+            break;
+        }
+        std::error_code type_code;
+        if (!entry.is_regular_file(type_code)) {
+            continue;
+        }
+        if (!starts_with(path_to_utf8(entry.path().filename()), "fmt-")) {
+            continue;
+        }
+        std::error_code ignored;
+        if (std::filesystem::remove(entry.path(), ignored)) {
+            ++removed;
+        }
+    }
+    return removed;
+}
+
 // 业务操作前缀：阶段 4/5 逐个实现。
 bool is_business_operation(const std::string& op) {
     for (const std::string_view prefix :
@@ -130,6 +158,13 @@ Status ServerRuntime::start() {
     }
 
     apply_http_locked();
+
+    // 上次异常退出可能留下提权结果之类的临时文件，启动时顺手清掉。
+    if (const int cleaned = clean_temp_directory(*context_->paths); cleaned > 0) {
+        context_->logger->info("Service",
+                               "清理 temp/ 中 " + std::to_string(cleaned) + " 个遗留临时文件");
+    }
+
     context_->logger->info("Service", "服务已启动，当前数据根：" + state.current_root);
     return std::monostate{};
 }

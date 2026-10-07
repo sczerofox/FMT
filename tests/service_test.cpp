@@ -136,6 +136,23 @@ FMT_TEST(Service, 运行体把控制事件写进日志) {
     FMT_CHECK(text.find("服务已启动") != std::string::npos);
 }
 
+FMT_TEST(Service, 启动时清理temp里的遗留临时文件) {
+    fmt_test::TempDir temp("service-temp");
+    const auto root = temp / "root";
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(root / "temp")));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(root / "temp" / "fmt-elev-123.json", "{}")));
+    // 中文文件名必须走 path_from_utf8：直接拼窄字符串会按 ANSI 代码页转换而抛异常。
+    const auto mine = root / "temp" / fmt::path_from_utf8("用户自己的文件.txt");
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(mine, "别删我")));
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    // 我们的临时文件清掉，用户手放的其它文件不动
+    FMT_CHECK(!fmt::file_exists(root / "temp" / "fmt-elev-123.json"));
+    FMT_CHECK(fmt::file_exists(mine));
+}
+
 FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {
     fmt_test::TempDir temp("service-ops");
     fmt::service::ServerRuntime runtime(temp / "root", temp / "state");

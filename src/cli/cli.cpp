@@ -303,7 +303,11 @@ int run_interactive(const Options& options, service::State state) {
     log_info("Cli", "进入交互循环，数据根：" + to_forward_slashes(options.data_root));
 
     Session session;
+    bool blank_before_prompt = true;  // 横幅之后先空一行，输出不会和提示符挤在一起
     while (true) {
+        if (blank_before_prompt) {
+            std::printf("\n");
+        }
         std::printf("fmt> ");
         std::fflush(stdout);
 
@@ -315,8 +319,10 @@ int run_interactive(const Options& options, service::State state) {
 
         const std::vector<std::string> parts = split_command(line);
         if (parts.empty()) {
+            blank_before_prompt = false;  // 光敲回车不再多空一行
             continue;
         }
+        blank_before_prompt = true;
 
         // 用户敲了什么就记什么：日志要能跟着 CLI 走。
         log_info("Cli", "fmt> " + trim(line));

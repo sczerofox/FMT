@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "fmt/common/string.hpp"
+#include "fmt/core/path.hpp"
 #include "fmt_test.hpp"
 
 FMT_TEST(Cli, 命令切分) {
@@ -39,9 +41,16 @@ FMT_TEST(Cli, 管道输入带BOM也能识别) {
     FMT_CHECK_EQ(with_bom[0], std::string("exit"));
 }
 
-FMT_TEST(Cli, 提权结果文件路径) {
+FMT_TEST(Cli, 提权结果文件放在数据根的temp下) {
     const std::string path = fmt::cli::result_file_for(4242);
     FMT_CHECK(path.find("fmt-elev-4242.json") != std::string::npos);
+    FMT_CHECK(path.find("temp") != std::string::npos);
+
+    // 就在本进程 exe 所在目录的 temp/ 里：临时文件跟着 exe 走
+    const std::string root = fmt::to_forward_slashes(fmt::path_to_utf8(fmt::executable_directory()));
+    const std::string normalized = fmt::to_forward_slashes(path);
+    FMT_CHECK(fmt::starts_with(normalized, root));
+    FMT_CHECK(normalized.find("/temp/fmt-elev-") != std::string::npos);
 }
 
 FMT_TEST(Cli, 提权判断不崩溃) {

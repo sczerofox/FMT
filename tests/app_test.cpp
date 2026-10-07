@@ -10,7 +10,7 @@
 #include "fmt_test.hpp"
 #include "temp_dir.hpp"
 
-FMT_TEST(App, 初始化建出五个目录与默认JSON) {
+FMT_TEST(App, 初始化建出六个目录与默认JSON) {
     fmt_test::TempDir temp("app-init");
     const auto root = temp / "FMT";
 
