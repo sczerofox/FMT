@@ -474,9 +474,67 @@ FMT_TEST(File, 标识与名字同时命中时报歧义) {
     FMT_CHECK(fmt::error_of(ambiguous)->message.find("歧义") != std::string::npos);
     FMT_CHECK(fmt::error_of(ambiguous)->message.find("fmt-20261008-1") != std::string::npos);
 
+    // 预检要把**两条候选**都摊出来（y/N 解决不了歧义，只能让用户改用 file_id）
+    const auto checked = files.check_remove("fmt-20261008-0");
+    FMT_CHECK(fmt::ok(checked));
+    if (fmt::ok(checked)) {
+        const fmt::FileDeleteCheck& check = std::get<fmt::FileDeleteCheck>(checked);
+        FMT_CHECK(check.ambiguous);
+        FMT_CHECK(!check.other_bucket);
+        FMT_CHECK_EQ(check.candidates.size(), std::size_t{2});
+        FMT_CHECK(check.message.find("file_id") != std::string::npos);
+    }
+
     // 不歧义的名字照常
     FMT_CHECK(!fmt::ok(files.remove("a.txt")) ||
               fmt::error_of(files.remove("a.txt"))->code == fmt::ErrorCode::FileNotFound);
+}
+
+FMT_TEST(File, 删除预检会把情况说清楚) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(buckets.create("生活")));
+    FMT_CHECK(fmt::ok(buckets.use("工作")));
+
+    const auto uploaded = upload_local(f, "a.txt");
+    FMT_CHECK(fmt::ok(uploaded));
+    if (!fmt::ok(uploaded)) {
+        return;
+    }
+
+    fmt::FileService files(*f.paths, f.config, nullptr);
+
+    // 同一个桶：没什么要先说清楚的
+    const auto same = files.check_remove("a.txt");
+    FMT_CHECK(fmt::ok(same));
+    if (fmt::ok(same)) {
+        const fmt::FileDeleteCheck& check = std::get<fmt::FileDeleteCheck>(same);
+        FMT_CHECK(!check.other_bucket);
+        FMT_CHECK(!check.ambiguous);
+        FMT_CHECK_EQ(check.bucket, std::string("工作"));
+        FMT_CHECK_EQ(check.current_bucket, std::string("工作"));
+        FMT_CHECK(check.message.empty());
+        FMT_CHECK(!check.path.empty());
+    }
+
+    // 切到另一个桶：预检要能说清「属于哪个桶、当前是哪个桶」
+    FMT_CHECK(fmt::ok(buckets.use("生活")));
+    const auto cross = files.check_remove("a.txt");
+    FMT_CHECK(fmt::ok(cross));
+    if (fmt::ok(cross)) {
+        const fmt::FileDeleteCheck& check = std::get<fmt::FileDeleteCheck>(cross);
+        FMT_CHECK(check.other_bucket);
+        FMT_CHECK(!check.ambiguous);
+        FMT_CHECK_EQ(check.bucket, std::string("工作"));
+        FMT_CHECK_EQ(check.current_bucket, std::string("生活"));
+        FMT_CHECK(check.message.find("工作") != std::string::npos);
+        FMT_CHECK(check.message.find("生活") != std::string::npos);
+    }
+
+    // 预检**不改任何东西**：文件还在仓库里
+    const auto path = files.resolve_path(std::get<fmt::FileRecord>(uploaded));
+    FMT_CHECK(fmt::ok(path));
+    FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(path)));
 }
 
 FMT_TEST(File, 从HTTP下载入库) {

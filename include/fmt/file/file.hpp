@@ -36,7 +36,24 @@ struct FileRecord {
     std::string trash_reason;  // "bucket" / "file" / 空
 };
 
-// 上传第一阶段的产物：数据已经完整落在 temp/ 下，大小与 MD5 已知。
+// 「要删的到底是哪一个、有没有要先说清楚的情况」——**预检，零副作用**。
+//
+// CLI 用它实现「先检查 → 说清楚冲突的具体对象 → 再让用户确认」：
+//   目标唯一但在别的 Bucket  -> other_bucket（需要确认，说清是哪两个桶）
+//   名字与 file_id 撞车      -> ambiguous（**不能靠 y/N 解决**：y 无法表达删哪一个），
+//                              候选放在 candidates 里，让用户改用 file_id
+struct FileDeleteCheck {
+    std::string file_id;
+    std::string file_name;
+    std::string bucket;          // 目标所属 Bucket
+    std::string current_bucket;  // 当前 Bucket
+    std::string path;            // 能定位到时给出（相对数据根、正斜杠）
+    bool other_bucket = false;
+    bool ambiguous = false;
+    std::vector<FileRecord> candidates;  // 歧义时的候选（各带 file_id/file_name/bucket）
+    std::string message;                 // 给用户看的一句话
+};
+
 struct PreparedUpload {
     std::filesystem::path temp_path;
     std::string file_name;
@@ -77,6 +94,9 @@ public:
     // 参数与 file get 一致：先当 file_id 查，再当文件名查（当前用户 + 正常文件）。
     Result<FileRecord> remove(std::string_view file_id_or_name);
 
+    // 删除前的预检：只读，不改任何东西（跨桶确认与歧义检测都靠它）。
+    Result<FileDeleteCheck> check_remove(std::string_view file_id_or_name) const;
+
     // 仓库里的实际路径；回收站里的实际路径。
     Result<std::filesystem::path> resolve_path(const FileRecord& record) const;
     Result<std::filesystem::path> trash_path_of(const FileRecord& record) const;
@@ -89,6 +109,14 @@ private:
     // （「名字存在但已在回收站」不能报成「文件不存在」）。
     Result<std::size_t> locate_record(const std::vector<FileRecord>& records,
                                       std::string_view key) const;
+    // 两个维度各自命中哪一条（预检与定位共用，保证判定只有一份）。
+    struct RecordMatch {
+        bool has_id = false;
+        bool has_name = false;
+        std::size_t by_id = 0;
+        std::size_t by_name = 0;
+    };
+    RecordMatch match_record(const std::vector<FileRecord>& records, std::string_view key) const;
     std::filesystem::path bucket_path() const;
 
     const PathManager& paths_;

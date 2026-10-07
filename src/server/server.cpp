@@ -35,6 +35,7 @@ std::string dump(const nlohmann::json& value) { return value.dump(2); }
 int http_status_for(ErrorCode code) {
     switch (code) {
         case ErrorCode::InvalidArgument:
+        case ErrorCode::ConfirmRequired:
         case ErrorCode::PathTooLong:
         case ErrorCode::PathEscape:
         case ErrorCode::FileNameEmpty:
@@ -149,6 +150,38 @@ Result<nlohmann::json> upload_args_from_body(const httplib::Request& request) {
     return args;
 }
 
+// DELETE 路由的公共参数：
+//   ?dry_run=1  只预检（说清要删什么、有没有冲突），零副作用
+//   ?force=1    已确认执行（也接受请求体 {"force":true}）
+nlohmann::json delete_args(const httplib::Request& request, const std::string& name) {
+    nlohmann::json args = args_with_encoded_name(name);
+
+    const auto flag = [&request](const char* key) {
+        if (!request.has_param(key)) {
+            return false;
+        }
+        const std::string value = request.get_param_value(key);
+        return value == "1" || iequals(value, "true");
+    };
+
+    if (flag("dry_run")) {
+        args["dry_run"] = true;
+    }
+    bool force = flag("force");
+    if (!force && !request.body.empty()) {
+        try {
+            const nlohmann::json body = nlohmann::json::parse(request.body);
+            force = body.is_object() && body.value("force", false);
+        } catch (const nlohmann::json::exception&) {
+            force = false;  // 请求体不是 JSON：当作没确认
+        }
+    }
+    if (force) {
+        args["force"] = true;
+    }
+    return args;
+}
+
 void respond(httplib::Response& response, const Result<nlohmann::json>& result) {
     if (ok(result)) {
         response.status = 200;
@@ -212,24 +245,9 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler) 
                 });
     server->Delete(R"(/api/trash/([^/]+))",
                    [run](const httplib::Request& request, httplib::Response& response) {
-                       // 永久删除不可恢复：必须显式确认，?force=1 或请求体 {"force":true}。
-                       nlohmann::json args = args_with_encoded_name(request.matches[1]);
-                       bool force = false;
-                       if (request.has_param("force")) {
-                           const std::string value = request.get_param_value("force");
-                           force = (value == "1" || iequals(value, "true"));
-                       }
-                       if (!force && !request.body.empty()) {
-                           try {
-                               const nlohmann::json body = nlohmann::json::parse(request.body);
-                               force = body.is_object() && body.value("force", false);
-                           } catch (const nlohmann::json::exception&) {
-                               force = false;  // 请求体不是 JSON：当作没确认
-                           }
-                       }
-                       if (force) {
-                           args["force"] = true;
-                       }
+                       // 永久删除不可恢复：必须显式确认，?force=1 或请求体 {"force":true}；
+                       // ?dry_run=1 只预检（把要删掉的东西说清楚）。
+                       nlohmann::json args = delete_args(request, request.matches[1]);
                        run("trash.delete", args, response);
                    });
 
@@ -252,7 +270,8 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler) 
                 });
     server->Delete(R"(/api/file/([^/]+))",
                    [run](const httplib::Request& request, httplib::Response& response) {
-                       run("file.delete", args_with_encoded_name(request.matches[1]), response);
+                       // 跨 Bucket 删除要先确认：?dry_run=1 预检、?force=1 执行。
+                       run("file.delete", delete_args(request, request.matches[1]), response);
                    });
 }
 

@@ -34,6 +34,7 @@ enum class ErrorCode : int {
     DirectoryCreateFailed = 13,    // 目录创建失败           退出码 1
     PathEscape = 14,               // 路径穿越               退出码 2
     ConsistencyError = 15,         // 数据一致性异常         退出码 6
+    ConfirmRequired = 16,          // 该操作需要显式确认     退出码 2
 
     // ---- FMT-1xx 文件名校验 ----
     FileNameEmpty = 100,           // 文件名为空             退出码 2

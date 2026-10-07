@@ -273,7 +273,7 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     unconfirmed.args["argv"] = nlohmann::json::array({second});
     const fmt::ipc::Response refused = runtime.handle(unconfirmed);
     FMT_CHECK(!refused.ok);
-    FMT_CHECK(refused.error.code == fmt::ErrorCode::InvalidArgument);
+    FMT_CHECK(refused.error.code == fmt::ErrorCode::ConfirmRequired);
     FMT_CHECK_EQ(fmt::exit_code(refused.error.code), 2);
 
     // 带上 force：真的删掉，索引也一起清
@@ -473,6 +473,126 @@ FMT_TEST(Service, 管道能上传与操作文件) {
         FMT_CHECK_EQ(trashed.data.value("trash_path", std::string{}).rfind("trash/user/.files/", 0),
                      std::size_t{0});
     }
+}
+
+FMT_TEST(Service, 破坏性操作先预检再确认) {
+    fmt_test::TempDir temp("service-confirm");
+    const auto root = temp / "root";
+
+    const auto source = temp / "payload.txt";
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(source, "hello confirm")));
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const auto create_bucket = [&runtime](const char* name, int id) {
+        fmt::ipc::Request request;
+        request.id = id;
+        request.op = "bucket.create";
+        request.args["argv"] = nlohmann::json::array({name});
+        return runtime.handle(request);
+    };
+    FMT_CHECK(create_bucket("工作", 50).ok);
+    FMT_CHECK(create_bucket("生活", 51).ok);
+
+    fmt::ipc::Request upload;
+    upload.id = 52;
+    upload.op = "file.upload";
+    upload.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(source)});
+    FMT_CHECK(runtime.handle(upload).ok);
+
+    fmt::ipc::Request use_other;
+    use_other.id = 53;
+    use_other.op = "bucket.use";
+    use_other.args["argv"] = nlohmann::json::array({"生活"});
+    FMT_CHECK(runtime.handle(use_other).ok);
+
+    // ── 软删除：目标在别的桶里，预检要说清楚，执行要先确认 ──
+    fmt::ipc::Request check;
+    check.id = 54;
+    check.op = "file.delete";
+    check.args["argv"] = nlohmann::json::array({"payload.txt"});
+    check.args["dry_run"] = true;
+    const fmt::ipc::Response checked = runtime.handle(check);
+    FMT_CHECK(checked.ok);
+    if (checked.ok) {
+        FMT_CHECK(checked.data.value("needs_confirm", false));
+        FMT_CHECK(!checked.data.value("blocked", true));
+        FMT_CHECK_EQ(checked.data.value("bucket", std::string{}), std::string("工作"));
+        FMT_CHECK_EQ(checked.data.value("current_bucket", std::string{}), std::string("生活"));
+        FMT_CHECK(checked.data.value("message", std::string{}).find("工作") != std::string::npos);
+    }
+    // 预检不改数据
+    FMT_CHECK(fmt::file_exists(root / "repository" / "user" / fmt::path_from_utf8("工作") /
+                               "payload.txt") == false);  // 在日期目录里，这里只是确认没被删
+
+    fmt::ipc::Request unconfirmed = check;
+    unconfirmed.id = 55;
+    unconfirmed.args.erase("dry_run");
+    const fmt::ipc::Response refused = runtime.handle(unconfirmed);
+    FMT_CHECK(!refused.ok);
+    FMT_CHECK(refused.error.code == fmt::ErrorCode::ConfirmRequired);
+    FMT_CHECK_EQ(fmt::exit_code(refused.error.code), 2);
+
+    unconfirmed.id = 56;
+    unconfirmed.args["force"] = true;
+    const fmt::ipc::Response removed = runtime.handle(unconfirmed);
+    FMT_CHECK(removed.ok);
+    if (removed.ok) {
+        FMT_CHECK(removed.data.value("message", std::string{}).find("Bucket：工作") !=
+                  std::string::npos);
+    }
+
+    // ── 永久删除：预检要把要删掉的东西说清楚 ──
+    // 先回「工作」再放一个文件：上面那个已经软删除、躺在文件级回收站里了，
+    // 不在桶的树里（所以删桶之前桶里是空的）。
+    fmt::ipc::Request use_work;
+    use_work.id = 61;
+    use_work.op = "bucket.use";
+    use_work.args["argv"] = nlohmann::json::array({"工作"});
+    FMT_CHECK(runtime.handle(use_work).ok);
+
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(source, "second content")));
+    fmt::ipc::Request upload_again;
+    upload_again.id = 62;
+    upload_again.op = "file.upload";
+    upload_again.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(source)});
+    FMT_CHECK(runtime.handle(upload_again).ok);
+
+    fmt::ipc::Request delete_bucket;
+    delete_bucket.id = 57;
+    delete_bucket.op = "bucket.delete";
+    delete_bucket.args["argv"] = nlohmann::json::array({"工作"});
+    const fmt::ipc::Response bucket_removed = runtime.handle(delete_bucket);
+    FMT_CHECK(bucket_removed.ok);
+    const std::string trashed = bucket_removed.data.value("trashed_name", std::string{});
+    FMT_CHECK(!trashed.empty());
+
+    fmt::ipc::Request purge_check;
+    purge_check.id = 58;
+    purge_check.op = "trash.delete";
+    purge_check.args["argv"] = nlohmann::json::array({trashed});
+    purge_check.args["dry_run"] = true;
+    const fmt::ipc::Response plan = runtime.handle(purge_check);
+    FMT_CHECK(plan.ok);
+    if (plan.ok) {
+        FMT_CHECK(plan.data.value("needs_confirm", false));
+        FMT_CHECK_EQ(plan.data.value("original", std::string{}), std::string("工作"));
+        FMT_CHECK_EQ(plan.data.value("files", std::size_t{9}), std::size_t{1});
+        FMT_CHECK(plan.data.value("bytes", std::uintmax_t{0}) > 0);
+        FMT_CHECK(plan.data.value("message", std::string{}).find("不可恢复") != std::string::npos);
+    }
+
+    fmt::ipc::Request purge_unconfirmed = purge_check;
+    purge_unconfirmed.id = 59;
+    purge_unconfirmed.args.erase("dry_run");
+    const fmt::ipc::Response purge_refused = runtime.handle(purge_unconfirmed);
+    FMT_CHECK(!purge_refused.ok);
+    FMT_CHECK(purge_refused.error.code == fmt::ErrorCode::ConfirmRequired);
+
+    purge_unconfirmed.id = 60;
+    purge_unconfirmed.args["force"] = true;
+    FMT_CHECK(runtime.handle(purge_unconfirmed).ok);
 }
 
 FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {

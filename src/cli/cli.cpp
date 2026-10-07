@@ -601,6 +601,99 @@ void print_business_data(const nlohmann::json& data) {
     }
 }
 
+// 破坏性操作的预检结果打印（**不走** print_business_data：那是给真实结果用的，
+// 预检里的布尔字段不该被当成结果 dump 出来）。
+void print_precheck(const nlohmann::json& data) {
+    if (const auto message = data.find("message"); message != data.end() && message->is_string()) {
+        std::printf("%s\n", message->get<std::string>().c_str());
+    }
+
+    // 歧义候选：把两条记录各自的 file_id 摊开，用户才知道该用哪个
+    if (const auto items = data.find("candidates"); items != data.end() && items->is_array()) {
+        std::printf("候选：\n");
+        for (const nlohmann::json& item : *items) {
+            std::printf("  %s（Bucket：%s，file_id %s）\n",
+                        item.value("file_name", std::string{}).c_str(),
+                        item.value("bucket", std::string{}).c_str(),
+                        item.value("file_id", std::string{}).c_str());
+        }
+    }
+
+    // 永久删除的预检：把要删掉的东西列清楚
+    if (data.contains("trashed") && data.contains("files")) {
+        std::printf("回收站条目：%s\n", data.value("trashed", std::string{}).c_str());
+        const std::string original = data.value("original", std::string{});
+        std::printf("原 Bucket：%s\n",
+                    original.empty() ? "（未记录）" : original.c_str());
+        std::printf("删除时间：%s\n", data.value("deleted_at", std::string{}).c_str());
+        std::printf("文件数：%zu\n", data.value("files", std::size_t{0}));
+        std::printf("占用：%s\n", format_size(data.value("bytes", std::uintmax_t{0})).c_str());
+    }
+}
+
+// 破坏性操作的统一流程：**先检查 → 说清楚冲突的具体对象 → 再确认**。
+//
+//   ① 发一次预检（dry_run，零副作用）：由服务端判定有没有要先说清楚的情况
+//   ② 把情况原样打印（目标在哪个 Bucket、哪两条记录撞车、要永久删掉多少东西）
+//   ③ 交互窗口问 y/N；一次性命令要求 --yes
+//   ④ 用户同意之后才给真实请求带 force
+//
+// 所以在用户确认之前，**一个破坏性请求都不会发出去**。
+// 返回 false 表示不要继续（用户拒绝，或预检发现这是确认也解决不了的问题）。
+bool confirm_before_acting(const std::string& operation, const nlohmann::json& arguments,
+                           bool pre_confirmed, Session& session, const Options& options,
+                           bool interactive) {
+    ipc::Request check;
+    check.id = session.next_id++;
+    check.op = operation;
+    check.root = options.data_root;
+    check.pid = GetCurrentProcessId();
+    check.args = arguments;
+    check.args["dry_run"] = true;
+
+    Result<ipc::Response> checked = session.client.call(check, ipc::kCommandTimeoutMs);
+    if (!ok(checked)) {
+        session.connected = false;
+        std::fprintf(stderr, "预检失败：%s\n", error_of(checked)->message.c_str());
+        return false;
+    }
+    const ipc::Response& response = std::get<ipc::Response>(checked);
+    if (!response.ok) {
+        print_failure(response.error);  // 预检就错了（不存在、已在回收站…）直接报出来
+        return false;
+    }
+
+    print_precheck(response.data);
+
+    if (response.data.value("blocked", false)) {
+        // 例如「名字与 file_id 撞车」：y 无法表达删哪一个，必须让用户改用 file_id。
+        std::fprintf(stderr, "这项操作不能靠确认解决，请按上面的提示指定具体对象\n");
+        return false;
+    }
+    if (!response.data.value("needs_confirm", false)) {
+        return true;  // 没有什么要先说清楚的，照做
+    }
+
+    if (!pre_confirmed) {
+        if (!interactive) {
+            std::fprintf(stderr, "该操作需要确认：请加 --yes，或在交互窗口里执行\n");
+            log_warn("Cli", "拒绝未确认的破坏性操作：" + operation);
+            return false;
+        }
+        std::printf("确认执行？(y/N) ");
+        std::fflush(stdout);
+
+        std::string answer;
+        std::getline(std::cin, answer);
+        if (answer.empty() || (answer[0] != 'y' && answer[0] != 'Y')) {
+            log_info("Cli", "用户取消了：" + operation);
+            std::printf("已取消\n");
+            return false;
+        }
+    }
+    return true;
+}
+
 int run_business_command(const std::vector<std::string>& parts, Session& session,
                          const Options& options, bool interactive) {
     const std::string operation = parts[0] + "." + parts[1];
@@ -616,34 +709,18 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
         arguments.push_back(parts[i]);
     }
 
-    // 永久删除不可恢复：交互窗口里问一句，一次性命令必须显式 --yes。
-    // 确认结果作为 force 发给服务端，服务端也会再检查一次。
-    if (operation == "trash.delete") {
-        const std::string target =
-            arguments.empty() ? std::string{} : arguments[0].get<std::string>();
-        if (interactive) {
-            std::printf("永久删除回收站条目 %s ？此操作不可恢复 (y/N) ", target.c_str());
-            std::fflush(stdout);
-            std::string answer;
-            std::getline(std::cin, answer);
-            if (answer.empty() || (answer[0] != 'y' && answer[0] != 'Y')) {
-                log_info("Cli", "用户取消永久删除：" + target);
-                std::printf("已取消\n");
-                return 0;
-            }
-            confirmed = true;
-        } else if (!confirmed) {
-            std::fprintf(stderr,
-                         "永久删除不可恢复：请加 --yes 明确确认，或在交互窗口里执行\n");
-            log_warn("Cli", "拒绝未确认的永久删除：" + target);
-            return exit_code(ErrorCode::InvalidArgument);
-        }
-    }
-
     if (const Status status = ensure_connected(session, options); !ok(status)) {
         log_error("Cli", "命令 " + operation + " 无法连接服务：" + error_of(status)->message);
         print_failure(*error_of(status));
         return exit_code(error_of(status)->code);
+    }
+
+    // 破坏性操作（软删除也进回收站、永久删除则不可恢复）：先检查、说清楚、再确认。
+    const bool destructive = (operation == "file.delete" || operation == "trash.delete");
+    if (destructive &&
+        !confirm_before_acting(operation, arguments, confirmed, session, options, interactive)) {
+        // 交互窗口里用户拒绝 = 正常退出；一次性命令缺 --yes = 需要确认（退出码 2）
+        return interactive ? 0 : exit_code(ErrorCode::ConfirmRequired);
     }
 
     ipc::Request request;
@@ -655,7 +732,9 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     if (!arguments.empty()) {
         request.args["argv"] = arguments;
     }
-    if (confirmed) {
+    // 预检已经做过、用户也已经同意：这里带 force 让服务端放行。
+    // 服务端仍然会独立校验（预检被绕过时也不会误删）。
+    if (confirmed || destructive) {
         request.args["force"] = true;
     }
 

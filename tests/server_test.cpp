@@ -215,14 +215,25 @@ FMT_TEST(Server, Bucket路由与状态码) {
             FMT_CHECK(body["data"]["present"].get<bool>());
         }
 
-        // 没确认 -> 400 + FMT-001
+        // 预检：?dry_run=1 要把要永久删掉的东西说清楚，且不改数据
+        const auto plan = client.Delete("/api/trash/" + fmt::url_encode(second) + "?dry_run=1");
+        FMT_CHECK(plan != nullptr);
+        if (plan != nullptr) {
+            FMT_CHECK_EQ(plan->status, 200);
+            const nlohmann::json body = nlohmann::json::parse(plan->body);
+            FMT_CHECK(body["data"]["needs_confirm"].get<bool>());
+            FMT_CHECK_EQ(body["data"]["original"].get<std::string>(), std::string("工作"));
+            FMT_CHECK(body["data"].contains("files"));
+        }
+
+        // 没确认 -> 400 + FMT-016（需要显式确认）
         const auto refused = client.Delete("/api/trash/" + fmt::url_encode(second));
         FMT_CHECK(refused != nullptr);
         if (refused != nullptr) {
             FMT_CHECK_EQ(refused->status, 400);
             FMT_CHECK_EQ(
                 nlohmann::json::parse(refused->body)["error"]["code"].get<std::string>(),
-                std::string("FMT-001"));
+                std::string("FMT-016"));
         }
 
         // ?force=1 -> 真的删掉
@@ -349,6 +360,20 @@ FMT_TEST(Server, File路由与上传) {
         FMT_CHECK_EQ(nlohmann::json::parse(missing->body)["error"]["code"].get<std::string>(),
                      std::string("FMT-002"));
     }
+
+    // 预检：?dry_run=1 只读、零副作用，同桶删除不需要确认
+    const auto precheck = client.Delete("/api/file/" + fmt::url_encode(file_id) + "?dry_run=1");
+    FMT_CHECK(precheck != nullptr);
+    if (precheck != nullptr) {
+        FMT_CHECK_EQ(precheck->status, 200);
+        const nlohmann::json plan = nlohmann::json::parse(precheck->body);
+        FMT_CHECK(!plan["data"]["needs_confirm"].get<bool>());
+        FMT_CHECK(!plan["data"]["blocked"].get<bool>());
+        FMT_CHECK_EQ(plan["data"]["bucket"].get<std::string>(), std::string("工作"));
+    }
+    // 预检没动数据：文件还在
+    const auto still_there = client.Get("/api/file/" + fmt::url_encode(file_id));
+    FMT_CHECK(still_there != nullptr && still_there->status == 200);
 
     // 软删除
     const auto removed = client.Delete("/api/file/" + fmt::url_encode(file_id));

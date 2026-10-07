@@ -691,45 +691,52 @@ Result<std::filesystem::path> FileService::trash_path_of(const FileRecord& recor
                              record.file_name);
 }
 
-Result<std::size_t> FileService::locate_record(const std::vector<FileRecord>& records,
-                                               std::string_view key) const {
+FileService::RecordMatch FileService::match_record(const std::vector<FileRecord>& records,
+                                                   std::string_view key) const {
     // 标识比较**一律不区分大小写**（Windows 习惯：文件名与路径都不区分大小写，
     // 用户敲 `DOC.TXT` 或大写 file_id 时不该得到「文件不存在」）。
+    RecordMatch match;
 
-    // ① 先当 file_id：全局唯一，形状固定（fmt-YYYYMMDD-N），先查不会误伤名字。
-    std::size_t by_id = records.size();
-    std::size_t by_name = records.size();
+    // ① 当 file_id：全局唯一，形状固定（fmt-YYYYMMDD-N）。
     for (std::size_t i = 0; i < records.size(); ++i) {
         if (iequals(records[i].file_id, key)) {
-            by_id = i;
+            match.has_id = true;
+            match.by_id = i;
             break;
         }
     }
 
-    // ② 再当文件名：当前用户 + 正常文件。
+    // ② 当文件名：当前用户 + 正常文件。
     //    名字在同用户范围内唯一（重名上传会被 FMT-105 拒绝，且比较不区分大小写）。
     for (std::size_t i = 0; i < records.size(); ++i) {
         if (records[i].user == config_.current_user && !records[i].is_trash &&
             iequals(records[i].file_name, key)) {
-            by_name = i;
+            match.has_name = true;
+            match.by_name = i;
             break;
         }
     }
+    return match;
+}
+
+Result<std::size_t> FileService::locate_record(const std::vector<FileRecord>& records,
+                                               std::string_view key) const {
+    const RecordMatch match = match_record(records, key);
 
     // 两者命中**不同**的记录：这是上传时已被禁止的形状（名字与 file_id 同形），
     // 只可能来自旧数据或手工改过的 file.json——不能猜，直接报歧义。
-    if (by_id != records.size() && by_name != records.size() && by_id != by_name) {
+    if (match.has_id && match.has_name && match.by_id != match.by_name) {
         return make_error(ErrorCode::InvalidArgument,
-                          "有歧义：" + std::string(key) + " 既是 " + records[by_id].file_id +
-                              " 的文件标识，又是另一个文件的文件名（file_id " +
-                              records[by_name].file_id +
+                          "有歧义：" + std::string(key) + " 既是 " +
+                              records[match.by_id].file_id + " 的文件标识，又是另一个文件的文件名（file_id " +
+                              records[match.by_name].file_id +
                               "）。这种名字现在不允许上传；请直接用 file_id 指定要删哪一个");
     }
-    if (by_id != records.size()) {
-        return by_id;
+    if (match.has_id) {
+        return match.by_id;
     }
-    if (by_name != records.size()) {
-        return by_name;
+    if (match.has_name) {
+        return match.by_name;
     }
 
     // ③ 名字存在、但已经在回收站里：说清楚是哪一条，别让用户以为文件没了。
@@ -743,6 +750,63 @@ Result<std::size_t> FileService::locate_record(const std::vector<FileRecord>& re
     }
 
     return make_error(ErrorCode::FileNotFound, "文件不存在：" + std::string(key));
+}
+
+Result<FileDeleteCheck> FileService::check_remove(std::string_view file_id_or_name) const {
+    if (config_.current_user.empty()) {
+        return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
+    }
+    if (file_id_or_name.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少 file_id 或文件名");
+    }
+
+    Result<std::vector<FileRecord>> loaded = load_records();
+    if (!ok(loaded)) {
+        return *error_of(loaded);
+    }
+    const std::vector<FileRecord> records = std::get<std::vector<FileRecord>>(loaded);
+    const RecordMatch match = match_record(records, file_id_or_name);
+
+    FileDeleteCheck check;
+    check.current_bucket = config_.current_bucket;
+
+    // 歧义：名字与 file_id 撞在**两条不同**的记录上。
+    // 这不是「确认一下就能删」的事——y/N 无法表达删哪一个，必须让用户改用 file_id。
+    if (match.has_id && match.has_name && match.by_id != match.by_name) {
+        check.ambiguous = true;
+        check.candidates.push_back(records[match.by_id]);
+        check.candidates.push_back(records[match.by_name]);
+        check.message = "「" + std::string(file_id_or_name) + "」既是文件标识、又是另一个文件名，" +
+                        "无法确定删哪一个：" + records[match.by_id].file_name + "（file_id " +
+                        records[match.by_id].file_id + "）与 " + records[match.by_name].file_name +
+                        "（file_id " + records[match.by_name].file_id +
+                        "）。请用 file_id 明确指定";
+        return check;
+    }
+
+    // 没有命中：走与 delete 完全相同的错误路径（含「已经在回收站里」的提示），
+    // 免得预检与执行给出两套说法。
+    if (!match.has_id && !match.has_name) {
+        const Result<std::size_t> located = locate_record(records, file_id_or_name);
+        return *error_of(located);
+    }
+
+    const FileRecord& record = records[match.has_id ? match.by_id : match.by_name];
+    check.file_id = record.file_id;
+    check.file_name = record.file_name;
+    check.bucket = record.bucket;
+
+    const Result<std::filesystem::path> path = resolve_path(record);
+    if (ok(path)) {
+        check.path = relative_path_text(paths_.root(), std::get<std::filesystem::path>(path));
+    }
+
+    check.other_bucket = !iequals(record.bucket, config_.current_bucket);
+    if (check.other_bucket) {
+        check.message = "「" + record.file_name + "」属于 Bucket「" + record.bucket +
+                        "」，而当前 Bucket 是「" + config_.current_bucket + "」";
+    }
+    return check;
 }
 
 Result<FileRecord> FileService::remove(std::string_view file_id_or_name) {

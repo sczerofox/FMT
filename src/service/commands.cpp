@@ -219,19 +219,47 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
     }
 
     if (operation == "trash.delete") {
-        // **永久删除不可恢复**：调用方必须显式确认（CLI 在用户回答 y 之后才置 force）。
-        // 少一次误操作就少一次数据丢失，宁可多要一个字段。
-        const auto force = args.find("force");
-        if (force == args.end() || !force->is_boolean() || !force->get<bool>()) {
-            return make_error(ErrorCode::InvalidArgument,
-                              "永久删除不可恢复，需要确认（force = true）");
-        }
-
         const Result<std::string> name = argument(args, 0, "回收站条目名称");
         if (!ok(name)) {
             return *error_of(name);
         }
         const std::string value = std::get<std::string>(name);
+
+        // ① 预检（dry_run）：把要永久删掉的东西**说清楚**——原桶名、删除时间、
+        //    多少文件、占多少空间。永久删除没有「确认一下就行」之外的补救。
+        if (args.value("dry_run", false)) {
+            const Result<TrashBucketDetail> detail = buckets.get_trashed(value);
+            if (!ok(detail)) {
+                return *error_of(detail);
+            }
+            const TrashBucketDetail& found = std::get<TrashBucketDetail>(detail);
+
+            nlohmann::json data = nlohmann::json::object();
+            data["needs_confirm"] = true;  // 永久删除永远要确认
+            data["trashed"] = found.bucket.trashed_name;
+            data["original"] = found.bucket.original_name;
+            data["deleted_at"] = found.bucket.deleted_at;
+            data["present"] = found.bucket.directory_present;
+            data["files"] = found.file_count;
+            data["bytes"] = found.byte_count;
+
+            std::string message = "永久删除后不可恢复：" + found.bucket.trashed_name;
+            message += "（原桶 " + (found.bucket.original_name.empty()
+                                      ? std::string("未记录")
+                                      : found.bucket.original_name);
+            message += "，" + std::to_string(found.file_count) + " 个文件，" +
+                       format_size(found.byte_count) + "）";
+            data["message"] = message;
+            return data;
+        }
+
+        // ② **永久删除不可恢复**：调用方必须显式确认（CLI 在用户回答 y 之后才置 force）。
+        //    少一次误操作就少一次数据丢失，宁可多要一个字段。
+        const auto force = args.find("force");
+        if (force == args.end() || !force->is_boolean() || !force->get<bool>()) {
+            return make_error(ErrorCode::ConfirmRequired,
+                              "永久删除不可恢复，需要确认（force = true）");
+        }
 
         const Result<TrashPurge> purged = buckets.purge(value);
         if (!ok(purged)) {
@@ -329,11 +357,68 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
     }
 
     if (operation == "file.delete") {
-        const Result<std::string> name = argument(args, 0, "file_id");
+        const Result<std::string> name = argument(args, 0, "file_id 或文件名");
         if (!ok(name)) {
             return *error_of(name);
         }
         const std::string value = std::get<std::string>(name);
+
+        // ① 预检（dry_run）：只读，不改任何东西。
+        //    CLI 用它实现「先检查 → 说清楚冲突的具体对象 → 再让用户确认」，
+        //    这样**破坏性请求在用户确认之前一个都不发**。
+        if (args.value("dry_run", false)) {
+            const Result<FileDeleteCheck> checked = files.check_remove(value);
+            if (!ok(checked)) {
+                return *error_of(checked);
+            }
+            const FileDeleteCheck& check = std::get<FileDeleteCheck>(checked);
+
+            nlohmann::json data = nlohmann::json::object();
+            data["ambiguous"] = check.ambiguous;
+            data["other_bucket"] = check.other_bucket;
+            // 歧义**不能**靠 y/N 解决（y 无法表达删哪一个），所以它算「阻断」而不是「确认」
+            data["blocked"] = check.ambiguous;
+            data["needs_confirm"] = check.other_bucket;
+            data["current_bucket"] = check.current_bucket;
+            if (!check.file_id.empty()) {
+                data["file_id"] = check.file_id;
+                data["file_name"] = check.file_name;
+                data["bucket"] = check.bucket;
+            }
+            if (!check.path.empty()) {
+                data["path"] = check.path;
+            }
+            if (!check.candidates.empty()) {
+                nlohmann::json array = nlohmann::json::array();
+                for (const FileRecord& candidate : check.candidates) {
+                    nlohmann::json item = nlohmann::json::object();
+                    item["file_id"] = candidate.file_id;
+                    item["file_name"] = candidate.file_name;
+                    item["bucket"] = candidate.bucket;
+                    array.push_back(std::move(item));
+                }
+                data["candidates"] = std::move(array);
+            }
+            if (!check.message.empty()) {
+                data["message"] = check.message;
+            }
+            return data;
+        }
+
+        // ② 兜底：预检被绕过时，跨 Bucket 的删除仍然必须显式确认过。
+        const auto force = args.find("force");
+        const bool forced = force != args.end() && force->is_boolean() && force->get<bool>();
+        if (!forced) {
+            const Result<FileDeleteCheck> checked = files.check_remove(value);
+            if (!ok(checked)) {
+                return *error_of(checked);
+            }
+            const FileDeleteCheck& check = std::get<FileDeleteCheck>(checked);
+            if (check.other_bucket) {
+                return make_error(ErrorCode::ConfirmRequired,
+                                  check.message + "；确认删除请加 force（CLI：--yes）");
+            }
+        }
 
         const Result<FileRecord> removed = files.remove(value);
         if (!ok(removed)) {
@@ -344,13 +429,17 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
         nlohmann::json data = nlohmann::json::object();
         data["file_id"] = record.file_id;
         data["file_name"] = record.file_name;
+        data["bucket"] = record.bucket;
 
         const Result<std::filesystem::path> target = files.trash_path_of(record);
         if (ok(target)) {
             data["moved_to"] =
                 relative_path_text(context.paths->root(), std::get<std::filesystem::path>(target));
         }
-        data["message"] = "文件已移入回收站：" + record.file_name;
+        data["message"] = "文件已移入回收站：" + record.file_name +
+                          (iequals(record.bucket, context.config.current_bucket)
+                               ? std::string{}
+                               : "（Bucket：" + record.bucket + "）");
         return data;
     }
 
