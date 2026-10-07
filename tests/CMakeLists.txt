@@ -1,28 +1,18 @@
-# Unit tests. Add one test source file per module as the project grows.
-include(FetchContent)
-
-set(FMT_CATCH2_TAG v3.7.1 CACHE STRING "Catch2 git tag to fetch")
-
-FetchContent_Declare(Catch2
-    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG        ${FMT_CATCH2_TAG}
-    GIT_SHALLOW    TRUE
-    SYSTEM
-)
-FetchContent_MakeAvailable(Catch2)
-
+# FMT 单元测试
+#
+# 每个模块一个 *_test.cpp，链接 fmt_core，测试与可执行文件共用同一份实现。
+# 新增测试文件时在这里登记；fmt_test.cpp 提供运行器（无第三方依赖，可离线构建）。
 add_executable(fmt_tests
-    core_test.cpp
+    fmt_test.cpp
+    error_test.cpp
 )
 
 target_link_libraries(fmt_tests
     PRIVATE
         fmt_core
         fmt_project_options
-        Catch2::Catch2WithMain
 )
 
-list(APPEND CMAKE_MODULE_PATH "${Catch2_SOURCE_DIR}/extras")
-include(Catch)
+target_include_directories(fmt_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-catch_discover_tests(fmt_tests)
+add_test(NAME fmt_tests COMMAND fmt_tests)

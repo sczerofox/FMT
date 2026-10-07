@@ -2,31 +2,21 @@ name: ci
 
 on:
   push:
-    branches: [main, dev, "feature/**"]
+    branches: [main, dev, arch-restart, "feature/**"]
   pull_request:
     branches: [main, dev]
   workflow_dispatch:
 
-# Cancel superseded runs on the same branch.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+# FMT 是 Windows 专用项目：Windows Service（advapi32）、ShellExecuteEx 提权、
+# 命名管道安全描述符都无法在 Linux 上构建，因此 CI 只跑 windows-latest。
 jobs:
   build:
-    name: ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: windows-msvc
-            os: windows-latest
-            generator: Ninja
-          - name: ubuntu-gcc
-            os: ubuntu-latest
-            generator: Ninja
+    name: windows-msvc
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -36,10 +26,13 @@ jobs:
         with:
           cmakeVersion: 3.31.x
 
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Configure
         run: >
           cmake -S . -B build
-          -G "${{ matrix.generator }}"
+          -G Ninja
           -DCMAKE_BUILD_TYPE=Debug
           -DBUILD_TESTING=ON
 
@@ -50,7 +43,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
       - name: Smoke test the executable
-        shell: bash
+        shell: pwsh
         run: |
-          ./build/bin/FMT --version
-          ./build/bin/FMT --help
+          ./build/bin/fmt.exe --version
+          ./build/bin/fmt.exe --help
