@@ -78,6 +78,30 @@ bool is_windows_reserved_name(std::string_view name) {
     return false;
 }
 
+// 名字是否与 file_id 同形：fmt-YYYYMMDD-N（前缀按 ASCII 折叠，因为 file_id 比对本身
+// 也不区分大小写）。这种名字会让「先查 id、再查名字」的定位产生歧义。
+bool looks_like_file_id(std::string_view name) {
+    // fmt-YYYYMMDD-N 最短是 14 个字符（4 + 8 + 1 + 1）。
+    // 前缀按 ASCII 折叠比较（file_id 的比对本身也不区分大小写）。
+    if (name.size() < 14) {
+        return false;
+    }
+    if (to_lower_ascii(name.substr(0, 4)) != "fmt-" || name[12] != '-') {
+        return false;
+    }
+    for (std::size_t i = 4; i < 12; ++i) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+    }
+    for (std::size_t i = 13; i < name.size(); ++i) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
 Status validate_bucket_name(std::string_view name) {
     if (name.empty()) {
         return make_error(ErrorCode::BucketNameInvalid, "Bucket 名称不能为空");
@@ -127,6 +151,11 @@ Status validate_file_name(std::string_view name) {
     if (is_windows_reserved_name(name)) {
         return make_error(ErrorCode::FileNameReserved,
                           "文件名不能是 Windows 保留设备名：" + std::string(name));
+    }
+    if (looks_like_file_id(name)) {
+        return make_error(ErrorCode::FileNameLikeFileId,
+                          "文件名不能与文件标识同形（fmt-YYYYMMDD-N）：" + std::string(name) +
+                              "（会与 file_id 混淆，请换一个名字）");
     }
     if (has_bad_tail(name)) {
         return make_error(ErrorCode::FileNameInvalidChar, "文件名不能以点或空格结尾");

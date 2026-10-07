@@ -42,6 +42,7 @@ enum class ErrorCode : int {
     FileNameReserved = 103,        // Windows 保留设备名     退出码 2
     FileNameTooLong = 104,         // 文件名超长             退出码 2
     FileNameConflict = 105,        // 同用户正常文件重名     退出码 4
+    FileNameLikeFileId = 106,      // 名字与 file_id 同形    退出码 2
 
     // ---- FMT-2xx Bucket ----
     BucketNotFound = 200,          // Bucket 不存在          退出码 3

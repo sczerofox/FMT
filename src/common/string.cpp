@@ -54,7 +54,15 @@ bool iequals(std::string_view left, std::string_view right) {
     for (std::size_t i = 0; i < left.size(); ++i) {
         const auto a = static_cast<unsigned char>(left[i]);
         const auto b = static_cast<unsigned char>(right[i]);
-        if (std::tolower(a) != std::tolower(b)) {
+        // 只折叠 ASCII：>= 0x80 的字节是 UTF-8 多字节序列的一部分，
+        // 交给 std::tolower 会随 locale 变化，中文名字可能被改坏。
+        const auto fold = [](unsigned char value) {
+            if (value < 0x80) {
+                return static_cast<unsigned char>(std::tolower(value));
+            }
+            return value;
+        };
+        if (fold(a) != fold(b)) {
             return false;
         }
     }

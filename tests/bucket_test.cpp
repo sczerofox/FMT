@@ -515,6 +515,55 @@ FMT_TEST(Bucket, 大小写不同也认得同一个桶) {
     }
 }
 
+FMT_TEST(Bucket, 创建时大写会转成小写) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+
+    const auto created = buckets.create("WORK");
+    FMT_CHECK(fmt::ok(created));
+    if (!fmt::ok(created)) {
+        return;
+    }
+    const fmt::BucketCreation& result = std::get<fmt::BucketCreation>(created);
+    FMT_CHECK_EQ(result.requested, std::string("WORK"));
+    FMT_CHECK_EQ(result.name, std::string("work"));
+    FMT_CHECK(result.renamed);
+    FMT_CHECK(result.became_current);
+    FMT_CHECK_EQ(f.config.current_bucket, std::string("work"));
+
+    // 磁盘上的**实际条目名**是小写（目录名本身不区分大小写，不能靠 directory_exists 判断）
+    bool found_lower = false;
+    bool found_upper = false;
+    std::error_code code;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(f.root / "repository" / "user", code)) {
+        const std::string name = fmt::path_to_utf8(entry.path().filename());
+        found_lower = found_lower || name == "work";
+        found_upper = found_upper || name == "WORK";
+    }
+    FMT_CHECK(found_lower);
+    FMT_CHECK(!found_upper);
+
+    // 再敲大写会被认成同一个桶
+    const auto again = buckets.create("WORK");
+    FMT_CHECK(!fmt::ok(again));
+    FMT_CHECK(fmt::error_of(again)->code == fmt::ErrorCode::BucketAlreadyExists);
+}
+
+FMT_TEST(Bucket, use大写规范化到磁盘上的名字) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(buckets.create("work")));
+
+    FMT_CHECK(fmt::ok(buckets.use("WORK")));
+    // 存进 current_bucket 的是磁盘上的实际拼写，不是用户敲的
+    FMT_CHECK_EQ(f.config.current_bucket, std::string("work"));
+
+    const auto info = buckets.get("WORK");
+    FMT_CHECK(fmt::ok(info));
+    FMT_CHECK_EQ(std::get<fmt::BucketInfo>(info).name, std::string("work"));
+}
+
 FMT_TEST(Bucket, 当前Bucket失效时置空) {
     Fixture f;
     fmt::BucketService buckets(*f.paths, f.config, nullptr);

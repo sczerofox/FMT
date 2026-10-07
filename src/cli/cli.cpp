@@ -134,6 +134,8 @@ bool print_command_help(const std::string& topic) {
             "  delete <名称>   移到回收站，名字变成 <名称>_<时间戳>；\n"
             "                  删的是当前 Bucket 时置空，不自动切换\n"
             "\n"
+            "名称统一使用小写：create WORK 会建成 work（会提示你）；\n"
+            "其余命令按名找桶时不区分大小写，找得到就按磁盘上的实际名字处理。\n"
             "回收站的桶级记录在 trash/<用户>/.original 里，回退用 trash restore。\n");
         return true;
     }
@@ -144,13 +146,17 @@ bool print_command_help(const std::string& topic) {
             "                           文件名省略时取来源的最后一段；重名不会自动改名，\n"
             "                           会提示换一个名字；相同内容（MD5 相同）会被拒绝，\n"
             "                           不重复入库。大小上限取 config.json 的 max_upload_size。\n"
+            "                           文件名不能与文件标识同形（fmt-YYYYMMDD-N）：\n"
+            "                           那会和 file_id 混淆，属保留形状（FMT-106）。\n"
             "  list                     列出当前 Bucket 的正常文件\n"
-            "  get <file_id|文件名>     查看文件信息与磁盘路径\n"
+            "  get <file_id|文件名>     按文件名只查正常文件；按 file_id 连回收站里的\n"
+            "                           也查得到（带 is_trash 与 trash_path）\n"
             "  delete <file_id|文件名>  软删除进回收站，file_id 不变\n"
             "                           （文件级回收站目前只能写、还不能从 trash 查回，待阶段 7）\n"
             "\n"
             "文件落在 repository/<用户>/<Bucket>/YYYY/MM/DD/ 下；上传先写 temp/，\n"
             "校验（大小上限、MD5、文件名）通过后才移动入库。\n"
+            "名字与 file_id 的比较都不区分大小写（Windows 习惯）。\n"
             "网络下载走系统组件（WinHTTP + Schannel），支持 https，不需要 OpenSSL。\n");
         return true;
     }
@@ -488,6 +494,11 @@ void print_business_data(const nlohmann::json& data) {
         return;
     }
 
+    // 服务端的提示（例如「Bucket 名称统一使用小写」）单独一行先打出来。
+    if (const auto note = data.find("note"); note != data.end() && note->is_string()) {
+        std::printf("提示：%s\n", note->get<std::string>().c_str());
+    }
+
     // 列表：buckets: [{name, is_current}, …]
     if (const auto items = data.find("buckets"); items != data.end() && items->is_array()) {
         for (const nlohmann::json& item : *items) {
@@ -556,6 +567,9 @@ void print_business_data(const nlohmann::json& data) {
         std::printf("MD5：%s\n", data.value("md5", std::string{}).c_str());
         if (data.contains("path")) {
             std::printf("路径：%s\n", data.value("path", std::string{}).c_str());
+        }
+        if (data.contains("trash_path")) {
+            std::printf("回收站路径：%s\n", data.value("trash_path", std::string{}).c_str());
         }
         if (data.value("is_trash", false)) {
             std::printf("状态：在回收站（%s）\n",

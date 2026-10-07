@@ -40,6 +40,8 @@ constexpr Entry kTable[] = {
     {ErrorCode::FileNameReserved, "FileNameReserved", 2, "文件名是 Windows 保留设备名"},
     {ErrorCode::FileNameTooLong, "FileNameTooLong", 2, "文件名超长"},
     {ErrorCode::FileNameConflict, "FileNameConflict", 4, "同用户下已存在同名正常文件"},
+    {ErrorCode::FileNameLikeFileId, "FileNameLikeFileId", 2,
+     "文件名与文件标识同形（fmt-YYYYMMDD-N），会与 file_id 混淆"},
 
     // ---- FMT-2xx Bucket ----
     {ErrorCode::BucketNotFound, "BucketNotFound", 3, "Bucket 不存在"},

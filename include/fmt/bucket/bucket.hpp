@@ -44,6 +44,15 @@ struct BucketRemoval {
     bool was_current = false;
 };
 
+// 创建 Bucket 的结果。**名称统一小写**：`WORK` 会被建成 `work`，
+// `renamed` 为真时调用方要提示用户（免得他以为建了个大写的桶）。
+struct BucketCreation {
+    std::string requested;        // 用户原本敲的
+    std::string name;             // 实际创建的名字（小写）
+    bool renamed = false;         // requested != name
+    bool became_current = false;  // 是不是顺手设成了当前 Bucket
+};
+
 // 回收站里的一个 Bucket 条目。
 //
 // **桶级记录的唯一权威是 `trash/<user>/.original`**：它跟着数据走，`data/*.json`
@@ -76,7 +85,8 @@ class BucketService {
 public:
     BucketService(const PathManager& paths, Config& config, Logger* logger);
 
-    Status create(std::string_view name);
+    // 创建：名称统一转小写后再校验与建目录（见 BucketCreation）。
+    Result<BucketCreation> create(std::string_view name);
     Result<std::vector<BucketInfo>> list();
     Result<BucketInfo> get(std::string_view name);
     Status use(std::string_view name);
@@ -113,6 +123,9 @@ private:
 
     std::filesystem::path user_root() const;
     std::filesystem::path bucket_path(std::string_view name) const;
+    // 磁盘上的实际桶名（不区分大小写地找）；找不到就返回小写后的输入。
+    // 用它把用户敲的拼写规范化，免得 `WORK` / `work` 两种写法在记录里各留一份。
+    std::string canonical_name(std::string_view name) const;
     std::filesystem::path trash_user_root() const;
     std::filesystem::path original_index_path() const;
 

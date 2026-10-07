@@ -88,6 +88,27 @@ std::filesystem::path BucketService::directory_of(std::string_view name) const {
     return bucket_path(name);
 }
 
+std::string BucketService::canonical_name(std::string_view name) const {
+    // 目录不区分大小写：优先返回磁盘上的实际拼写，找不到才退回小写形式。
+    std::error_code code;
+    if (std::filesystem::is_directory(user_root(), code)) {
+        for (const auto& entry : std::filesystem::directory_iterator(user_root(), code)) {
+            if (code) {
+                break;
+            }
+            std::error_code type_code;
+            if (!entry.is_directory(type_code)) {
+                continue;
+            }
+            const std::string candidate = path_to_utf8(entry.path().filename());
+            if (iequals(candidate, name)) {
+                return candidate;
+            }
+        }
+    }
+    return to_lower(name);
+}
+
 Status BucketService::require_current_user() const {
     if (config_.current_user.empty()) {
         return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
@@ -101,38 +122,50 @@ Status BucketService::persist_config() { return save_config(paths_, config_); }
 // create / list / get / use
 // ---------------------------------------------------------------------------
 
-Status BucketService::create(std::string_view name) {
+Result<BucketCreation> BucketService::create(std::string_view name) {
     if (const Status status = require_current_user(); !ok(status)) {
-        return status;
-    }
-    if (const Status status = validate_bucket_name(name); !ok(status)) {
-        return status;
+        return *error_of(status);
     }
 
-    const std::filesystem::path directory = bucket_path(name);
+    // **名称统一小写**：Windows 目录不区分大小写，`WORK` 与 `work` 本来就是同一个目录，
+    // 统一拼写才能让「同名」判定与回收站记录稳定，也免得用户以为存在两个桶。
+    BucketCreation created;
+    created.requested = std::string(name);
+    created.name = to_lower(name);
+    created.renamed = (created.name != created.requested);
+
+    if (const Status status = validate_bucket_name(created.name); !ok(status)) {
+        return *error_of(status);
+    }
+
+    const std::filesystem::path directory = bucket_path(created.name);
     if (directory_exists(directory)) {
-        return make_error(ErrorCode::BucketAlreadyExists, "Bucket 已存在：" + std::string(name));
+        return make_error(ErrorCode::BucketAlreadyExists, "Bucket 已存在：" + created.name);
     }
 
     if (const Status status = ensure_directory(user_root()); !ok(status)) {
-        return status;
+        return *error_of(status);
     }
     if (const Status status = ensure_directory(directory); !ok(status)) {
-        return status;
+        return *error_of(status);
     }
 
     // 第一个 Bucket 自动成为当前 Bucket（第 28 节）。
     if (config_.current_bucket.empty()) {
-        config_.current_bucket = std::string(name);
+        config_.current_bucket = created.name;
         if (const Status status = persist_config(); !ok(status)) {
-            return status;
+            return *error_of(status);
         }
+        created.became_current = true;
     }
 
     if (logger_ != nullptr) {
-        logger_->info("Bucket", "创建 Bucket：" + std::string(name));
+        logger_->info("Bucket", "创建 Bucket：" + created.name +
+                                    (created.renamed ? "（名称统一小写，由 " + created.requested +
+                                                           " 转换）"
+                                                     : std::string{}));
     }
-    return std::monostate{};
+    return created;
 }
 
 Result<std::vector<BucketInfo>> BucketService::list() {
@@ -181,8 +214,9 @@ Result<BucketInfo> BucketService::get(std::string_view name) {
     }
 
     BucketInfo info;
-    info.name = std::string(name);
-    info.is_current = (info.name == config_.current_bucket);
+    // 报磁盘上的实际名字，而不是用户敲的拼写（`get WORK` 时显示 work）
+    info.name = canonical_name(name);
+    info.is_current = iequals(info.name, config_.current_bucket);
     return info;
 }
 
@@ -198,13 +232,15 @@ Status BucketService::use(std::string_view name) {
         return make_error(ErrorCode::BucketNotFound, "Bucket 不存在：" + std::string(name));
     }
 
-    config_.current_bucket = std::string(name);
+    // 落盘时规范化成磁盘上的实际名字：否则 `use WORK` 会把 "WORK" 存进 current_bucket，
+    // 而目录叫 "work"——以后按这个名字写进 file.json / .original 就会留下另一种拼写。
+    config_.current_bucket = canonical_name(name);
     if (const Status status = persist_config(); !ok(status)) {
         return status;
     }
 
     if (logger_ != nullptr) {
-        logger_->info("Bucket", "切换当前 Bucket：" + std::string(name));
+        logger_->info("Bucket", "切换当前 Bucket：" + config_.current_bucket);
     }
     return std::monostate{};
 }
@@ -224,6 +260,10 @@ Result<BucketRemoval> BucketService::remove(std::string_view name) {
         return make_error(ErrorCode::BucketNotFound, "Bucket 不存在：" + std::string(name));
     }
 
+    // 名字一律规范化成磁盘上的实际拼写：回收站目录名、`.original` 里的原名、
+    // 以及 file.json 里按桶名匹配的记录，都靠它保持一致。
+    const std::string actual = canonical_name(name);
+
     // 先读索引：它坏了就不能继续——否则桶搬进回收站却没有身份记录，原名就丢了。
     Result<std::vector<TrashBucket>> loaded = load_original_index();
     if (!ok(loaded)) {
@@ -232,28 +272,28 @@ Result<BucketRemoval> BucketService::remove(std::string_view name) {
     std::vector<TrashBucket> entries = std::get<std::vector<TrashBucket>>(loaded);
 
     BucketRemoval removal;
-    removal.was_current = iequals(config_.current_bucket, name);
-    removal.trashed_name = unique_trashed_name(name);
+    removal.was_current = iequals(config_.current_bucket, actual);
+    removal.trashed_name = unique_trashed_name(actual);
 
-    if (const Status status = move_bucket_to_trash(name, removal.trashed_name, &removal.moved_to);
+    if (const Status status = move_bucket_to_trash(actual, removal.trashed_name, &removal.moved_to);
         !ok(status)) {
         return *error_of(status);
     }
 
     TrashBucket record;
     record.trashed_name = removal.trashed_name;
-    record.original_name = std::string(name);
+    record.original_name = actual;
     record.deleted_at = local_datetime_iso();
 
     entries.push_back(record);
     if (const Status status = save_original_index(entries); !ok(status)) {
         // 身份记录写不进去就把目录搬回去：宁可删不掉，也不要留下一个「不知道原名」的条目。
         std::error_code ignored;
-        std::filesystem::rename(removal.moved_to, bucket_path(name), ignored);
+        std::filesystem::rename(removal.moved_to, bucket_path(actual), ignored);
         return *error_of(status);
     }
 
-    if (const Status status = set_bucket_files_trash_flag(name, true, &removal.files_affected);
+    if (const Status status = set_bucket_files_trash_flag(actual, true, &removal.files_affected);
         !ok(status)) {
         return *error_of(status);
     }

@@ -87,3 +87,25 @@ FMT_TEST(Validation, 路径穿越形状被拒) {
     expect_file_name_rejected("test/name.txt", fmt::ErrorCode::FileNameSeparator);
     expect_bucket_name_rejected("../../etc");
 }
+
+FMT_TEST(Validation, 与file_id同形的文件名被拒) {
+    // fmt-YYYYMMDD-N 是保留形状：这种名字会让「先按 id 查、再按名字查」产生歧义
+    FMT_CHECK(fmt::looks_like_file_id("fmt-20261008-0"));
+    FMT_CHECK(fmt::looks_like_file_id("FMT-20261008-0"));  // 前缀不区分大小写
+    FMT_CHECK(fmt::looks_like_file_id("fmt-20261008-123"));
+    FMT_CHECK(!fmt::looks_like_file_id("fmt-20261008"));        // 没有序号
+    FMT_CHECK(!fmt::looks_like_file_id("fmt-2026100-0"));       // 日期不是 8 位
+    FMT_CHECK(!fmt::looks_like_file_id("fmt-20261008-0.txt"));  // 带扩展名就不是 id
+    FMT_CHECK(!fmt::looks_like_file_id("my-fmt-20261008-0"));
+
+    const fmt::Status status = fmt::validate_file_name("fmt-20261008-0");
+    FMT_CHECK(!fmt::ok(status));
+    if (!fmt::ok(status)) {
+        FMT_CHECK(fmt::error_of(status)->code == fmt::ErrorCode::FileNameLikeFileId);
+        FMT_CHECK_EQ(fmt::exit_code(fmt::error_of(status)->code), 2);
+    }
+
+    // 长得像但不是这个形状的名字照样能用
+    FMT_CHECK(fmt::ok(fmt::validate_file_name("fmt-20261008-0.txt")));
+    FMT_CHECK(fmt::ok(fmt::validate_file_name("my-fmt-20261008-0")));
+}

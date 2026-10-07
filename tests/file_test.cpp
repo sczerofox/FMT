@@ -424,6 +424,61 @@ FMT_TEST(File, 按名字查询不区分大小写) {
     FMT_CHECK(fmt::ok(files.remove("REPORT.TXT")));
 }
 
+FMT_TEST(File, 与file_id同形的名字不能上传) {
+    Fixture f;
+
+    // 显式给的名字
+    const auto explicit_name = fmt::prepare_upload(*f.paths, fmt::path_to_utf8(f.source),
+                                                   "fmt-20261008-0", kSizeLimit, nullptr);
+    FMT_CHECK(!fmt::ok(explicit_name));
+    FMT_CHECK(fmt::error_of(explicit_name)->code == fmt::ErrorCode::FileNameLikeFileId);
+
+    // 从来源推断出来的名字走的是同一道校验
+    const std::filesystem::path tricky = f.temp / "fmt-20261008-0";
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(tricky, "x")));
+    const auto derived =
+        fmt::prepare_upload(*f.paths, fmt::path_to_utf8(tricky), "", kSizeLimit, nullptr);
+    FMT_CHECK(!fmt::ok(derived));
+    FMT_CHECK(fmt::error_of(derived)->code == fmt::ErrorCode::FileNameLikeFileId);
+}
+
+FMT_TEST(File, 标识与名字同时命中时报歧义) {
+    Fixture f;
+
+    // 手工造一段「旧数据」：一个文件的 file_id 恰好等于另一个文件的名字。
+    // 这种名字现在上传时会被 FMT-106 拒绝，只可能来自旧版本或手工编辑过的 file.json。
+    nlohmann::json document = fmt::make_collection(1, "files");
+    const auto add = [&document](const std::string& id, const std::string& name) {
+        nlohmann::json item = nlohmann::json::object();
+        item["file_id"] = id;
+        item["user"] = "user";
+        item["bucket"] = "工作";
+        item["file_name"] = name;
+        item["extension"] = ".txt";
+        item["file_type"] = "text";
+        item["size"] = 1;
+        item["md5"] = "d41d8cd98f00b204e9800998ecf8427e";
+        item["is_trash"] = false;
+        item["trash_reason"] = "";
+        document["files"].push_back(std::move(item));
+    };
+    add("fmt-20261008-0", "a.txt");
+    add("fmt-20261008-1", "fmt-20261008-0");
+    FMT_CHECK(fmt::ok(fmt::write_json_file(f.paths->file_data(), document)));
+
+    // 不能猜：明确报歧义，并让用户用 file_id 指定
+    fmt::FileService files(*f.paths, f.config, nullptr);
+    const auto ambiguous = files.remove("fmt-20261008-0");
+    FMT_CHECK(!fmt::ok(ambiguous));
+    FMT_CHECK(fmt::error_of(ambiguous)->code == fmt::ErrorCode::InvalidArgument);
+    FMT_CHECK(fmt::error_of(ambiguous)->message.find("歧义") != std::string::npos);
+    FMT_CHECK(fmt::error_of(ambiguous)->message.find("fmt-20261008-1") != std::string::npos);
+
+    // 不歧义的名字照常
+    FMT_CHECK(!fmt::ok(files.remove("a.txt")) ||
+              fmt::error_of(files.remove("a.txt"))->code == fmt::ErrorCode::FileNotFound);
+}
+
 FMT_TEST(File, 从HTTP下载入库) {
     Fixture f;
 

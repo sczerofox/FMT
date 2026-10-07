@@ -163,9 +163,24 @@ FMT_TEST(Service, 管道能执行Bucket命令) {
     FMT_CHECK(!rejected.ok);
     FMT_CHECK(rejected.error.code == fmt::ErrorCode::InvalidArgument);
 
+    // 名称统一小写：create WORK 建成 work，并带回提示让 CLI 告知用户
+    fmt::ipc::Request upper;
+    upper.id = 14;
+    upper.op = "bucket.create";
+    upper.args["argv"] = nlohmann::json::array({"WORK"});
+    const fmt::ipc::Response created_upper = runtime.handle(upper);
+    FMT_CHECK(created_upper.ok);
+    if (created_upper.ok) {
+        FMT_CHECK_EQ(created_upper.data.value("bucket", std::string{}), std::string("work"));
+        FMT_CHECK(created_upper.data.contains("note"));
+        FMT_CHECK(created_upper.data.value("note", std::string{}).find("WORK") !=
+                  std::string::npos);
+    }
+    FMT_CHECK(fmt::directory_exists(root / "repository" / "user" / "work"));
+
     // 已登记但没实现的模块仍然是 FMT-602，而不是「未知操作」
     fmt::ipc::Request pending;
-    pending.id = 13;
+    pending.id = 15;
     pending.op = "share.list";  // share 还没做（file 已经能用了）
     const fmt::ipc::Response not_yet = runtime.handle(pending);
     FMT_CHECK(!not_yet.ok);
@@ -454,6 +469,9 @@ FMT_TEST(Service, 管道能上传与操作文件) {
     if (trashed.ok) {
         FMT_CHECK(trashed.data.value("is_trash", false));
         FMT_CHECK_EQ(trashed.data.value("trash_reason", std::string{}), std::string("file"));
+        // 在回收站里的记录，仓库里当然找不到——所以要告诉用户它在回收站哪儿
+        FMT_CHECK_EQ(trashed.data.value("trash_path", std::string{}).rfind("trash/user/.files/", 0),
+                     std::size_t{0});
     }
 }
 

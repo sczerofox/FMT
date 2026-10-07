@@ -697,20 +697,39 @@ Result<std::size_t> FileService::locate_record(const std::vector<FileRecord>& re
     // 用户敲 `DOC.TXT` 或大写 file_id 时不该得到「文件不存在」）。
 
     // ① 先当 file_id：全局唯一，形状固定（fmt-YYYYMMDD-N），先查不会误伤名字。
+    std::size_t by_id = records.size();
+    std::size_t by_name = records.size();
     for (std::size_t i = 0; i < records.size(); ++i) {
         if (iequals(records[i].file_id, key)) {
-            return i;
+            by_id = i;
+            break;
         }
     }
 
     // ② 再当文件名：当前用户 + 正常文件。
-    //    名字在同用户范围内唯一（重名上传会被 FMT-105 拒绝，且比较不区分大小写），
-    //    所以不会撞出歧义。
+    //    名字在同用户范围内唯一（重名上传会被 FMT-105 拒绝，且比较不区分大小写）。
     for (std::size_t i = 0; i < records.size(); ++i) {
         if (records[i].user == config_.current_user && !records[i].is_trash &&
             iequals(records[i].file_name, key)) {
-            return i;
+            by_name = i;
+            break;
         }
+    }
+
+    // 两者命中**不同**的记录：这是上传时已被禁止的形状（名字与 file_id 同形），
+    // 只可能来自旧数据或手工改过的 file.json——不能猜，直接报歧义。
+    if (by_id != records.size() && by_name != records.size() && by_id != by_name) {
+        return make_error(ErrorCode::InvalidArgument,
+                          "有歧义：" + std::string(key) + " 既是 " + records[by_id].file_id +
+                              " 的文件标识，又是另一个文件的文件名（file_id " +
+                              records[by_name].file_id +
+                              "）。这种名字现在不允许上传；请直接用 file_id 指定要删哪一个");
+    }
+    if (by_id != records.size()) {
+        return by_id;
+    }
+    if (by_name != records.size()) {
+        return by_name;
     }
 
     // ③ 名字存在、但已经在回收站里：说清楚是哪一条，别让用户以为文件没了。

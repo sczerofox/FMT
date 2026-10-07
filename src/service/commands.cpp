@@ -35,15 +35,21 @@ Result<nlohmann::json> bucket_command(AppContext& context, const std::string& op
             return *error_of(name);
         }
         const std::string value = std::get<std::string>(name);
-        if (const Status status = buckets.create(value); !ok(status)) {
-            return *error_of(status);
+        const Result<BucketCreation> created = buckets.create(value);
+        if (!ok(created)) {
+            return *error_of(created);
         }
+        const BucketCreation& result = std::get<BucketCreation>(created);
 
         nlohmann::json data = nlohmann::json::object();
-        data["bucket"] = value;
+        data["bucket"] = result.name;
         data["current_bucket"] = context.config.current_bucket;
-        data["message"] = "Bucket 已创建：" + value +
-                          (context.config.current_bucket == value ? "（已设为当前 Bucket）" : "");
+        data["message"] = "Bucket 已创建：" + result.name +
+                          (result.became_current ? "（已设为当前 Bucket）" : "");
+        if (result.renamed) {
+            data["note"] = "Bucket 名称统一使用小写：已把 " + result.requested + " 转为 " +
+                           result.name;
+        }
         return data;
     }
 
@@ -100,10 +106,14 @@ Result<nlohmann::json> bucket_command(AppContext& context, const std::string& op
         }
 
         nlohmann::json data = nlohmann::json::object();
-        data["bucket"] = value;
+        data["bucket"] = context.config.current_bucket;  // 已规范化的实际桶名
         data["previous"] = previous;
         data["current_bucket"] = context.config.current_bucket;
-        data["message"] = "已切换到 Bucket：" + value;
+        data["message"] = "已切换到 Bucket：" + context.config.current_bucket;
+        if (value != context.config.current_bucket) {
+            data["note"] = "Bucket 名称统一使用小写：已把 " + value + " 规范为 " +
+                           context.config.current_bucket;
+        }
         return data;
     }
 
@@ -306,6 +316,14 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
         if (ok(path)) {
             data["path"] =
                 relative_path_text(context.paths->root(), std::get<std::filesystem::path>(path));
+        }
+        // 在回收站里的记录，仓库里当然找不到——此时告诉用户**它在回收站哪儿**。
+        if (found.is_trash) {
+            const Result<std::filesystem::path> trashed = files.trash_path_of(found);
+            if (ok(trashed)) {
+                data["trash_path"] = relative_path_text(
+                    context.paths->root(), std::get<std::filesystem::path>(trashed));
+            }
         }
         return data;
     }
