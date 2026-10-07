@@ -204,7 +204,17 @@ FMT/
 
 数据根（`FMT_ROOT`）**由 CLI 声明**：CLI 连接服务时用 `hello` 帧带上自己 exe 所在目录
 （`GetModuleFileNameW` 取父目录），服务把该目录作为「当前数据根」。切换数据根时**不删除旧根数据**，
-只对新根做幂等初始化（见第 91～94 节）。
+只对新根做幂等初始化（见第 91～94 节）。服务的 `hello` 响应会回填本次是否发生了切换：
+
+```json
+{ "id":1, "ok":true, "data":{ "root":"D:/FMT2", "switched":true, "previous_root":"D:/FMT" } }
+```
+
+`switched` 为真表示这次声明**导致服务切换了数据根**，此时才带 `previous_root`；CLI 打印
+`数据根切换：旧 -> 新`。未切换时不含这两个字段（`switched` 缺省视为 false）。
+
+CLI 在双击时还会**先对自己所在数据根做一次体检与补齐**（六个目录 + 六个默认 JSON，只补缺失，
+见第 91～92 节）；这一步在打开日志器之前完成，所以 `log/` 也在它创建之列。
 
 `log/` 与业务数据分离（日志不是业务数据），见第 65 节。
 
@@ -218,7 +228,10 @@ FMT/
 `temp/` 的创建与清理规则：
 
 ```text
-谁创建  CLI 在执行提权类命令前会尝试创建 <数据根>/temp；
+谁创建  CLI 双击时会对自己的数据根执行与服务共用的幂等体检与补齐（ensure_root/check_root，
+        见第 91～92 节），其中就包括 temp/；这一步在打开日志器之前完成，
+        所以 log/ 与 temp/ 都在同一条「新建目录」清单里。
+        CLI 在执行提权类命令前也会确保 <数据根>/temp 存在；
         创建不出来（例如 exe 放在只读位置）就退回系统临时目录 %TEMP%，
         并写一行 WARN 说明原因与改用后的路径。
         提权副本在写入结果文件前也会确保目录存在——它自己有权限，
@@ -2047,31 +2060,35 @@ CLI 写这些内容：
 ```text
 CLI 启动 / 退出
 用户敲的原始命令（形如  fmt> service stop ）
-每条 service 命令的提权过程与结果
+每条 service 命令的结果（四条动作命令还记提权过程；`status` 不提权，只记查询结果）
 提权副本自身的执行与结果
 业务命令的请求与结果
 连接失败
 ```
 
-三条边界：
+四条边界：
 
 ```text
-1. CLI 只允许创建 <数据根>/log/ 与执行提权命令前要用的 <数据根>/temp/ 这两个目录
-   （都不属于业务数据：日志不是业务数据，temp/ 按定义随时可以清空）；
-   repository / data / config 一概不碰，CLI 仍然不改任何业务数据。
-2. --help 与 --version 不写日志、不创建任何目录（它们不该在磁盘上留下东西）。
+1. CLI 双击时先对自己所在数据根执行与服务共用的幂等体检与补齐
+   （六个目录 + 六个默认 JSON，只补缺失、已存在不动、损坏 JSON 只报告不重置，见第 91～92 节）；
+   这一步在打开日志器之前完成，所以 log/ 与 temp/ 都在同一条「新建目录」清单里，
+   而**结果只进日志**（等日志器开好后写 log/fmt.log，模块 Cli），控制台一行都不打。
+   除此之外 CLI 不改任何业务数据：不写 data/*.json 的内容、不删文件、不改名。
+   旧口径里「CLI 只允许创建 log/ 与 temp/ 这两个目录」的说法已被这一步覆盖。
+2. --help / --version / help / exit 不写日志、不创建任何目录（它们不该在磁盘上留下东西）。
 3. 两个进程的数据根可能不同（服务可能被别人启动在另一个目录）：各写各自数据根下的
    log/fmt.log；这种情况下 CLI 会额外写一行 WARN，指明服务当前数据根与服务侧日志的位置。
+4. 控制台只留交互与异常：横幅、提示符、命令结果、以及 stderr 上的异常；
+   服务的当前状态、数据根体检结果都只进日志（见第 127 节）。
 ```
 
 日志目录位于**当前数据根**下（`FMT_ROOT/log/`），由服务在初始化时创建（见第 92 节）；
-CLI 只在真的要写日志时创建 `log/` 目录本身。临时文件目录 `temp/` 同理（见第 5 节）：
-由服务在初始化时创建，CLI 只在执行提权命令前确保它存在——建不出来就退回系统临时目录
-`%TEMP%` 并写一行 WARN。
+CLI 双击时的那一次幂等补齐也会建出它（在打开日志器之前）。临时文件目录 `temp/` 同理
+（见第 5 节）：由服务在初始化时创建，CLI 双击时也会补出来；执行提权命令前若仍不存在，
+就被退回系统临时目录 `%TEMP%` 并写一行 WARN。
 
 CLI 与服务之间的通道是命名管道（见第 76 节）：CLI 把命令发给服务，服务执行后把
-`{ok, code, message}` 回传，CLI 把结果打印到控制台**并追加写入数据根下的 `log/fmt.log`**，
-**只建 `log/`、不直接读写数据根下的任何 JSON**。
+`{ok, code, message}` 回传，CLI 把结果打印到控制台**并追加写入数据根下的 `log/fmt.log`**。
 
 CLI 连接管道时，如果管道**还不存在**（服务刚被 `service start` 拉起、监听尚未就绪），
 最多重试 **5 秒**再报 `FMT-601`；**权限类错误（`ERROR_ACCESS_DENIED`）不重试**，
@@ -2166,25 +2183,56 @@ Exit Code
 
 # 68. Help
 
-必须支持：
+帮助有**两个入口**：一次性的 `--help`，以及 `help` 命令（交互式与一次性都支持）。
 
 ```text
-fmt.exe --help
+fmt.exe --help             完整用法：横幅 + 用法 + 命令总览 + 退出码表 + 「详细说明」一行
+fmt.exe help               只列命令总览（不加描述）
+fmt.exe help <组>          该组详情
+help / help <组>           交互循环内同上（--help 在交互里是 help 的别名）
 ```
 
-以及：
+`help`（不带参数）只列命令、不加描述：
 
 ```text
-fmt.exe bucket --help
-fmt.exe file --help
-fmt.exe share --help
-fmt.exe trash --help
-fmt.exe service --help
+可用命令：
+  (service)  install  uninstall  start  stop  status
+  (help)     help [命令]
+  (exit)     exit  quit
+
+业务命令（服务端尚未实现，现在会返回 FMT-602）：
+  (bucket)   create  list  get  use  delete
+  (file)     upload  list  get  delete
+  (share)    create  get  list  delete
+  (trash)    list  get  restore  delete
 ```
+
+`help <组>` 支持 `service` / `bucket` / `file` / `share` / `trash` / `help` / `exit`
+（`quit` 等同 `exit`）。`help service`：
+
+```text
+service —— Windows 服务管理
+  install    安装并启动服务；需要管理员权限，弹一次 UAC
+  uninstall  停止并删除服务；需要管理员权限
+             不删除 repository / trash / config / data / log / temp
+  start      启动服务；需要管理员权限
+  stop       停止服务；需要管理员权限
+  status     查询服务状态；不需要管理员权限
+
+说明：启动类型为自动启动，运行账户为 LocalSystem；异常退出由 Windows
+      服务恢复策略自动重启（第一次 5 秒、第二次 10 秒、之后 30 秒）。
+```
+
+四组业务命令（`bucket` / `file` / `share` / `trash`）的详情里**都要注明**
+「服务端尚未实现，现在返回 FMT-602」。
+
+`help <未知组>` → stderr 打印 `没有 <组> 的帮助；输入 help 查看命令列表`，退出码 2（`FMT-001`）。
+`help` / `--help` 全程**不提权、不连服务、不写日志**。
 
 `service` 命令**不带 `--` 前缀**：旧写法 `fmt.exe --service install` 作废；
-service 只有 `install` / `uninstall` / `start` / `stop` 四条，**没有 pause，也没有 delete**
-（旧 `delete` 已更名为 `uninstall`），见第 70 节、第 95 节。
+service 有 `install` / `uninstall` / `start` / `stop` / `status` 五条，**没有 pause，也没有 delete**
+（旧 `delete` 已更名为 `uninstall`）；其中 `status` 是查询命令，不提权、不弹 UAC。
+帮助文本里必须列出 `status`，见第 70 节、第 95 节。
 
 帮助内容应该：
 
@@ -2244,13 +2292,14 @@ SERVICE_CONTROL_INTERROGATE
 
 # 70. Service 命令集
 
-service 命令只有四条：
+service 命令有五条：
 
 ```text
 fmt.exe service install
 fmt.exe service uninstall
 fmt.exe service start
 fmt.exe service stop
+fmt.exe service status
 ```
 
 固定规则：
@@ -2258,14 +2307,20 @@ fmt.exe service stop
 ```text
 不带 -- 前缀（旧写法 fmt.exe --service install 作废）
 没有 pause，也没有 delete（旧 delete 更名为 uninstall）
-四条命令都直连 SCM，不走命名管道、不走 HTTP
-四条命令一律走 UAC 提权
+五条命令都直连 SCM，不走命名管道、不走 HTTP
+四条动作命令（install / uninstall / start / stop）一律走 UAC 提权
+status 是查询命令：不提权、不弹 UAC、不需要管理员权限
 ```
 
 为什么必须直连 SCM：服务可能尚未安装或尚未运行，此时走任何进程间通道都会形成引导死锁。
+`status` 更是要在「服务还没装」时就能回答「未安装」，所以它同样直连 SCM，而不是去连管道。
 
-**每条命令都提权**，即使目标状态已经满足（例如服务已安装仍执行 `install`）也照常弹 UAC，
+**四条动作命令都提权**，即使目标状态已经满足（例如服务已安装仍执行 `install`）也照常弹 UAC，
 不做「已满足状态就免提权」的优化。
+
+**`status` 是唯一的例外，而它不是「提权优化」**：它只读、不改变任何状态，因此不需要管理员权限，
+也永远不弹 UAC。它读的是统一查询接口 `service::query_status()` 给出的状态、`QueryServiceConfigW`
+的宿主路径，以及 `%ProgramData%\FMT\service.json` 里记录的当前数据根（见第 69 节、第 126 节）。
 
 各命令提权后做什么：
 
@@ -2273,10 +2328,62 @@ fmt.exe service stop
 | --- | --- | --- |
 | `service install` | 创建服务 + 配置 Recovery + 启动 | 已存在 → `FMT-600` / 退出码 8 |
 | `service uninstall` | 先 stop，再 `DeleteService` | 未安装 → `FMT-601` / 退出码 8 |
-| `service start` | `StartServiceW` | 未安装 → `FMT-601` / 退出码 8 |
-| `service stop` | `ControlService(SERVICE_CONTROL_STOP)` | 未安装 → `FMT-601` / 退出码 8 |
+| `service start` | `StartServiceW`，再 `settle_state()` 等落定（见下） | 未安装 → `FMT-601` / 退出码 8 |
+| `service stop` | `ControlService(SERVICE_CONTROL_STOP)`，再 `settle_state()` 等落定 | 未安装 → `FMT-601` / 退出码 8 |
+| `service status` | **不提权**：`service::query_status()` + `QueryServiceConfigW`，然后打印状态 / 宿主 / 数据根 / 错误码 | 未安装 → `FMT-601` / 退出码 8；已安装未运行 → 照常打印、退出码 0 |
 
-提权的完整流程、四种命令各自何时提权、用户取消 UAC 的处理与固定输出格式，见第 126 节。
+`service status` 的输出样例（服务已安装且运行中）：
+
+```text
+服务状态：运行中
+服务宿主：D:/FMT2/fmt.exe
+服务数据根：D:/FMT2
+错误码：0
+```
+
+未安装时 stdout 打印 `服务状态：未安装`，退出码 8（`FMT-601 ServiceNotInstalled`）；
+已安装但未运行时照常打印（如 `已停止`），退出码 0——「服务没在跑」不是错误，`status` 只回答
+「它现在什么样」。状态名由 `service::state_name()` 一处映射：
+`未安装` / `已停止` / `正在启动` / `正在停止` / `运行中` / `正在继续` / `正在暂停` / `已暂停` / `未知`。
+
+**统一的状态查询接口**（技术文档 13.4.2 有完整定义）：所有读 SCM 状态的地方都走
+`service::query_status()`，不在别处自己调 `QueryServiceStatusEx` 再映射状态。
+
+```text
+service::State { NotInstalled, Stopped, StartPending, StopPending, Running,
+                 ContinuePending, PausePending, Paused, Unknown }
+service::StatusInfo { state, wait_hint_ms, win32_exit_code, service_exit_code }
+service::query_status()        -> Result<StatusInfo>
+       「未安装」是**正常结果**（state = State::NotInstalled），不是错误；
+       只有查询本身失败（打不开服务控制管理器等）才返回错误（FMT-602 / 退出码 8）
+service::query_state()         只是 query_status() 的薄封装（取 state，失败给 Unknown）
+service::installed_binary_path() -> Result<std::string>（服务宿主 binPath，去掉引号）
+service::last_start_failure()  -> Result<ErrorCode>
+       也基于 query_status()，读 win32_exit_code / service_exit_code；没有失败信息则返回错误
+```
+
+> 名字别混：`State` 是运行状态枚举；`ServiceState` 是 `service.json` 的结构体
+> （`current_root` / `host_path` / `installed_at`，由 `load_state()` 读取）。
+
+**「等它落定」不写死时长，按 SCM 的 `dwWaitHint` 自适应**（实现是 CLI 内的 `settle_state()`）：
+
+```text
+服务处于 State::StartPending / State::StopPending 时，每轮查询读 SCM 给的 dwWaitHint，
+把它夹在 100 ms – 2000 ms 之间作为下次查询的间隔；兜底上限 30 秒（kSettleCapMs）。
+状态一旦不是等待类（Running / Stopped / Paused / NotInstalled …）就立即结束等待；
+settle_state() 返回落定后的 State，回来仍是等待类就说明「没起来」。
+```
+
+理由：`ServiceMain` 启动时要建目录、读 JSON、扫 `data/file.json`、起 HTTP、等管道就绪，
+慢机器、大目录、杀毒软件介入时完全可能超过 8 秒——此时服务**并没有失败**，只是还在
+`START_PENDING`。写死 8 秒会把「还在启动」误判成「启动失败」，然后白弹一次 UAC 去做根本解决
+不了问题的重装（而且重装之后同样慢，用户会被反复弹 UAC）。**等一下多久，由 SCM 自己说。**
+
+**V1 不做结构化输出**：`service status` 没有 `--json`，也不预留参数名。机器可读通道是
+**命令退出码**（`0` 成功；未安装 `FMT-601` → `8`；查询失败 → `8`），人类可读通道就是上面那几行
+固定顺序的文本（见第 127.4 节）。
+
+提权的完整流程、四种动作命令各自何时提权、用户取消 UAC 的处理与固定输出格式，见第 126 节。
 
 ---
 
@@ -2427,17 +2534,44 @@ V1 **不实现**独立 watchdog，也不自建守护进程。
 ```text
 1. 单实例互斥体 Local\FMT.CLI.v1
      已有实例 → 激活已有窗口，不新建窗口（见第 76 节）
-2. 查 SCM
-     未安装        → 提权 install + start（一次 UAC）
-     已安装未运行  → 提权 start（一次 UAC）
-     已运行        → 不动，不提权
-3. 比较服务 binPath 与自身路径
+2. 数据根体检与补齐：对自己 exe 所在目录执行与服务共用的幂等 ensure_root/check_root
+     （六个目录 + 六个默认 JSON，只补缺失；已有 JSON 读一遍确认完整性，
+      损坏或版本不受支持只报告、绝不重置，见第 91～92 节）
+     这一步在打开日志器之前完成，所以 log/ 也在这条「新建目录」清单里；
+     结果**只进日志**，控制台一行都不打，只有异常走 stderr
+3. 查 SCM 状态（走统一接口 service::query_status()；「未安装」是**正常结果**，不是错误）
+     未安装        → 提权 install（装 + 启动，一次 UAC）
+     运行中        → 不动、不弹 UAC
+     已安装未运行  → 提权 start → **等它落定**（见第 70 节：按 SCM 的 dwWaitHint 自适应）
+           起来了       → 完成
+           仍然没起     → 读服务留下的失败编号 dwServiceSpecificExitCode（见第 99 节）
+                 数据根/配置类问题 → **不重装**（重装也解决不了），打印原因让用户先处理
+                 其它             → 提权 reinstall 一次（卸载 + 安装，一次 UAC），仍失败则报错
+4. 比较服务 binPath 与自身路径
      相同              → 正常继续
      不同但文件存在    → 作为客户端继续
-     不同且文件已丢失  → 提示重新安装服务（uninstall + install）
-4. 连命名管道，用 hello 帧声明 root = 自身 exe 所在目录
-5. 打印横幅与 Service Running... → 进入交互循环
+     不同且文件已丢失  → 询问是否重新安装服务（提权副本的 reinstall operation：
+                         先卸载、再安装并启动，服务未安装时忽略卸载错误，一次 UAC）
+5. 服务在运行 → 连命名管道，用 hello 帧声明 root = 自身 exe 所在目录；
+     switched=true 时记一行日志「数据根切换：旧 -> 新」（只进日志）
+6. 打印横幅与 Service Running... → 空一行 → fmt> 进入交互循环
 ```
+
+第 3 步判定「数据根/配置类问题」的错误码集合（命中就**跳过重装**、只打印原因让用户先处理）：
+
+| 错误码 | 含义 |
+| --- | --- |
+| `FMT-006` | `JsonParseError` JSON 格式错误 |
+| `FMT-007` | `JsonWriteError` JSON 写入失败 |
+| `FMT-008` | `ConfigError` 配置错误 |
+| `FMT-011` | `JsonUnsupportedVersion` JSON 数据版本不受支持 |
+| `FMT-013` | `DirectoryCreateFailed` 目录创建失败 |
+| `FMT-009` | `StorageError` 存储操作失败 |
+| `FMT-005` | `IoError` 磁盘/IO 错误 |
+| `FMT-014` | `PathEscape` 路径穿越 |
+
+这些都不是「服务注册坏了」，重装服务解决不了；集合之外的失败（如 `FMT-602`）才走
+「提权 reinstall 一次」。
 
 第一次双击：
 
@@ -2473,11 +2607,15 @@ V1 **不实现**独立 watchdog，也不自建守护进程。
 ```text
 双击 D:\FMT2\fmt.exe
  ↓
+第 2 步先对 D:\FMT2 做幂等体检与补齐（只补缺失，含 log/ 与 temp/）
+ ↓
 服务宿主仍是首次安装时注册的那个 exe
  ↓
 管道 hello 帧声明 root = D:\FMT2
  ↓
-服务在 D:\FMT2 下幂等初始化
+服务在 D:\FMT2 下幂等初始化，响应回填 switched=true / previous_root
+ ↓
+CLI 记一行日志「数据根切换：旧 -> 新」（只进日志，不刷控制台）
  ↓
 旧数据原样保留，不删除
 ```
@@ -2536,6 +2674,15 @@ CLI 与 HTTP 只是两条通道，业务行为由同一个 service 层决定。
          {"ok":false,"error":{"code":"FMT-305","message":"..."}}
 ```
 
+`hello` 的响应 `data` 里带两个新字段：
+
+```json
+{ "id":1, "ok":true, "data":{ "root":"D:/FMT2", "switched":true, "previous_root":"D:/FMT" } }
+```
+
+`switched` = 这次声明是否**导致服务切换了数据根**；未切换时不含 `previous_root`。
+`switched` 为真时 CLI 记一行日志 `[Service] 数据根切换：旧 -> 新`（只进日志）。
+
 响应信封与 HTTP 完全一致，一份信封两处复用；超时：连接时管道不存在最多重试 **5 秒**
 （权限类错误不重试）、普通命令 30 秒。
 
@@ -2551,8 +2698,9 @@ D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)
 S:(ML;;NW;;;ME)
 ```
 
-CLI 形态**不碰 core、不建业务目录、不写 JSON**（只在写日志时创建 `log/`、执行提权命令前确保
-`temp/` 存在，见第 5 节与第 65 节）：只解析命令行、走管道、打印结果。
+CLI 形态**不碰 core 业务操作、不写业务 JSON**；它双击时会对自己所在数据根跑一次与服务共用的
+幂等体检与补齐（只补缺失的六个目录与六个默认 JSON，见第 5 节与第 91～92 节），此后只解析命令行、
+走管道、打印结果。写日志用的 `log/` 与提权前要用的 `temp/` 都已被那一步覆盖（第 65 节）。
 
 ## 76.2 数据根由 CLI 声明
 
@@ -2560,8 +2708,9 @@ CLI 连接时的首帧是 `hello`，其中 `root` = CLI 自身 exe 所在目录�
 
 ```text
 root != 当前数据根 ?
- ├─ 是 → 切换当前数据根（旧根数据原样保留），对新根做幂等初始化
- └─ 否 → 直接进入命令循环
+ ├─ 是 → 切换当前数据根（旧根数据原样保留），对新根做幂等初始化，
+ │        响应里置 switched=true 并回填 previous_root，CLI 记一行日志「数据根切换：旧 -> 新」（只进日志，不刷控制台）
+ └─ 否 → 直接进入命令循环，响应不含 switched / previous_root
 ```
 
 该连接上的所有业务命令都在该数据根下执行。因为同时只有一个 CLI 窗口，所以同时只有一个数据根。
@@ -2931,16 +3080,53 @@ user.json
 
 # 91. 初始化流程
 
-初始化**由服务执行，CLI 只读**：CLI 不创建任何业务目录、不写默认 JSON、
-不直接读写数据根下的任何业务文件（日志目录 `log/` 是唯一例外，见第 65 节）。
-（这条统一了旧文档「CLI 只读不建目录」与「首次运行创建目录」的口径冲突，口径唯一：
-**服务建，CLI 只读**。）
+初始化**由 Service 与 CLI 共用同一套幂等规则**（同一份 `ensure_root` / `check_root` 实现）：
 
-触发时机：CLI 连接服务时用 `hello` 帧声明 `root`（自身 exe 所在目录），服务发现该根与当前数据根
-不同（或该根从未初始化）时，对该根做一次幂等初始化。
+```text
+谁执行  Service：启动时、以及 hello 触发换根时，对自己的数据根执行
+        CLI    ：双击时，对自己 exe 所在的数据根执行
+                （在打开日志器之前完成，所以 log/ 也由它创建）
+共同规则 只补缺失；六个目录缺则建、已存在一律不动（不删除、不覆盖、不改名）
+        默认 JSON 缺则写；已有的会被真正读一遍（解析 + 版本检查）确认完整性
+        读不出来或版本不受支持 → 只报告、绝不重置（沿用「JSON 损坏不能静默重置」）
+        两边都不碰业务数据内容：不写 data/*.json 的内容、不删文件、不改名
+```
+
+CLI 侧的结果**只进日志**（`log/fmt.log`，模块 `Cli`），控制台一行都不打：
+
+```text
+[Cli] 数据根检查：D:/FMT2
+[Cli] 数据根新建目录：repository, trash, config, data, log, temp
+[Cli] 数据根新建文件：D:/FMT2/config/config.json, D:/FMT2/config/server.json,
+                      D:/FMT2/data/file.json, D:/FMT2/data/share.json,
+                      D:/FMT2/data/trash.json, D:/FMT2/data/user.json
+```
+
+第二次及以后双击（什么都没缺）只是日志里换成 `[Cli] 数据根完整`；发现损坏时日志记
+`[Cli] 数据根损坏（未自动修复）：data/file.json`，同时把
+`数据根文件损坏（未自动修复）：data/file.json` 送到 **stderr**（异常才进控制台）。
+数据根无法补齐时同样走 stderr：`数据根无法补齐：FMT-013 …`。
+
+这条归位守的是第 65 节的原则：**控制台负责用户交互与重要异常，日志文件负责完整运行记录**。
+双击时用户只想知道「能不能开始敲命令」，不该被一串「建了什么」淹掉。
+
+这条统一了旧文档「CLI 只读不建目录」与「首次运行创建目录」的口径冲突。旧口径把「服务建、CLI 只读」
+当成唯一答案，只给日志 `log/` 留了一个例外；**现在的口径是**：两边跑同一套幂等规则，CLI 双击时补的
+就是它自己数据根缺的那部分，所以既不与「首次运行就自动建出了目录」的实测打架，也不再把「建目录」
+当成 CLI 的禁忌——真正的禁忌是**碰业务数据内容**（`data/*.json` 的内容、文件的删除与改名）。
+
+触发时机有两处：
+
+```text
+时机 1：Service 启动时，对自己的数据根（%ProgramData% 记录值或宿主 exe 目录）执行
+时机 2：CLI 双击时对自己的数据根执行；连上服务后用 hello 帧声明 root，
+        服务发现该根与当前数据根不同（或该根从未初始化）时，再对服务侧执行一次
+```
 
 ```text
 CLI 声明 root
+ ↓
+CLI 先对自己所在 root 做一次幂等体检与补齐（第 2 步，见第 75 节）
  ↓
 服务检查 root
  ↓
@@ -2963,6 +3149,8 @@ CLI 声明 root
 加载配置
  ↓
 把该根记为当前数据根
+ ↓
+响应回填 switched / previous_root
 ```
 
 幂等要求：
@@ -2970,6 +3158,7 @@ CLI 声明 root
 ```text
 不存在则创建
 已存在 → 保持原样，不修改、不清空、不覆盖
+已有 JSON → 读一遍确认（解析 + 版本检查），读不出来只报告、绝不重置
 绝不删除用户已经存在的数据
 ```
 
@@ -2993,11 +3182,13 @@ log/
 temp/
 ```
 
-由**服务**在数据根下创建，不存在则创建，已存在不动。
+由 **Service 与 CLI 共用的同一套规则**在数据根下补齐：不存在则创建，已存在不动。
+Service 在启动/换根时对自己的数据根执行，CLI 在双击时对自己 exe 所在的数据根执行
+（这一步在打开日志器之前，所以 `log/` 也包含在同一条「新建目录」清单里）。
 `temp/` 是**临时文件目录**（既不是业务数据、也不是日志），内容随时可以清空：
 Service 启动时会删除它下面以 `fmt-` 开头的遗留文件（用户手放的其它文件不动），见第 5 节与第 126 节。
 
-对应默认文件：
+对应默认文件（六个，缺则补）：
 
 ```text
 config/config.json     {"version":1,...}
@@ -3009,12 +3200,16 @@ data/trash.json        {"version":1,"trash":[]}
 ```
 
 默认 JSON 一律「写 `.tmp` → 验证 → 替换」，已存在的文件不改、不删、不覆盖
-（见第 11 节、第 13 节）。
+（见第 11 节、第 13 节）。已存在的 JSON 会被**真正读一遍**（解析 + 版本检查）来确认完整性：
+读不出来或版本不受支持的**只报告、绝不重置**——日志记一行
+`[Cli] 数据根损坏（未自动修复）：data/file.json`，异常同时送到 stderr。
 
 `log/` 由服务与 CLI **共同追加写入**：两个进程写同一个 `fmt.log`（见第 65 节）。
 
-CLI 只读业务数据：除 `log/` 之外不建任何目录、不写任何 JSON，
-只把命令经命名管道交给服务执行。
+CLI 只读业务数据：不改 `data/*.json` 的内容、不删文件、不改名，
+只把命令经命名管道交给服务执行。它唯一会碰目录结构的动作，是双击时对自己所在数据根跑一次
+与服务共用的幂等体检与补齐（只补缺失的目录与默认 JSON，见第 91～92 节）；
+`log/` 与 `temp/` 也由那一步一并建出。
 
 ---
 
@@ -3066,6 +3261,8 @@ file list
 fmt.exe
 │
 ├── --help
+├── help [组]
+├── exit | quit
 │
 ├── bucket
 │   ├── create <name>
@@ -3097,21 +3294,27 @@ fmt.exe
     ├── install
     ├── uninstall
     ├── start
-    └── stop
+    ├── stop
+    └── status
 ```
 
 规则：
 
 ```text
 service 命令不带 -- 前缀（旧写法 fmt.exe --service install 作废）
-service 只有 install / uninstall / start / stop 四条
+service 有 install / uninstall / start / stop / status 五条
 没有 pause，也没有 delete（旧 delete 更名为 uninstall）
 业务命令（bucket / file / share / trash）经命名管道交给服务执行
-service 命令直连 SCM，且每条都走 UAC 提权
+service 命令直连 SCM：install / uninstall / start / stop 走 UAC 提权，
+                        status 是查询、不提权、不弹 UAC
+help / --help 是本地命令：不连服务、不提权、不写日志
+exit / quit 是交互循环里的正式命令（help exit 有说明）
 ```
 
-各子命令支持 `--help`（如 `fmt.exe file --help`、`fmt.exe service --help`），
-帮助内容必须与实际命令一致。
+帮助有两个入口：`--help` 打印带横幅与退出码表的完整用法（内含命令总览）；`help` 不带参数
+只列命令、`help <组>` 打印该组详情（`service` / `bucket` / `file` / `share` / `trash` /
+`help` / `exit`），交互式与一次性都支持；`help <未知组>` → stderr 一行 + 退出码 2（`FMT-001`）。
+各子命令的详细说明必须与实际命令一致（见第 68 节）。
 
 ---
 
@@ -3225,7 +3428,7 @@ storage
 core 初始化
 ```
 
-完成后，服务在 CLI 声明的数据根下自动创建：
+完成后，服务在 CLI 声明的数据根下自动创建（CLI 双击时也对自己所在数据根跑同一套幂等补齐）：
 
 ```text
 <数据根>/
@@ -3237,13 +3440,14 @@ core 初始化
 └── temp/
 ```
 
-并写入默认 JSON（`.tmp` 原子替换，已存在不动）。
+并写入默认 JSON（`.tmp` 原子替换，已存在不动；已有的会被读一遍确认，损坏只报告不重置）。
 
 验收：
 
 ```text
-能在指定数据根建出六个目录 + 默认 JSON
-JSON 损坏报配置错误（退出码 7），且不修改原文件
+能在指定数据根建出六个目录 + 默认 JSON（Service 与 CLI 共用 ensure_root/check_root）
+第二次执行日志里只多一行「数据根完整」，不再新建任何东西，控制台无输出
+JSON 损坏报配置错误（退出码 7），且不修改原文件，只报告（日志 + stderr）
 ```
 
 ---
@@ -3258,19 +3462,27 @@ service
     service uninstall
     service start
     service stop
+    service status（查询，不提权）
+    统一查询接口 StatusInfo / query_status / query_state / last_start_failure
+    按 dwWaitHint 自适应的落定等待（100 ms – 2000 ms 夹取，兜底 30 秒）
     ServiceMain + HandlerEx
+    ServiceMain 失败时上报 FMT 编号到 dwServiceSpecificExitCode
     Recovery
     %ProgramData%\FMT\service.json
 ipc
     命名管道 \\.\pipe\fmt.control
     帧格式 [4 字节小端长度][UTF-8 JSON]
+    hello 响应回填 switched / previous_root
     安全描述符（授权 IU）+ MIC 标签
 cli
     交互循环与横幅
     单实例互斥体 Local\FMT.CLI.v1
     单实例窗口激活
     UAC 提权与结果回显
-    双击行为（首次 / 再次 / 换目录）
+    双击行为（首次 / 再次 / 换目录）：先做数据根幂等体检与补齐，
+      再查 SCM（走 query_status()，「未安装」是正常结果）；
+      已安装未运行 → 提权 start → settle_state() 等落定（按 dwWaitHint 自适应）→
+      仍没起则读失败编号，数据根/配置类问题跳过重装，其余提权 reinstall 一次
 ```
 
 并配置：
@@ -3285,8 +3497,14 @@ cli
 ```text
 manifest 为 asInvoker
 服务不声明 SERVICE_ACCEPT_PAUSE_CONTINUE（没有 pause）
-数据根由 CLI 用 hello 帧声明
-初始化由服务执行，CLI 只读
+数据根由 CLI 用 hello 帧声明，响应回填 switched / previous_root
+初始化由 Service 与 CLI 共用同一套幂等规则（ensure_root/check_root）：
+  Service 在启动/换根时执行，CLI 在双击时对自己的数据根执行；两边都只补不缺
+service status 是查询命令，不提权、不弹 UAC
+服务状态与失败编号统一走 service::query_status() / query_state() / last_start_failure()；
+  「未安装」是正常结果（state = NotInstalled），不是错误
+「等它落定」按 SCM 的 dwWaitHint 自适应：夹在 100 ms – 2000 ms，兜底 30 秒，
+  不是等待类状态就立即结束（不写死时长）
 ```
 
 验收：
@@ -3294,7 +3512,11 @@ manifest 为 asInvoker
 ```text
 全新环境双击 → 一次 UAC → 服务装好且开机自启
 service stop / service start 各弹一次 UAC，输出与第 126 节样例一致
-复制 exe 到新目录双击 → 在新目录建出数据，旧目录数据保留
+service status 不弹 UAC，输出「服务状态：运行中 / 服务宿主 / 服务数据根 / 错误码：0」
+未安装时 service status 打印「服务状态：未安装」且退出码 8
+人为让服务启动变慢 → 等待随之变长，不误判为启动失败、不弹 UAC 重装
+复制 exe 到新目录双击 → 在新目录建出数据（只补缺失），旧目录数据保留，
+  并记一行日志「数据根切换：旧 -> 新」（只进日志）
 ```
 
 ---
@@ -3632,16 +3854,47 @@ MD5 不一致
 未安装时 stop（FMT-601 / 退出码 8）
 uninstall 之后再 start（FMT-601 / 退出码 8）
 install → start → stop → uninstall 全流程
-提权（四条命令各弹一次 UAC，输出与第 126 节样例一致）
+service status（运行中 → 退出码 0，打印状态 / 宿主 / 数据根 / 错误码：0）
+service status 不弹 UAC、不需要管理员权限（非管理员账户下也能成功）
+service status 未安装（打印「服务状态：未安装」，退出码 8 / FMT-601）
+service status 已安装未运行（打印「已停止」，退出码 0）
+提权（四条动作命令各弹一次 UAC，输出与第 126 节样例一致；status 不弹 UAC）
 用户取消 UAC（ERROR_CANCELLED 1223 → FMT-004 / 退出码 5，CLI 继续循环不退出）
 提权等待超时（FMT-602 / 退出码 8）
 提权副本不新开控制台窗口，结果写进结果文件 <数据根>\temp\fmt-elev-<父进程 pid>.json 回到原窗口打印
 Service 启动时清理 temp/ 下遗留的 fmt-* 文件（用户手放的其它文件不动），删除数量记一行 INFO
 （服务宿主 exe 已丢失 → reinstall 一次 UAC 完成）
+ServiceMain 初始化失败 → dwServiceSpecificExitCode 带 FMT 编号，
+  CLI 打印「服务启动失败：FMT-008 配置错误」；
+  命中数据根/配置类错误码（FMT-005/006/007/008/009/011/013/014）时**不触发重装**
+服务启动失败（其它错误码）→ 已安装未运行时提权 reinstall 一次
+等待落定按 dwWaitHint 自适应（不写死时长）：
+  正常启动（START_PENDING 短）→ 很快结束等待，不空转到上限
+  人为让 ServiceMain 初始化变慢（sleep 或填大目录）→ 等待随之变长，**不误判为启动失败**
+  dwWaitHint 为 0 / 异常值 → 退回下限 100 ms，不忙轮询
+  确认状态一旦不是等待类就立即结束等待（不等满间隔、不等满 30 秒）
+  慢启动场景下**不弹 UAC、不触发 reinstall**（这是本项要防的回归）
+query_status() 的契约：
+  未安装 → 正常结果 state=NotInstalled（**不返回错误**），命令层才决定 FMT-601 / 退出码 8
+  已安装未运行 → 正常结果 state=Stopped
+  打不开服务控制管理器 → FMT-602 / 退出码 8
+  Win32 状态码不认识 → state=Unknown，不猜测、不崩溃
+命令行退出码与文本两套通道可用：脚本读退出码即可判断「服务在不在」
 开机自启（重启电脑后服务自动运行，横幅显示 Service Running...）
 Service Recovery（异常退出后按 5 秒 / 10 秒 / 30 秒重启，失败计数 1 天重置）
 uninstall 后 repository / trash / data / config / log / temp 仍在
-换目录声明新数据根（复制 exe 到新目录双击 → 新根完成初始化，旧根数据保留）
+换目录声明新数据根（复制 exe 到新目录双击 → 新根完成初始化，旧根数据保留，
+  hello 回执 switched=true 且 CLI 记一行日志「数据根切换：旧 -> 新」（只进日志，不刷控制台））
+CLI 双击时对自己数据根做幂等体检与补齐（首次日志里有「数据根新建目录 / 数据根新建文件」，
+  第二次只有「数据根完整」；**两种情况控制台都不打印这些行**）
+CLI 体检发现损坏 JSON（FMT-006）→ 日志记「数据根损坏（未自动修复）：…」，
+  **stderr** 出现「数据根文件损坏（未自动修复）：…」，不重置、不覆盖原文件
+CLI 体检不触碰已有内容（预置同名目录与自写 JSON 后双击，内容与时间戳不变）
+数据根无法补齐（只读目录等）→ stderr 出现「数据根无法补齐：FMT-013 …」且不阻断后续流程
+help 命令（`help` 列命令总览、`help service` 看详情、`help 未知组` → stderr + 退出码 2、
+  交互式与一次性都支持；不提权、不连服务、不写日志）
+横幅与 --version 同一串 `File Manager Tool  v1.0  ( build  <日期> )`；重跑 CMake 后日期变化
+控制台整洁：双击后 stdout 只有横幅 + 状态行 + 提示符（外加需要提权时的四行），无「建了什么」
 数据根不可写（exe 放在只读位置）→ 提权结果文件退回 %TEMP% 并写一行 WARN，命令仍能完成
 单实例（再次双击 → 激活已有窗口，不新建第二个窗口）
 服务宿主 exe 被移动或删除 → 提示重新安装服务
@@ -3798,18 +4051,44 @@ V2
 14. File 本身不保存下载限制
 15. JSON 损坏不能静默重置
 16. 关键文件操作必须具备事务式处理
-17. Windows Service V1 保持简单（四条命令 + SCM + Recovery，不自建 watchdog）
+17. Windows Service V1 保持简单（五条命令 + SCM + Recovery，不自建 watchdog）
 18. CLI（命名管道）与 HTTP 使用统一业务核心
 19. 单一 fmt.exe，三种形态：CLI / Service / 提权短命副本
 20. manifest 为 asInvoker，绝不 requireAdministrator
-21. service 只有 install / uninstall / start / stop，没有 pause、没有 delete
-22. service 四条命令一律走 UAC 提权，不做免提权优化
+21. service 有 install / uninstall / start / stop / status 五条，没有 pause、没有 delete
+22. service 的四条动作命令（install / uninstall / start / stop）一律走 UAC 提权，不做免提权优化；
+    status 是查询命令，不提权、不弹 UAC
 23. CLI 走命名管道，HTTP 只给浏览器（CLI 不走 HTTP）
-24. 数据根由 CLI 声明，服务维护当前数据根，切换不删旧数据
-25. 初始化由服务执行，CLI 只读不建业务目录、不写 JSON（只允许建 log/ 与提权前要用的 temp/，见第 5 节、第 65 节）
+24. 数据根由 CLI 声明，服务维护当前数据根，切换不删旧数据；
+    hello 响应回填 switched / previous_root，CLI 据此记一行日志「数据根切换：旧 -> 新」（只进日志）
+25. 初始化由 Service 与 CLI 共用同一套幂等规则（ensure_root/check_root）：
+    Service 在启动/换根时执行，CLI 在双击时对自己的数据根执行；两边都只补缺失、
+    都不碰业务数据内容；已有 JSON 读一遍确认，损坏只报告不重置
 26. 服务自身状态写在 %ProgramData%\FMT\service.json，不属于业务数据
 27. 同时只有一个 CLI 窗口，因此同时只有一个数据根
 28. 服务宿主为首次安装时注册的 exe 绝对路径，移动请用复制
+29. ServiceMain 初始化失败时把 FMT 编号写进 dwServiceSpecificExitCode（不是退出码），
+    CLI 通过统一查询接口读回并打印「服务启动失败：FMT-008 配置错误」
+30. 双击引导：数据根体检与补齐 → 查 SCM → 已安装未运行则提权 start 并等它落定 →
+    仍没起就读失败编号；命中数据根/配置类错误码集合（FMT-005/006/007/008/009/011/013/014）
+    不重装，其余才提权 reinstall 一次
+31. service status 未安装时打印「服务状态：未安装」并返回 FMT-601 / 退出码 8；
+    已安装未运行时照常打印、退出码 0
+32. 服务状态与失败编号统一走 service::query_status() / query_state() / last_start_failure()；
+    「未安装」是正常结果（state = NotInstalled），不是错误——只有查询本身失败才是 FMT-602
+33. 「等它落定」不写死时长：按 SCM 的 dwWaitHint 自适应，夹在 100 ms – 2000 ms，
+    兜底上限 30 秒，状态一旦不是等待类就立即结束
+34. V1 不做结构化输出：没有 --json，也不预留参数名；机器可读通道是命令退出码，
+    人类可读通道是固定顺序的那几行文本
+35. 程序横幅名固定 File Manager Tool，版本部分 v<MAJOR>.<MINOR>（当前 v1.0），
+    构建日期由 CMake 配置时生成（FMT_BUILD_DATE，%Y.%m.%d 本地时间）；
+    横幅与 --version 共用 banner_text()，源码里不得硬编码版本号或日期；
+    用法标题是「用法：fmt.exe [命令]」
+36. 控制台只留交互：双击时数据根体检的结果（新建目录 / 新建文件 / 完整）与服务当前状态
+    只进日志；只有异常（无法补齐、文件损坏）走 stderr
+37. help 是正式命令：help 列命令总览（只列命令、不加描述），help <组> 看详情，
+    支持 service / bucket / file / share / trash / help / exit；help <未知组> →
+    stderr 一行 + FMT-001 / 退出码 2；exit / quit 也是正式命令
 ```
 
 ---
@@ -3934,13 +4213,23 @@ FMT 重构设计.md
 
 ```text
 单一 fmt.exe 三种形态（manifest 为 asInvoker）
-service install / uninstall / start / stop（无 pause、无 delete）
-service 命令一律 UAC 提权 + 结果经结果文件 <数据根>\temp\fmt-elev-<父进程 pid>.json 回传
+service install / uninstall / start / stop / status（无 pause、无 delete）
+service 四条动作命令一律 UAC 提权 + 结果经结果文件 <数据根>\temp\fmt-elev-<父进程 pid>.json 回传
   （提权副本 operation 五种：install / uninstall / start / stop / reinstall）
+service status 是查询命令：不提权、不弹 UAC，未安装时 FMT-601 / 退出码 8
 CLI 走命名管道 \\.\pipe\fmt.control，不走 HTTP
-数据根由 CLI 声明，服务侧幂等初始化，CLI 只读
+数据根由 CLI 声明（hello 响应回填 switched / previous_root）
+初始化由 Service 与 CLI 共用同一套幂等规则（ensure_root/check_root），两边都只补缺失；
+  CLI 双击时对自己数据根执行体检与补齐，损坏 JSON 只报告不重置
+ServiceMain 初始化失败上报 FMT 编号（dwServiceSpecificExitCode），CLI 读回并打印原因
+服务状态统一走 query_status / query_state / last_start_failure；「未安装」是正常结果而非错误
+等待落定按 SCM 的 dwWaitHint 自适应（100 ms – 2000 ms，兜底 30 秒），不写死时长
 服务状态文件 %ProgramData%\FMT\service.json
 CLI 单实例与固定界面输出（横幅、提示符、stdout / stderr）
+横幅 = File Manager Tool  v1.0  ( build  <CMake 配置日期> )，与 --version 同一串
+控制台只留交互与异常：数据根体检结果与服务当前状态只进日志
+help 命令（总览 / 分组详情 / 未知组 → FMT-001 退出码 2）；exit / quit 是正式命令
+V1 不做 --json 结构化输出，机器可读通道是退出码
 开发顺序：阶段 2 = common/config/storage/core，阶段 3 = service/ipc/cli
 ```
 
@@ -3982,10 +4271,15 @@ HTTP 实现限制
 
 # 126. 提权流程
 
-service 命令（`install` / `uninstall` / `start` / `stop`）**每条都走 UAC 提权**，
+service 命令里的**四条动作命令**（`install` / `uninstall` / `start` / `stop`）**每条都走 UAC 提权**，
 即使目标状态已经满足也照常弹 UAC，不做免提权优化。提权副本额外支持一个组合操作
 `reinstall`（= 先卸载再安装并启动，服务未安装时忽略卸载阶段的错误），用于「服务宿主 exe
 已丢失、需要重新指向当前目录」的场景，**一次 UAC 做完**。
+
+**第五个命令 `service status` 不走提权流程**：它是查询命令，只读、不改变任何状态，
+因此不需要管理员权限，也不弹 UAC、不生成结果文件；它直接 `OpenSCManagerW` +
+`OpenServiceW(SERVICE_QUERY_STATUS)` + `QueryServiceStatusEx` + `QueryServiceConfigW` 后打印
+（见第 70 节）。本节剩下的内容只描述那四条动作命令与 `reinstall`。
 
 ## 126.1 判断是否已提权
 
@@ -4080,9 +4374,10 @@ Service 启动时会清理 `temp/` 下遗留的 `fmt-*` 文件（只清固定前
 | --- | --- | --- |
 | `service install` | 命中该命令即提权，不检查服务是否已存在 | `CreateServiceW` + Recovery + `StartServiceW` |
 | `service uninstall` | 命中该命令即提权，不检查服务是否在运行 | `ControlService(STOP)` + `DeleteService` |
-| `service start` | 命中该命令即提权，不检查服务是否已在运行 | `StartServiceW` |
-| `service stop` | 命中该命令即提权，不检查服务是否已停止 | `ControlService(SERVICE_CONTROL_STOP)` |
+| `service start` | 命中该命令即提权，不检查服务是否已在运行 | `StartServiceW`，随后 `settle_state()` 按 `dwWaitHint` 等落定（第 70 节） |
+| `service stop` | 命中该命令即提权，不检查服务是否已停止 | `ControlService(SERVICE_CONTROL_STOP)`，随后 `settle_state()` 等落定 |
 | `service reinstall` | 命中该命令即提权（宿主 exe 已丢失时由引导流程触发） | `OpenServiceW` 失败（`ERROR_SERVICE_DOES_NOT_EXIST`）则**忽略** → `DeleteService`（若存在）→ `CreateServiceW` + Recovery → `StartServiceW`，**一次 UAC 完成** |
+| `service status` | **从不提权**（它是查询命令，不进入提权流程，也不生成结果文件） | 直接 `service::query_status()` + `QueryServiceConfigW` 打印状态 / 宿主 / 数据根 / 错误码 |
 
 `reinstall` 是提权副本的 operation 之一（`--elevated reinstall --result "<路径>"`），
 不是「先跑一次 uninstall 再跑一次 install」两条命令——两次命令会弹两次 UAC。
@@ -4099,6 +4394,8 @@ SCM 操作失败                           → FMT-602 / 退出码 8
 服务不存在                             → FMT-601 / 退出码 8
 服务已存在（重复 install）             → FMT-600 / 退出码 8
 reinstall 时服务不存在                 → 忽略卸载阶段的 FMT-601，继续安装
+service status 发现服务未安装           → FMT-601 / 退出码 8（不提权，不是提权失败）
+service status 已安装但未运行           → 照常打印「已停止」/ 退出码 0
 ```
 
 用户取消 UAC 或提权失败**不退出 CLI**：打印错误后回到提示符继续等待输入（见第 127 节）。
@@ -4108,7 +4405,7 @@ reinstall 时服务不存在                 → 忽略卸载阶段的 FMT-601�
 成功：
 
 ```text
-FMT v1.0.0
+File Manager Tool  v1.0  ( build  2026.10.08 )
 Service Running...
 
 fmt >service stop
@@ -4123,7 +4420,7 @@ fmt >
 失败（后两行替换为执行失败行与错误码行）：
 
 ```text
-FMT v1.0.0
+File Manager Tool  v1.0  ( build  2026.10.08 )
 Service Running...
 
 fmt >service stop
@@ -4151,19 +4448,65 @@ fmt> 提示符前先输出一个空行（横幅之后、以及每条命令之后
 
 ## 127.1 横幅
 
-CLI 启动时打印：
+CLI 启动时打印（`banner_text()` 产出，与 `--version` 同一串）：
 
 ```text
-FMT v1.0.0
+File Manager Tool  v1.0  ( build  2026.10.08 )
 Service Running...
 ```
 
 服务未运行时第二行改为：
 
 ```text
-FMT v1.0.0
+File Manager Tool  v1.0  ( build  2026.10.08 )
 Service Stopped...
 ```
+
+| 项 | 约定 |
+| --- | --- |
+| 程序名 | 固定 `File Manager Tool`（文档名/工程名仍叫 FMT，只有横幅用这个名字） |
+| 版本部分 | `v<MAJOR>.<MINOR>`，当前 `v1.0`；工程版本仍是 `1.0.0` |
+| 构建日期 | CMake 配置时生成（`FMT_BUILD_DATE`，`%Y.%m.%d` 本地时间），每次重新配置都会变 |
+| 单一来源 | 横幅与 `--version` 调同一个 `banner_text()`，不各写一份；源码里不得硬编码版本号或日期 |
+| 用法标题 | `--help` 里是 `用法：fmt.exe [命令]`，不再用 `FMT 1.0.0 - Windows 文件管理系统` 这类旧标题 |
+
+**双击时控制台只有这些行**（数据根体检与服务状态都不打印）：
+
+```text
+需要管理员权限        ← 仅当需要装/启服务时才有这两行
+正在提权...
+执行成功...
+错误码：0
+
+File Manager Tool  v1.0  ( build  2026.10.08 )
+Service Running...
+
+fmt> 
+```
+
+数据根体检的「建了什么 / 完不完整」与服务当前状态**只进日志**（`log/fmt.log`，
+模块 `Cli` / `Service`）：
+
+```text
+[Cli] 数据根检查：D:/FMT2
+[Cli] 数据根新建目录：repository, trash, config, data, log, temp
+[Cli] 数据根新建文件：D:/FMT2/config/config.json, ...
+[Cli] 数据根完整                      ← 第二次双击
+[Service] 当前状态：运行中
+```
+
+**只有异常才走 stderr**：`数据根无法补齐：FMT-013 …`、
+`数据根文件损坏（未自动修复）：data/file.json`。
+
+**换根这种例行状态变化也只进日志、不刷控制台**（要看就问 `service status`，
+它会打印「服务数据根」）：
+
+```text
+[Service] 数据根切换：D:/FMT -> D:/FMT2        ← 仅当 hello 回执 switched=true
+[Service] 服务数据根已经是：D:/FMT2            ← 未切换时
+```
+
+这样归位守的是第 65 节那条老原则：**控制台负责用户交互与重要异常，日志文件负责完整运行记录**。
 
 横幅之后**先输出一个空行**，再打印提示符，等待用户输入。
 空行的作用是把提示符和上面的横幅分开，输出不会和提示符挤在一起。
@@ -4190,7 +4533,8 @@ fmt>
 正常结果 → stdout
 错误 → stderr
 命令失败后继续循环，不退出
-exit 或 quit 退出
+help    → 打印命令总览；help <组> 看该组详情（交互里 --help 是 help 的别名）
+exit 或 quit 退出（正式命令，不只是「关窗口」）
 ```
 
 命令按 `fmt> ` 提示符逐条输入，例如：
@@ -4198,7 +4542,35 @@ exit 或 quit 退出
 ```text
 fmt >service stop
 
-fmt >file list
+fmt >help service
+```
+
+`help` 的输出：
+
+```text
+fmt> help
+可用命令：
+  (service)  install  uninstall  start  stop  status
+  (help)     help [命令]
+  (exit)     exit  quit
+
+业务命令（服务端尚未实现，现在会返回 FMT-602）：
+  (bucket)   create  list  get  use  delete
+  (file)     upload  list  get  delete
+  (share)    create  get  list  delete
+  (trash)    list  get  restore  delete
+```
+
+`service status` 的输出也走 stdout（它是查询命令，成功与「未安装」两种结果都是它的正常输出）：
+
+```text
+fmt> service status
+服务状态：运行中
+服务宿主：D:/FMT2/fmt.exe
+服务数据根：D:/FMT2
+错误码：0
+
+fmt>
 ```
 
 ## 127.3 退出
@@ -4208,8 +4580,8 @@ exit
 quit
 ```
 
-两种写法都结束 CLI 循环并以退出码 `0` 退出；直接关闭窗口同样只结束 CLI，
-**不影响后台服务**（服务由 SCM 托管）。
+两者都是**正式命令**（`help exit` 有说明，`quit` 等同 `exit`）：结束 CLI 循环并以退出码 `0`
+退出；直接关闭窗口同样只结束 CLI，**不影响后台服务**（服务由 SCM 托管）。
 
 ## 127.4 输出通道
 
@@ -4218,16 +4590,26 @@ stdout   命令的正常结果、横幅、提示符、提权过程提示（需�
 stderr   错误码与错误消息（执行失败：FMT-NNN <消息>、错误码：N）
 ```
 
+**机器可读通道是退出码，不是结构化文本**：V1 不做 `--json`，也不预留参数名。
+脚本判断「服务在不在」读退出码即可（`0` 成功；未安装 `FMT-601` → `8`；查询失败 → `8`），
+要拿具体状态就读上面那几行**顺序固定**的文本。等真的需要读到 `wait_hint_ms` 这类结构化字段时
+再加（见第 70 节）。
+
 CLI 把结果输出到控制台，**同时追加写入数据根下的 `log/fmt.log`**（见第 65 节）；
-`--help` 与 `--version` 不写日志、不创建任何目录。
+`--help` / `--version` / `help` / `exit` 不写日志、不创建任何目录。
+**控制台只留交互与异常**：双击时的数据根体检结果与服务当前状态都只进日志（见 127.1），
+只有「数据根无法补齐」「数据根文件损坏（未自动修复）」才走 stderr。
 
 ## 127.5 CLI 与服务的边界
 
 ```text
-CLI 不碰 core、不建业务目录、不写 JSON（仅有的两处例外是 log/ 与提权前要用的 temp/，见第 5 节、第 65 节）
+CLI 不碰 core 业务操作、不写业务 JSON；双击时对自己所在数据根跑一次与服务共用的幂等体检与补齐
+  （只补缺失的六个目录与六个默认 JSON，不删除、不覆盖、不改名、不重置损坏 JSON，
+   结果只进日志、控制台不打印，见第 5 节、第 91～92 节）
 CLI 只解析命令、走管道、打印结果、写自己的日志
+help / --help 本地处理：不连服务、不提权、不写日志
 业务命令经命名管道交给服务执行（见第 76 节）
-service 命令直连 SCM + UAC 提权（见第 126 节）
+service 命令直连 SCM：四条动作命令走 UAC 提权、status 是查询不提权（见第 126 节）
 CLI 单实例：已有窗口则激活，不新建窗口
 ```
 
@@ -4251,13 +4633,21 @@ CLI 单实例：已有窗口则激活，不新建窗口
 | 命名空间 | `fmt` 保持不变；第三方库 vendor 到 `third_party/`，不污染业务命名空间 |
 | 第三方依赖 | vendor `nlohmann/json` + `cpp-httplib` 到 `third_party/`，`/MT` 静态链接 CRT，产物只有一个 `fmt.exe` |
 | 单一可执行文件 | `fmt.exe` 三种形态：CLI 形态 / Service 形态 / 提权短命副本；manifest 为 `asInvoker` |
-| service 命令 | 只有 `install` / `uninstall` / `start` / `stop`（提权副本另有 `reinstall` 组合操作），无 `pause`、无 `delete`，命令不带 `--` 前缀 |
-| service 提权 | service 命令（含 `reinstall`）一律走 UAC 提权，结果经结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 回传父进程打印（命令行 `--elevated <op> --result "<路径>"`，op 五种），见第 126 节；数据根不可写时退回 `%TEMP%` 并记一行 WARN |
+| service 命令 | 有 `install` / `uninstall` / `start` / `stop` / `status` 五条（提权副本另有 `reinstall` 组合操作），无 `pause`、无 `delete`，命令不带 `--` 前缀 |
+| service 提权 | 四条动作命令（`install` / `uninstall` / `start` / `stop`）含 `reinstall` 一律走 UAC 提权，结果经结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 回传父进程打印（命令行 `--elevated <op> --result "<路径>"`，op 五种），见第 126 节；数据根不可写时退回 `%TEMP%` 并记一行 WARN。**`status` 不提权**：只读查询，不弹 UAC、不生成结果文件 |
 | CLI 通道 | 命名管道 `\\.\pipe\fmt.control`（帧 = 4 字节长度 + JSON）；HTTP `127.0.0.1:4122` 只给浏览器 |
-| 数据根 | 由 CLI 用 `hello` 帧声明（自身 exe 所在目录）；服务维护当前数据根，切换不删旧数据 |
-| 初始化归属 | 服务创建 `repository`/`trash`/`config`/`data`/`log`/`temp` 与默认 JSON；CLI 只读（写日志用的 `log/` 与提权前建的 `temp/` 是仅有的两处例外），见第 91～92 节 |
+| 数据根 | 由 CLI 用 `hello` 帧声明（自身 exe 所在目录）；服务维护当前数据根，切换不删旧数据；响应回填 `switched` / `previous_root`，CLI 记一行日志「数据根切换：旧 -> 新」（只进日志，不刷控制台） |
+| 初始化归属 | Service 与 CLI **共用同一套幂等规则**（`ensure_root` / `check_root`）：六个目录 + 六个默认 JSON；Service 在启动/换根时执行、CLI 在双击时对自己数据根执行；两边都只补缺失，已有的读一遍确认，损坏 JSON 只报告不重置（不删除、不覆盖、不改名），见第 91～92 节 |
+| 服务启动失败上报 | `ServiceMain` 初始化失败时把 FMT 编号写进 `dwServiceSpecificExitCode` 并置 `dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR`；CLI 通过统一查询接口读回并打印「服务启动失败：FMT-008 配置错误」，见第 75、99、126 节 |
+| 状态查询接口 | `service::State` + `service::StatusInfo{state, wait_hint_ms, win32_exit_code, service_exit_code}` + `query_status()` / `query_state()` / `installed_binary_path()` / `last_start_failure()`；「未安装」是**正常结果**（`State::NotInstalled`）而非错误，旧的「`QueryServiceStatus` + `map_state`」写法作废。注意 `State` 是状态枚举，`ServiceState` 是 `service.json` 结构体，见第 70、126 节 |
+| 等待落定 | 不写死时长：按 SCM 的 `dwWaitHint` 自适应，夹在 100 ms – 2000 ms（`kMinStepMs` / `kMaxStepMs`），兜底上限 30 秒（`kSettleCapMs`），状态一旦不是等待类就立即结束；实现是 CLI 内的 `settle_state()`。旧口径的「约 8 秒」作废，见第 70、75 节 |
+| 结构化输出 | **V1 不做**：没有 `--json`，也不预留参数名；机器可读通道是命令退出码（`0` / 未安装 `FMT-601` → `8`），人类可读通道是固定顺序的几行文本，见第 70、127.4 节 |
+| 双击引导 | 单实例 → 数据根体检与补齐 → 查 SCM（走 `query_status()`；未安装 install / 运行中不动 / 已安装未运行提权 start 并用 `settle_state()` 等它落定）→ 仍没起读失败编号，命中数据根/配置类错误码（FMT-005/006/007/008/009/011/013/014）不重装、其余提权 reinstall 一次 → 宿主 exe 丢失询问 reinstall → hello 声明数据根 → 横幅与提示符，见第 75 节 |
 | 服务状态文件 | `%ProgramData%\FMT\service.json`（当前数据根 + 安装信息），不属于业务数据 |
-| CLI 界面 | 横幅 `FMT v1.0.0` + `Service Running...`，提示符 `fmt> `（打印前先输出一个空行，空命令不重复空行），正常 → stdout / 错误 → stderr，见第 127 节 |
+| 横幅与版本 | 程序名固定 `File Manager Tool`，横幅与 `--version` 共用 `banner_text()`：`File Manager Tool  v1.0  ( build  <CMake 配置时生成的日期> )`；日期来自 `FMT_BUILD_DATE`（`%Y.%m.%d` 本地时间）→ `version.hpp` 的 `BUILD_DATE`；用法标题 `用法：fmt.exe [命令]`，见第 127.1 节 |
+| 控制台约定 | 控制台只留交互与异常：横幅、提示符、命令结果、stderr 上的异常。双击时的数据根体检结果（新建目录 / 新建文件 / 完整）、服务当前状态、**以及换根通知**都只进日志（模块 `Cli` / `Service`），见第 65、127.1 节 |
+| help 命令 | `--help` 打印带横幅与退出码表的完整用法（内含命令总览）；`help` 不带参数只列命令、`help <组>` 打印该组详情（`service` / `bucket` / `file` / `share` / `trash` / `help` / `exit`），交互式与一次性都支持，不提权、不连服务、不写日志；`help <未知组>` → stderr 一行 + `FMT-001` / 退出码 2；`exit` / `quit` 是正式命令，见第 68、95、127.2 节 |
+| CLI 界面 | 横幅 `File Manager Tool  v1.0  ( build  2026.10.08 )` + `Service Running...`，提示符 `fmt> `（打印前先输出一个空行，空命令不重复空行），正常 → stdout / 错误 → stderr，见第 127 节 |
 
 ## 附录 A.1 错误码枚举
 
