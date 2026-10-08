@@ -9,10 +9,25 @@
 
 #include "fmt_test.hpp"
 
+FMT_TEST(Ipc, 管道名可被FMT_PIPE覆盖) {
+    // 默认名（线上就是这个）
+    SetEnvironmentVariableW(L"FMT_PIPE", nullptr);
+    FMT_CHECK(fmt::ipc::pipe_name() == std::wstring(fmt::ipc::kPipeName));
+
+    // 覆盖名：端到端测试靠它让自己起的服务与真服务互不干扰
+    SetEnvironmentVariableW(L"FMT_PIPE", L"\\\\.\\pipe\\fmt-unit-test");
+    FMT_CHECK(fmt::ipc::pipe_name() == std::wstring(L"\\\\.\\pipe\\fmt-unit-test"));
+
+    // 空值等于没设
+    SetEnvironmentVariableW(L"FMT_PIPE", L"");
+    FMT_CHECK(fmt::ipc::pipe_name() == std::wstring(fmt::ipc::kPipeName));
+
+    SetEnvironmentVariableW(L"FMT_PIPE", nullptr);  // 别影响后面的用例
+}
+
 namespace {
 
-void sleep_ms(int milliseconds) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+void sleep_ms(int milliseconds) {    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
 }
 
 }  // namespace

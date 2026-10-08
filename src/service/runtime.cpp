@@ -530,9 +530,11 @@ void ServerRuntime::serve(ipc::PipeConnection connection) {
 
 void ServerRuntime::run() {
     int consecutive_failures = 0;
+    // 管道名只算一次：默认名，或测试用 `FMT_PIPE` 覆盖的值。
+    const std::wstring pipe = ipc::pipe_name();
 
     while (!stop_requested_.load()) {
-        Result<ipc::PipeConnection> accepted = ipc::PipeConnection::accept(500);
+        Result<ipc::PipeConnection> accepted = ipc::PipeConnection::accept(500, pipe.c_str());
         if (!ok(accepted)) {
             // 500 ms 超时是正常路径：回到循环顶部检查停止标志。
             if (++consecutive_failures > 3) {

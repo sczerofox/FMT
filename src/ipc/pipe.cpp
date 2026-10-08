@@ -2,11 +2,25 @@
 
 #include <sddl.h>  // ConvertStringSecurityDescriptorToSecurityDescriptorW
 
+#include <iterator>
 #include <utility>
 
 #include "fmt/common/string.hpp"
 
 namespace fmt::ipc {
+
+std::wstring pipe_name() {
+    // 环境变量优先（测试/并行实例用）。取不到或为空都回默认名。
+    constexpr DWORD kBufferChars = 512;
+    wchar_t buffer[kBufferChars] = {};
+    const DWORD written =
+        GetEnvironmentVariableW(L"FMT_PIPE", buffer, static_cast<DWORD>(std::size(buffer)));
+    if (written > 0 && written < kBufferChars && buffer[0] != L'\0') {
+        return std::wstring(buffer, written);
+    }
+    return std::wstring(kPipeName);
+}
+
 namespace {
 
 // DACL 授权交互用户 + MIC 标签降到中完整性，一次设置到位（§13.9.2）。

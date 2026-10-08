@@ -20,6 +20,7 @@ add_executable(fmt_tests
     ipc_test.cpp
     service_test.cpp
     cli_test.cpp
+    cli_e2e_test.cpp   # 端到端：真实 fmt.exe + 真实管道 + 进程内服务（用 FMT_PIPE 隔离）
     server_test.cpp
 )
 

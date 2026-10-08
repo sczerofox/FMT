@@ -377,7 +377,10 @@ Status ensure_connected(Session& session, const Options& options) {
         return std::monostate{};
     }
 
-    Result<ipc::PipeClient> connected = ipc::PipeClient::connect_waiting(kConnectWaitMs);
+    // 管道名默认是 \\.\pipe\fmt.control；测试进程用 FMT_PIPE 覆盖，
+    // 好让端到端测试里的 CLI 打到测试自己的服务、而不是用户的真服务。
+    Result<ipc::PipeClient> connected =
+        ipc::PipeClient::connect_waiting(kConnectWaitMs, ipc::pipe_name().c_str());
     if (!ok(connected)) {
         return *error_of(connected);
     }
