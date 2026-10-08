@@ -595,6 +595,10 @@ FMT_TEST(Trash, 文件级条目能列出并回退) {
     // 回退：搬回仓库、记录复位
     const auto restored = trash.restore(record.file_id);
     FMT_CHECK(fmt::ok(restored));
+    if (fmt::ok(restored)) {
+        // present = 数据还在不在。回退后数据就在仓库里，所以**不能**翻成 false
+        FMT_CHECK(std::get<fmt::TrashEntry>(restored).present);
+    }
     const auto path = files.resolve_path(record);
     FMT_CHECK(fmt::ok(path));
     FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(path)));
@@ -740,6 +744,10 @@ FMT_TEST(Trash, 永久删除文件级条目) {
 
     const auto purged = trash.purge(record.file_id);
     FMT_CHECK(fmt::ok(purged));
+    if (fmt::ok(purged)) {
+        // 结果条目描述的是**删除前**那一份：present 不能被翻转
+        FMT_CHECK(std::get<fmt::TrashEntry>(purged).present);
+    }
     FMT_CHECK(!fmt::file_exists(std::get<std::filesystem::path>(trashed_path)));
     // 记录也一并清掉
     const auto gone = files.get_by_id(record.file_id);

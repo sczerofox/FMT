@@ -246,6 +246,9 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     if (restored.ok) {
         FMT_CHECK_EQ(restored.data["entry"].value("name", std::string{}), std::string("工作"));
         FMT_CHECK_EQ(restored.data["entry"].value("type", std::string{}), std::string("bucket"));
+        // present 的语义是「数据还在不在」——回退只是把它搬回仓库，数据当然还在。
+        // 若这里翻转成 false，CLI 就会打印「状态：数据已不存在」这种误导信息。
+        FMT_CHECK(restored.data["entry"].value("present", false));
     }
     FMT_CHECK(fmt::directory_exists(root / "repository" / "user" / fmt::path_from_utf8("工作")));
 
@@ -302,6 +305,8 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     if (purged.ok) {
         FMT_CHECK_EQ(purged.data["entry"].value("id", std::string{}), second);
         FMT_CHECK_EQ(purged.data["entry"].value("type", std::string{}), std::string("bucket"));
+        // 同 restore：结果条目描述的是**删除前**那一份，present 不能被翻转
+        FMT_CHECK(purged.data["entry"].value("present", false));
     }
 
     fmt::ipc::Request list_after;

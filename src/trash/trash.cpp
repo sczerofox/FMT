@@ -361,7 +361,6 @@ Result<TrashEntry> TrashService::restore(std::string_view identifier) {
         return *error_of(restored);
     }
     TrashEntry done = std::get<TrashEntry>(entry);
-    done.present = false;
     done.message.clear();
     return done;
 }
@@ -448,7 +447,6 @@ Result<TrashEntry> TrashService::purge(std::string_view identifier) {
         return *error_of(purged);
     }
     TrashEntry done = std::get<TrashEntry>(entry);
-    done.present = false;
     done.message.clear();
     return done;
 }
