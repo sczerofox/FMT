@@ -71,7 +71,7 @@ V1 用 **JSON + 文件系统**满足需求，不使用数据库、Redis、MQ、�
 
 ## 2. 关键设计决策
 
-V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～33** 项是
+V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～34** 项是
 `arch-restart` 分支新增的**重构冻结项**，逐条对应 `FMT 重构设计.md` 第 2 节的决策索引：
 
 | # | 规则 |
@@ -112,6 +112,8 @@ V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 �
 | 32 | **请求形状由同一个构造函数产出；进程间共写的两处纪律（提交 `2c841c8` + `5b316b3`，用户实测踩出来的）**：① `fmt::cli::argument_envelope(positional, dry_run, force)` 是「位置参数放 `argv`、开关放同级」的唯一产出点，预检与真实请求共用——原来把 `dry_run` 挂到位置参数**数组**上，nlohmann 抛 `type_error.305` 未捕获即 `abort()`（`file delete a7.jpg` 弹出的 Debug Error）；**测试不许自己拼形状**（旧测试照着服务端契约拼，所以全绿却挡不住崩溃）。② temp/ 的启动清理**只清十分钟以前**的 `fmt-*`：提权结果文件也叫 `fmt-elev-<pid>.json(.tmp)`，`service install` 会在同一次操作里启动服务，一律清掉会让父进程报「FMT-602 提权副本没有返回结果」——**服务其实装好了**（假失败）。③ 原子写的临时名必须唯一（`<目标>.<pid>.<序号>.tmp`）+ 进程内互斥 + 替换遇共享冲突短暂重试：固定 `<目标>.tmp` 时安装器与服务启动同时写 `service.json` 会互相踩，加上调用方忽略返回值 → `service.json` 静默不更新。④ `TrashEntry.present` 语义写死为「数据在不在磁盘上」，回退/删除的结果**不翻转它**（文件级 `5b316b3`、桶级 `8f0fd5c`——原来恢复成功后打印「状态：数据已不存在」；`8f0fd5c` 之后真机跑过建桶/删桶/回退/永久删除确认为实况）。见第 4.2、4.5、8 节与 `FMT 技术文档.md` 第 6.6、10.4、11.15、13.8.3、18.28、18.29、18.30 节 |
 
 | 33 | **`version` 是正式命令，与横幅、`--version` 同源（提交 `d108c80`）**：三处都走 `cli::version_text()`（内部就是 `banner_text()`），输出一行 `File Manager Tool  v1.0  ( build  <CMake 配置日期> )`——窗口里 `version`、`fmt.exe version`、`fmt.exe --version` / `-v` 都能用。**不需要服务在运行**（不连管道、不查状态、不弹 UAC），**不写任何磁盘内容**（一次性分支在开日志器之前，`log/fmt.log` 不会因此多记录）。`help` 总览多一行 `(version)  version  打印版本与构建日期`，`help version` 有正文。原口径「窗口里敲 `version` → 未知命令」**已作废** |
+
+| 34 | **数据根被搬走时要说出来（提交 `8f2fbc5` + `bb7a40f`，用户实测后选定）**：① **切换发生的那一刻**（hello 回执 `switched=true`）CLI 在 **stderr** 打印 `cli::root_switch_notice(previous, current)`——两个根都点名、说明原因是「数据根由 CLI 声明」、并给出「用数据根正确的那个 `fmt.exe` 再执行一条命令切回去」；**同时**照旧记一行日志（**原口径「换根只进日志、不刷控制台」已作废**）。② 交互窗口横幅区**永远多一行「数据根：…」**（`service::load_state()`），与本程序所在目录不一致时再补一行说明（触发条件：双击引导会先连上并声明本目录，所以服务在跑时通常已一致；这一行主要在服务不可用时出现）。③ **为什么「连接那一刻报警」就够**：服务一次只接受一条连接（第 3.1 节与 `FMT 技术文档.md` 第 15.1 节①），交互窗口握着管道时别的 CLI 拿 `ERROR_PIPE_BUSY` → `FMT-601`，所以「会话中途被搬走」不可能发生。④ 文本收进 `root_switch_notice()` 是为了**能断言**（控制台输出第一次有测试覆盖） |
 
 系统明确**禁止自动**执行：覆盖文件、修改用户文件名、选择其他 Bucket、创建恢复目标
 Bucket、绕过下载限制、删除文件、清空损坏 JSON、**删除旧数据根的数据**、**把服务宿主的
@@ -168,7 +170,7 @@ CLI 启动
 | `switched` | 这次声明是否**导致服务切换了数据根**；未切换时该字段不出现（或缺省为 false） |
 | `previous_root` | 切换前的旧数据根；**只在 `switched` 为真时出现** |
 
-`switched` 为真时，CLI 额外记一行日志 `[Service] 数据根切换：旧 -> 新`（只进日志），所以双击一个新目录就能看见
+`switched` 为真时，CLI **在 stderr 打印换根提示**（提交 `8f2fbc5`，`cli::root_switch_notice(previous, current)`：两个根都点名 + 原因 + 怎么切回去）**并**记一行日志 `[Service] 数据根切换：旧 -> 新`——**原口径「只进日志」已作废**，所以双击一个新目录就能看见
 服务跟过来了；未切换时保持原来的静默。
 
 数据根的取值优先级：
@@ -693,7 +695,7 @@ CLI 双击时会比较服务的 `binPath` 与自身路径：
                    └─ 其它             → 提权 reinstall 一次（卸载 + 安装，一次 UAC），仍失败则报错
   4. 比较服务 binPath 与自身路径（见上表）；不同且该宿主 exe 已丢失 → 询问是否 reinstall 指向当前目录
   5. 服务在运行 → 连管道发 hello 声明 root=D:\FMT2（第 3.1 节）；
-       switched=true 时记一行日志「数据根切换：旧 -> 新」（只进日志）
+       switched=true 时**在 stderr 打印换根提示**（提交 `8f2fbc5`）并记一行日志「数据根切换：旧 -> 新」（**原口径「只进日志」已作废**）
   6. 打印横幅（`File Manager Tool  v1.0  ( build  <日期> )` + Service Running.../Service Stopped...）
        → 空一行 → fmt> 提示符
 ```
@@ -1427,7 +1429,7 @@ CLI 侧的三条边界（详见 `FMT 技术文档.md` 第 11.12 节）：
 2. `--help` / `--version` / `-v` / `version` / `help` / `exit` 不写日志、不创建任何目录。
 3. 两个进程的数据根可能不同（服务可能被别人启动在另一个目录）：各写各自数据根下的
    log/fmt.log；这种情况下 CLI 会额外写一行 WARN，指明服务当前数据根与服务侧日志的位置。
-4. 控制台只留横幅、提示符、命令结果与异常；服务的当前状态、数据根体检结果都只进日志
+4. 控制台只留横幅、提示符、命令结果与异常；服务的当前状态、数据根体检结果只进日志；**换根通知是例外**（提交 `8f2fbc5`：切换时 stderr 报一次 + 横幅常驻「数据根：…」）
    （「控制台负责用户交互与重要异常，日志负责完整运行记录」）。
 ```
 
@@ -1465,8 +1467,9 @@ AppContext
 启动横幅要告诉用户「服务在不在」：
 
 ```text
-File Manager Tool  v1.0  ( build  2026.10.08 )
+File Manager Tool  v1.0  ( build  2026.10.09 )
 Service Running...
+数据根：D:/Data/Temp/JMT/fmt          ← 提交 8f2fbc5 起常驻（service::load_state()）
 
 fmt>
 ```
@@ -1474,7 +1477,9 @@ fmt>
 ```text
 服务已在运行  → 第二行 Service Running...
 服务未运行    → 第二行 Service Stopped...
-横幅名称版本  → File Manager Tool  v1.0  ( build  <配置时的日期> )，与 --version 同一串
+数据根行      → 第三行「数据根：<服务记录的数据根>」（提交 8f2fbc5，永远显示；
+                服务记的根为空时不打）；它与本程序所在目录不一致时再补一行说明
+横幅名称版本  → File Manager Tool  v1.0  ( build  <配置时的日期> )，与 --version、version 同一串
 提示符        → fmt> （fmt 后紧跟 > 和一个空格）
 提示符前的空行 → 打印 fmt> 之前先输出一个空行：横幅之后一次、每条命令执行完之后一次，
                  这样输出不会和提示符挤在一起；用户只敲回车（空命令）时不再重复空行
@@ -1490,8 +1495,9 @@ fmt>
 执行成功...
 错误码：0
 
-File Manager Tool  v1.0  ( build  2026.10.08 )
+File Manager Tool  v1.0  ( build  2026.10.09 )
 Service Running...
+数据根：D:/Data/Temp/JMT/fmt
 
 fmt> 
 ```
@@ -1510,16 +1516,31 @@ fmt>
 **只有异常才走 stderr**：`数据根无法补齐：FMT-013 …`、
 `数据根文件损坏（未自动修复）：data/file.json`。
 
-**换根这种例行状态变化也只进日志、不刷控制台**（要看就问 `service status`，它会打印
-「服务数据根」）：
+**换根通知是个例外：现在也上控制台（提交 `8f2fbc5`，原口径「只进日志、不刷控制台」已作废）**
+——切换的那一刻在 **stderr** 打印 `cli::root_switch_notice(previous, current)`：
+
+```text
+注意：服务的数据根已切换
+  原来：D:/Data/Temp/JMT/fmt
+  现在：D:/Data/CLionProjects/FMT/cmake-build-debug/bin
+原因是「数据根由 CLI 声明」：谁连上服务，服务就用谁的目录。
+如果这不是你想要的，请用数据根正确的那个 fmt.exe 再执行一条命令切回去。
+```
+
+同时照旧写日志（完整运行记录不变；也可以问 `service status`，它会打印「服务数据根」）：
 
 ```text
 [Service] 数据根切换：D:/FMT -> D:/FMT2        ← 仅当 hello 回执 switched=true
 [Service] 服务数据根已经是：D:/FMT2            ← 未切换时
 ```
 
+**交互窗口横幅区还常驻一行「数据根：…」**（提交 `8f2fbc5`），与本程序所在目录不一致时
+再补一行说明；**触发条件**与服务只接受一条连接、所以「中途被搬走」不可能发生这条论据，
+见 `FMT 技术文档.md` 第 11.9、13.10、15.1、18.33 节。
+
 这样归位正是本工程的老原则：**控制台负责用户交互与重要异常，日志文件负责完整运行记录**
-（第 7.2 节）。双击时用户只想知道「能不能开始敲命令」，不该被一串「建了什么」淹掉。
+（第 7.2 节）——换根通知属于「重要异常」那一类：数据、桶、回收站会整体换成另一个目录的
+内容，用户必须立刻知道。双击时数据根体检的「建了什么」仍然只进日志，不该把它淹掉。
 
 `service status` 的输出也走 stdout（它是查询命令，成功与「未安装」两种结果都是它的正常输出）：
 
@@ -1704,7 +1725,7 @@ before a bucket goes」；
 | `common/hash`（**提交 `188e85d`**）：`Md5`（Windows CNG / bcrypt 增量接口）+ `md5_hex()`；`bcrypt.lib` 在 `src/common/CMakeLists.txt` 链接 | `include/fmt/common/hash.hpp`、`src/common/hash.cpp` |
 | `core`：`PathManager`（`trash_file` 落点 `trash/<user>/.files/<bucket>/YYYY/MM/DD/`，提交 `4fee290`） | `src/core/` |
 | `common/http_client`（**提交 `a2b6cd1`**）：`is_remote_url()` + `http_download()`——WinHTTP + Schannel 的流式 GET（跟随重定向、连接/发送/接收超时、`Accept-Encoding: identity`、只有 2xx 交给 sink、sink 返回 false 即中止、证书失败给准提示）；`src/common/CMakeLists.txt` 链 `winhttp`，`src/file/CMakeLists.txt` 不再链 cpp-httplib | `include/fmt/common/http_client.hpp`、`src/common/http_client.cpp` |
-| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**145 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`），提交 `2c841c8` 增到 143（`Cli.位置参数的信封形状`），提交 `5b316b3` 增到 144（`Storage.两个写者同时写同一个文件不会互相踩`，并把 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」），提交 `d108c80` 增到 145（`Cli.版本文本只有一个来源`）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
+| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**146 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`），提交 `2c841c8` 增到 143（`Cli.位置参数的信封形状`），提交 `5b316b3` 增到 144（`Storage.两个写者同时写同一个文件不会互相踩`，并把 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」），提交 `d108c80` 增到 145（`Cli.版本文本只有一个来源`），提交 `bb7a40f` 增到 146（`Cli.数据根切换提示要把两个根都说清楚`——**控制台输出第一次有测试覆盖**）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
 | vendored 第三方库 | `third_party/nlohmann/json.hpp`、`third_party/cpp-httplib/httplib.h`（**只服务 HTTP 服务端**；URL 下载走系统 `winhttp`） |
 | 版本号的单一来源（CMake 生成头） | `cmake/version.hpp.in` |
 | 构建辅助脚本 | `tools/build.ps1` |
@@ -1785,7 +1806,7 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 | 编译器矩阵 | 仅验证 MSVC；Clang 未验证 |
 | 日志轮转策略 | 日志分级与去向已定（第 7.4 节），单文件大小上限与轮转规则未定 |
 | 提权副本的结果通道细节 | **已定稿，从待决清单移出**：结果经结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 回传（第 4.5 节），数据根不可写时退回 `%TEMP%` 同名文件并记一行 WARN；命令行 `--elevated <operation> --result "<路径>"`，operation 五种（`install` / `uninstall` / `start` / `stop` / `reinstall`）。命名管道方案作废——提权副本是高完整性进程，它创建的管道会被 MIC「禁止向上写」挡住（与技术文档 13.9.2「坑 2」同一机制） |
-| 数据根切换的并发保护 | 目前依赖「只有一个 CLI 窗口」（第 4.7 节）；多窗口场景不在本次范围 |
+| 数据根切换的并发保护 | 目前依赖「只有一个 CLI 窗口」（第 4.7 节）；多窗口场景不在本次范围。**「会话中途被别的 CLI 把数据根搬走」不可能发生**：服务一次只接受一条连接（`FMT 技术文档.md` 第 15.1 节① 严格串行），交互窗口握着管道时别的 CLI 拿 `ERROR_PIPE_BUSY` → 重试 → `FMT-601`；切换只可能发生在某个 CLI 连上来的那一刻——**所以换根提示在那一刻报就够了**（提交 `8f2fbc5`，第 3.1 节） |
 | **阶段 5 的锁粒度** | **已定，从待决清单移出**（提交 `188e85d`）：阶段 4 是「两条入口的业务命令共用运行体的一把互斥锁」（第 8 节 ③）——上传/下载持锁会把 `bucket list` 与浏览器请求一起卡住。**实现选的是「把长任务移出锁」的简化形态**：上传两段式，`prepare_upload()`（下载/复制到 `temp/`、边写边算 MD5）在**锁外**、`commit_upload()`（去重 → 重名 → `file_id` → 搬文件 → 写 `file.json`）在**锁内**，运行体 `ServerRuntime::run_upload()` 编排、管道与 HTTP 共用。**没有引入按 JSON / 按 `file_id` 的细分锁**（那仍是目标形态），仍然只有 `ServerRuntime::mutex_` 一把；「上传期间其他命令一起等」不再是既定限制（第 8 节 ④、`FMT 技术文档.md` 第 15.1 ④、15.3、18.16、18.19 节） |
 | `file.upload` 的命令超时值 | **已定并落地（提交 `a2b6cd1`，从「待决」改为「已知边界 + 现有缓解」）**：`ipc::kCommandTimeoutMs = 30000` 仍是其余命令的超时；**`file.upload` 改用新增的 `ipc::kUploadTimeoutMs = 30 * 60 * 1000`（30 分钟）**（`include/fmt/ipc/protocol.hpp`，CLI 侧 `src/cli/cli.cpp:651` 按 operation 选值）。CLI 在等待超时时额外打印「提示：等待服务响应超时。服务端可能仍在处理，稍后用 file list 确认；也可以查看 log/fmt.log。」**残余风险如实保留**：30 分钟上限到了仍可能出现「用户看到失败、服务端已经入库」；彻底解法仍是进度/长任务语义（`FMT 技术文档.md` 第 19.1 节保留此条） |
 

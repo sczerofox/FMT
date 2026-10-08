@@ -479,7 +479,7 @@ Windows 下用 `GetModuleFileNameW`（宽字符）获取自身路径，取其父
 
 把 fmt.exe 放到别处运行 = 声明了另一个数据根
    → Service 会切换根并初始化新根（hello 响应回填 switched=true / previous_root）；
-     CLI 记一行日志「数据根切换：旧 -> 新」（只进日志，不刷控制台）；旧根数据不删除，留在原地
+     CLI **在 stderr 打印换根提示**（提交 `8f2fbc5`，`cli::root_switch_notice(previous, current)`）并记一行日志「数据根切换：旧 -> 新」（**原口径「只进日志，不刷控制台」已作废**，11.9 / 13.10）；旧根数据不删除，留在原地
 ```
 
 数据根切换与初始化的完整流程见 13.10；服务自身状态文件见 13.6。
@@ -783,7 +783,7 @@ Reason: Access is denied.
                      （见 4.2、13.8.2），建不出来就退回 %TEMP% 并写一行 WARN；
                      status 是查询命令，不提权，也不碰 temp/
 7. 其他命令   → 连管道 + hello 声明 root → 进入命令循环（见 11.2）
-                 —— switched=true 时记一行日志「数据根切换：旧 -> 新」（只进日志）
+                 —— switched=true 时**在 stderr 打印换根提示**（提交 `8f2fbc5`）并记一行日志「数据根切换：旧 -> 新」
 8. 日志        → 以追加方式打开 root 下的 log/fmt.log（该目录已由第 3 步建好，见 11.12）
                  ——`--help` / `--version` 不执行第 3 步与这一步，也不创建任何目录
 ```
@@ -2553,6 +2553,7 @@ struct TrashCheck {
     bool blocked = false;        // 同名冲突 / 随桶删除 / 数据缺失：确认也解决不了
     std::string message;
 };
+```
 
 **`present` 的语义写死为「数据在不在磁盘上」（提交 `5b316b3` + `8f0fd5c`）**：
 
@@ -2566,12 +2567,13 @@ struct TrashCheck {
           被搬回仓库、明明在。这是实测报上来的误导信息
 断言      Service.管道能执行回收站命令（桶级 restore / purge 各一条 present 断言）、
           Trash.文件级条目能列出并回退 / Trash.永久删除文件级条目（文件级各一条）；
-          **计数仍是 144**（8f0fd5c 只补断言，没有新增用例）
+          8f0fd5c 只补断言、没有新增用例
 真机      8f0fd5c 之后对着已安装的服务跑过：建桶 → 删桶 → trash list → trash restore
           （打印里没有「状态：数据已不存在」）→ trash delete → trash list 归零，
           完整输出见 18.30
 ```
 
+```cpp
 class TrashService {
 public:
     TrashService(const PathManager& paths, Config& config, Logger* logger);
@@ -3155,11 +3157,12 @@ FMT-NNN   业务/系统错误码，跨进程传递（管道、HTTP 信封），�
 
 ### 11.9 界面与交互模式
 
-**横幅**（进入交互循环前打印）：
+**横幅**（进入交互循环前打印；**提交 `8f2fbc5` 起永远多一行「数据根：…」**）：
 
 ```text
-File Manager Tool  v1.0  ( build  2026.10.08 )
+File Manager Tool  v1.0  ( build  2026.10.09 )
 Service Running...
+数据根：D:/Data/Temp/JMT/fmt
 
 fmt >
 ```
@@ -3167,14 +3170,29 @@ fmt >
 服务未运行时第二行改为：
 
 ```text
-File Manager Tool  v1.0  ( build  2026.10.08 )
+File Manager Tool  v1.0  ( build  2026.10.09 )
 Service Stopped...
+数据根：D:/Data/Temp/JMT/fmt
 
 fmt >
 ```
 
+**「数据根：…」与它下面那一行（提交 `8f2fbc5`）**：
+
+```text
+数据来源    service::load_state() 的 current_root；**服务记的数据根为空时不打这一行**
+不一致时    与本程序所在目录（to_forward_slashes(options.data_root)）**不**相等
+            （iequals 比较）时，紧跟一行：
+            注意：本程序所在目录是 D:/Data/CLionProjects/FMT/cmake-build-debug/bin，
+            连上之后服务会切到本目录（数据根由 CLI 声明）。
+触发条件    双击引导会**先连上服务并声明本目录**，所以服务在跑时横幅上两边通常已经一致；
+            这一行主要在**服务不可用**（引导没能连上）时出现，用来说明
+            「服务记录的数据根与你所在目录不同」——**如实现，不是 bug**
+```
+
 横幅文本来自 `banner_text()`（`src/cli/cli.cpp`），它拼的是 `fmt/version.hpp` 的
-`MAJOR` / `MINOR` / `BUILD_DATE`（见 3.4），**不得硬编码**；`--version` 调的是同一个函数。
+`MAJOR` / `MINOR` / `BUILD_DATE`（见 3.4），**不得硬编码**；`--version` 与 `version` 命令
+调的是同一个 `version_text()`。
 
 **`version` 命令：三处共用一份文本（提交 `d108c80`）**：
 
@@ -3214,7 +3232,7 @@ std::string version_text();     // 实现就是 return banner_text();
 - `help` 打印命令总览，`help <组>` 看详情（`--help` 在交互里是别名）；`exit` / `quit` 退出
 - 命令失败时输出错误并**继续**循环
 - **同时只允许一个 CLI 窗口**（命名互斥体，见 11.11）
-- **控制台只留交互与异常**：数据根体检结果、服务当前状态、换根通知都只进日志（见下）
+- **控制台只留交互与异常**：数据根体检结果、服务当前状态只进日志（见下）；**换根通知是例外**——提交 `8f2fbc5` 起切换时在 stderr 报一次，横幅还常驻一行「数据根：…」（**原口径「换根通知也只进日志」已作废**）
 
 **输出样例（CLI 双击引导 + 横幅）**——**控制台只留交互**，数据根体检的结果不进控制台：
 
@@ -3245,10 +3263,20 @@ fmt>
 2026-10-08 09:20:12 [INFO] [Service] 服务数据根已经是：D:/FMT2
 ```
 
-换到另一个目录双击（hello 回执 `switched=true`）时，**换根通知同样只在日志里**，
-控制台不刷这一行（想看就问 `service status`，它会打印「服务数据根」）：
+换到另一个目录双击（hello 回执 `switched=true`）时，**换根通知现在也上控制台**
+（提交 `8f2fbc5`，**原口径「同样只在日志里、控制台不刷这一行」已作废**）——
+切换的那一刻在 **stderr** 打印 `cli::root_switch_notice(previous, current)`：
 
 ```text
+注意：服务的数据根已切换
+  原来：D:/Data/Temp/JMT/fmt
+  现在：D:/Data/CLionProjects/FMT/cmake-build-debug/bin
+原因是「数据根由 CLI 声明」：谁连上服务，服务就用谁的目录。
+如果这不是你想要的，请用数据根正确的那个 fmt.exe 再执行一条命令切回去。
+```
+
+```text
+（仍然照旧写日志，完整运行记录不变）
 2026-10-08 09:31:07 [INFO] [Service] 数据根切换：D:/FMT -> D:/FMT2
 ```
 
@@ -3260,10 +3288,13 @@ fmt>
 ```
 
 > 归位理由：本工程原本就有「**控制台负责用户交互与重要异常，日志文件负责完整运行记录**」
-> 这条原则（见 14.2）。数据根体检的「建了什么 / 完不完整」、服务的当前状态、以及换根通知
-> 都属于**例行运行记录**，放在控制台只会把提示符淹掉——尤其是双击时用户只想知道
-> 「能不能开始敲命令」。因此把这些行按原则归位到日志，控制台只保留横幅、提示符、
-> 命令结果与异常。
+> 这条原则（见 14.2）。数据根体检的「建了什么 / 完不完整」、服务的当前状态都属于
+> **例行运行记录**，放在控制台只会把提示符淹掉——尤其是双击时用户只想知道
+> 「能不能开始敲命令」。
+> **但换根通知是个例外**（提交 `8f2fbc5`）：它意味着「你看到的数据、桶、回收站整体换成了
+> 另一个目录的内容」，用户必须立刻知道，藏在日志里等于没说。所以它**两者都做**：
+> 控制台报一次 + 日志照旧记（另有横幅上的「数据根：…」常驻显示）。
+> 为什么「连接那一刻报警」就够——见 15.1 与 13.10 末尾。
 
 **输出样例（`service status`，成功）**：
 
@@ -5498,7 +5529,7 @@ const wchar_t* kSddlWithMic = L"D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)S:(ML;;N
 | `switched` | 这次声明是否**导致服务切换了数据根**；未切换时该字段不出现（缺省视为 false） |
 | `previous_root` | 切换前的旧数据根；**只在 `switched` 为真时出现** |
 
-CLI 侧：`switched == true` → 记一行日志 `[Service] 数据根切换：旧 -> 新`（只进日志）；否则静默。
+CLI 侧：`switched == true` → **在 stderr 打印 `cli::root_switch_notice(previous, current)`**（提交 `8f2fbc5`）并记一行日志 `[Service] 数据根切换：旧 -> 新`；否则静默（横幅上的「数据根：…」照常显示，见 11.9）。
 未切换时响应就是 `{ "id":1, "ok":true, "data":{ "root":"D:/FMT2" } }`。
 
 其余业务参数按 `op` 决定，就放在同一层或 `args` 子对象里；
@@ -5602,8 +5633,9 @@ Service（收到任意请求中的 root）：
  7. 整体替换：paths / logger / config / 业务服务 实例（4.3）
  8. 更新 service.json 的 current_root（.tmp 原子替换，13.6）
  9. 写 INFO 日志：「数据根切换: 旧 → 新」
-10. hello 响应回填 switched = true 与 previous_root = 旧根；CLI 收到后记一行日志
-    「数据根切换：旧 -> 新」（模块 Service），**控制台不打印这一行**
+10. hello 响应回填 switched = true 与 previous_root = 旧根；CLI 收到后
+    **在 stderr 打印换根提示**（`root_switch_notice()`，提交 `8f2fbc5`）并记一行日志
+    「数据根切换：旧 -> 新」（模块 Service）——**原口径「控制台不打印这一行」已作废**
 11. 开 gate；该连接上的后续命令都在新根下执行
 ```
 
@@ -5642,7 +5674,7 @@ CLI                     Service
  │                        ├─ 加载配置、初始化业务服务
  │←── ok{root,switched,  ─┤  current_root := D:\A（写 service.json）
  │     previous_root}     │
- │   switched=true → 记一行日志「数据根切换：旧 -> 新」（只进日志）
+ │   switched=true → stderr 打印换根提示 + 记一行日志「数据根切换：旧 -> 新」
  ├─ file.list ───────────→│  在 D:\A 下执行
 ```
 
@@ -5654,6 +5686,16 @@ CLI 仍然**不写任何业务 JSON 的内容**、不删文件、不改名；它
 > 旧口径「初始化只由服务执行、CLI 只读不建业务目录」已作废：
 > 双击时应立刻得到可用的数据根，而不是等一个可能启动失败的服务。
 > 变的是**谁有权调用那套规则**，规则本身没变。
+
+**为什么换根提示在「连接那一刻」报就够（提交 `8f2fbc5`，与 15.1 ① 互相印证）**：
+
+```text
+服务**一次只接受一条连接**（15.1 ①：管道 accept/serve 严格串行，没有每连接一线程）。
+所以交互窗口握着管道时，别的 CLI **连不上**（ERROR_PIPE_BUSY → 重试 → 最终 FMT-601），
+「会话中途被别人把数据根搬走」**不可能发生**——切换只可能发生在某个 CLI 连上来的那一刻。
+因此不需要在每条命令前后都检查根，只需在 hello 回执 switched=true 时当场报出来
+（外加横幅上常驻的「数据根：…」），覆盖就是完整的。18.33 有完整行为与实测。
+```
 
 ### 13.11 单实例与窗口激活
 
@@ -5727,7 +5769,7 @@ if (GetLastError() == ERROR_ALREADY_EXISTS) {
        + hello 声明 root（13.10）
        ├─ 连接失败 → 「无法连接 FMT Service，请先执行 service install」
        │              FMT-601 / 退出码 8
-       └─ 成功 → 继续；响应 switched=true 时记一行日志「数据根切换：旧 -> 新」（只进日志）
+       └─ 成功 → 继续；响应 switched=true 时 stderr 打印换根提示并记一行日志「数据根切换：旧 -> 新」
  7. 打印横幅：
        File Manager Tool  v1.0  ( build  2026.10.08 )
        Service Running...        （未运行时为 Service Stopped...）
@@ -6203,7 +6245,7 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 > `fmt_test.cpp`，`FMT_TEST(suite, 名称)` / `FMT_CHECK_EQ` 宏，**零第三方依赖、可完全离线构建**，
 > 断言失败继续跑下一个用例），并在 `tests/CMakeLists.txt` 里用 `add_test(NAME fmt_tests …)`
 > 接进 CTest——所以「不写自动化测试」这条**只对 Catch2 那种形态成立**：不引外部框架，
-> 但模块行为仍有单元测试兜底。当前 **145 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
+> 但模块行为仍有单元测试兜底。当前 **146 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
 `HttpClient.*` + 提交 `0ad9efc` 新增 2 条 `File.*` + 提交 `5bf2c1f` 新增 2 条 `File.*`
 与 1 条 `Bucket.*` + **提交 `9c3d2cb` 新增 5 条** + **提交 `0fc242b` 新增 4 条** +
 **提交 `a9af276` 新增 2 条** + **提交 `2c841c8` / `5b316b3` 各新增 1 条** +
@@ -6212,7 +6254,7 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 `Trash.随桶删除的文件不能单独回退`、`Trash.永久删除文件级条目`、
 `String.清理粘贴带进来的路径污染`、`File.粘贴路径里的不可见字符会被清掉`、
 `Cli.位置参数的信封形状`、`Storage.两个写者同时写同一个文件不会互相踩`、
-`Cli.版本文本只有一个来源`
+`Cli.版本文本只有一个来源`、`Cli.数据根切换提示要把两个根都说清楚`
 （另有既有用例追加断言或改口径：`File.列表与查询` 的大写 file_id、`File.软删除进回收站`
 改断言 `file.json` 且断言 `trash.json` 保持空、`Service.管道能执行Bucket命令`、
 `Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、
@@ -6312,7 +6354,7 @@ fmt.exe config set --user <名字>                     （写回 config.json）
 服务未运行时 fmt.exe file list       → 「无法连接 FMT Service，请先执行 service install」
                                        + FMT-601 + 退出码 8
 把 fmt.exe 复制到另一个目录再运行      → 声明新根，服务初始化新根并写 INFO 日志；
-                                       旧根数据仍在（不删）；hello 回执 switched=true，CLI 记一行日志「数据根切换：旧 -> 新」（只进日志，不刷控制台）
+                                       旧根数据仍在（不删）；hello 回执 switched=true，CLI **在 stderr 打印换根提示**（提交 `8f2fbc5`）并记一行日志「数据根切换：旧 -> 新」
 同一目录再双击第二次                  → 激活已有窗口，不新建控制台；
                                         日志里只多一行 [Cli] 数据根完整，控制台不变
 service stop 期间发一条 file list     → 要么等完成，要么 FMT-602，不出现半写状态
@@ -6697,7 +6739,7 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 |---|---|
 | 提权路径端到端实测 | `service install/uninstall/start/stop/reinstall` 都需要一次真实的 UAC 确认；**`service status` 不需要**（它不提权，要专门验证非管理员账户下也能成功、且全程不弹 UAC）。要验证：成功路径、**取消 UAC（`ERROR_CANCELLED` 1223 → `FMT-004` / 5）**、等待超时（`WAIT_TIMEOUT` → `FMT-602` / 8）、重复 install（`FMT-600` / 8）、服务不存在（`FMT-601` / 8）、提权期间不出现控制台闪窗、结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 正确生成并在父进程读完后删除、数据根不可写时退回 `%TEMP%` 并写 WARN |
 | 管道连接权限实测 | DACL（`D:(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)`）与 MIC 标签（`S:(ML;;NW;;;ME)`）都要在**非提权 CLI** 上跑通；只测提权 CLI 会掩盖 13.9.2 的两个坑 |
-| 根切换实测 | CLI 换目录运行 → 服务切根、幂等初始化新根、旧根数据不删、`service.json` 的 `current_root` 更新，且 hello 回执 `switched=true` + `previous_root`，CLI 记一行日志「数据根切换：旧 -> 新」（只进日志，不刷控制台） |
+| 根切换实测 | CLI 换目录运行 → 服务切根、幂等初始化新根、旧根数据不删、`service.json` 的 `current_root` 更新，且 hello 回执 `switched=true` + `previous_root`，CLI **在 stderr 打印换根提示**（提交 `8f2fbc5`）并记一行日志「数据根切换：旧 -> 新」；横幅另常驻一行「数据根：…」（11.9） |
 | `service status` 实测 | 三种状态各跑一次：未安装（`服务状态：未安装` / `FMT-601` / 退出码 8）、已安装未运行（`已停止` / 退出码 0）、运行中（`运行中` + 宿主 + 数据根 / 退出码 0）；并确认它在**非管理员账户**下同样成功 |
 | `dwServiceSpecificExitCode` 实测 | 人为让服务初始化失败（例如把 `data/file.json` 改成非法 JSON）→ 确认 `sc query` 能看到 `ERROR_SERVICE_SPECIFIC_ERROR`、CLI 打印「服务启动失败：FMT-006 JSON 格式错误」，并且**不触发重装** |
 | `help bucket` / `help trash` 实测 | `fmt.exe --help` = 横幅 + 用法 + 命令总览 + 退出码表；`fmt.exe help` 只列命令、不加描述；`help service` 列出五条命令并注明 `status` 不需要管理员权限；`help bucket` 写明五条子命令的真实行为（**已同步，提交 `8a5e554`**），`help trash` 写明桶级 `list` / `get` / `restore` / `delete` 四条的真实行为（**已同步，提交 `c2d545d` + `4fee290`**），命令总览里 `(trash) list get restore delete` 全在「可用命令」组、「尚未实现」组只剩 `file` / `share`，`help file/share` 带「服务端尚未实现，现在返回 FMT-602」；`help 未知组` → stderr 一行 + 退出码 2；`help` 全程不提权、不连服务、不写日志。**提交 `188e85d` 之后**：`(file) upload list get delete` 也进了「可用命令」组、「尚未实现」组**只剩 `share` 一行**，`help file` 的正文已同步（11.4），这一项仍需**真机实测**（本节整体是行为记录，不是实测） |
@@ -7983,15 +8025,13 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 | HTTP（`enabled` 手动打开后） | `GET /api/ping`、`/api/status`（含 `channel` / `pid` / `root` / `version`）、`/api/bucket`、`/api/file` ✓；`POST /api/file`（`{"path":…}`）✓、缺 `path` → 400 ✓；`POST /api/bucket`（含小写规范化 + `note`）✓、重名 → 409 ✓；`DELETE /api/file?dry_run=1` ✓、跨桶无 `force` → 400 + `FMT-016` ✓、带 `force=1` → 200 ✓；`GET /api/trash` ✓；`POST /api/trash/<名>/restore` ✓ |
 | 行为确认 | ① 删除**当前** Bucket 后 `current_bucket` 被置空，之后 `file list` 报 `FMT-305 未设置当前 Bucket`（退出码 3）；`trash restore` 把桶恢复回来**不会**自动设回当前桶，需要 `bucket use`（设计如此，见 10.1、开发文档第 30/61 节）。② `FMT-301 DownloadFailed` 的退出码是 **1**（附录 A 与实现一致） |
 
-> **实测风险（顺带记下，2026-10-09，**不改口径**）**：做 `version` 测试时在**构建目录**里
+> **实测风险 → 已被提交 `8f2fbc5` 处理（2026-10-09）**：做 `version` 测试时在**构建目录**里
 > 跑了交互模式，CLI 按设计把**自己所在目录**声明为数据根，于是服务的数据根被切到了构建目录
 > （日志：`[Main] 数据根切换: D:/Data/CLionProjects/FMT/cmake-build-debug/bin
 > -> D:/Data/Temp/JMT/fmt`；随后又用部署目录的 exe 发了一条命令切回来）。
-> 这正是「**数据根由 CLI 声明**」的既定行为（13.10），文档也写了「切换**只进日志、
-> 不刷控制台**」（11.12 / 4.4.2）——**这句在文档里是清楚的**。
-> 但代价很具体：**任何位置的 `fmt.exe` 一连上就会把服务的数据根搬走，而用户在控制台上
-> 看不到任何提示**。是否在控制台加一句提示**尚未决策**，本轮只记事实、不动口径
-> （开发文档第 125 节同注）。
+> 当时这件事**只进日志、控制台上看不见**，用户随后选了这一项并实现——**现在两者都上控制台**：
+> 切换那一刻 stderr 打印 `root_switch_notice()`，交互窗口横幅永远显示「数据根：…」
+> （11.9、13.10、18.33）。**原口径「只进日志、不刷控制台」已作废。**
 
 ---
 
@@ -8031,6 +8071,56 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 
 ---
 
+### 18.33 数据根被搬走时要说出来（commit `8f2fbc5` + `bb7a40f`）
+
+**2026-10-09**，用户从上一批实测里选了这一项：「数据根被别的 `fmt.exe` 抢走时控制台上看不见」。
+`8f2fbc5`「feat(cli): say out loud when the service data root moves」实现，
+`bb7a40f`「test(cli): give the root notice a home and a test」把文本抽出来并加测试。
+**146 个用例全绿**（145 + 新增 1 条）。
+
+```text
+背景    「数据根由 CLI 声明」意味着**任何位置的 fmt.exe 一连上就会把服务的数据根搬到自己
+        目录下**——桶、文件、回收站整体换成另一个目录的内容；而这件事原来**只写一行日志**。
+
+① 切换发生时（hello 回执 switched=true）
+   位置      src/cli/cli.cpp 的 ensure_connected()，拿到 session.root_switched 之后
+   输出      **stderr**（不是 stdout）打印 root_switch_notice(previous, current)：
+               注意：服务的数据根已切换
+                 原来：D:/Data/Temp/JMT/fmt
+                 现在：D:/Data/CLionProjects/FMT/cmake-build-debug/bin
+               原因是「数据根由 CLI 声明」：谁连上服务，服务就用谁的目录。
+               如果这不是你想要的，请用数据根正确的那个 fmt.exe 再执行一条命令切回去。
+             正斜杠（to_forward_slashes），不带反斜杠转义；同时照旧记一行日志
+② 交互窗口横幅区永远多一行数据根（run_interactive，数据来自 service::load_state()）
+             File Manager Tool  v1.0  ( build  2026.10.09 )
+             Service Running...
+             数据根：D:/Data/Temp/JMT/fmt
+   不一致时   与本程序所在目录（iequals 比较）不同 → 紧跟一行
+             「注意：本程序所在目录是 …，连上之后服务会切到本目录（数据根由 CLI 声明）。」
+   **触发条件（如实说明）**：双击引导会**先连上服务并声明本目录**，所以服务在跑时
+             两边通常已经一致；这一行主要在**服务不可用**（引导未能连上）时出现，
+             用来说明「服务记录的数据根与你所在目录不同」。服务记的根为空时不打「数据根：」那一行。
+③ 为什么「连接那一刻报警」就够（**设计论据**）
+   服务**一次只接受一条连接**（15.1 ① 严格串行）：交互窗口握着管道时别的 CLI 连不上
+   （ERROR_PIPE_BUSY → 重试 → FMT-601）。所以**「会话中途被别人把数据根搬走」不可能发生**，
+   切换只可能发生在某个 CLI **连上来的那一刻**——在那一刻报警即可完全覆盖（13.10 末尾同注）。
+
+④ 文本为什么要收进 root_switch_notice()（bb7a40f）
+   原来这段文本内联在连接路径里，**没法断言**；抽成 cli.hpp 里的
+   std::string root_switch_notice(const std::string& previous, const std::string& current)
+   之后就能测了——**这是控制台输出第一次有测试覆盖**。别把文本再写回连接路径里。
+   用例 Cli.数据根切换提示要把两个根都说清楚：断言旧根、新根、「数据根」、「切回去」都在；
+   并检查旧根为空（服务首次启动）时也包含新根。
+
+⑤ 实测（2026-10-09，对已安装服务）
+   从构建目录执行 bucket list → stderr 出现
+     「注意：服务的数据根已切换 / 原来：D:/Data/Temp/JMT/fmt / 现在：…/cmake-build-debug/bin」
+   再用部署目录的 exe 执行    → stderr 出现反向的那一条（…/bin -> D:/Data/Temp/JMT/fmt）
+   交互窗口横幅              → 多出「数据根：D:/Data/Temp/JMT/fmt」
+```
+
+---
+
 ## 19. 待决事项
 
 ### 19.1 本次重构引入的待决事项
@@ -8039,7 +8129,7 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 |---|---|
 | `init` 操作是否需要显式命令 | 当前设计是「CLI 双击时先自己跑一次 `check_root`（11.13），连上后再声明 root，服务用同一套规则幂等初始化」（13.10），没有独立的 `init` 命令。是否需要一条显式的「初始化这个数据根」命令待定；不加也不影响主链路 |
 | 数据根由 CLI 声明 vs 架构文档 | 已对齐：`FMT 项目架构.md` 与本文档都写 **CLI 声明、服务持有**，并明确 CLI 双击时对自身数据根做同一套幂等体检与补齐（第 3.1 / 3.2 节 ↔ 4.4 / 11.13）。后续若再出现「`FMT_ROOT` = `fmt.exe` 所在目录」的旧表述，以冻结决策为准 |
-| 两个不同的数据根 | CLI 所在目录（声明值）与服务宿主 exe 所在目录（无 CLI 连接时的回退值）可能不同。是否需要一条「服务启动后马上规范化为记录值」的规则，避免「服务自启 → 用宿主目录 → 第一个 CLI 连上 → 又切一次」的抖动，待定。注意这种切换现在会**显式可见**：hello 回执 `switched=true` 且 CLI 记一行日志「数据根切换：旧 -> 新」（只进日志，不刷控制台） |
+| 两个不同的数据根 | CLI 所在目录（声明值）与服务宿主 exe 所在目录（无 CLI 连接时的回退值）可能不同。是否需要一条「服务启动后马上规范化为记录值」的规则，避免「服务自启 → 用宿主目录 → 第一个 CLI 连上 → 又切一次」的抖动，待定。注意这种切换现在会**显式可见**：hello 回执 `switched=true` 且 CLI **在 stderr 打印换根提示**（提交 `8f2fbc5`）并记一行日志「数据根切换：旧 -> 新」；横幅另常驻一行「数据根：…」（11.9） |
 | 多 CLI 窗口 | 单实例（11.11）保证同时只有一个数据根，因此根切换不需要按连接隔离。若将来放开多窗口，需要重新设计「一个当前根」的语义 |
 | `service.json` 的字段集 | 现定 `version` / `current_root` / `binary_path` / `installed_at`。是否需要记录「上次正常停止时间」等诊断字段待定 |
 | `--elevated` 的参数形状 | **已定稿**：`fmt.exe --elevated <operation> --result "<结果文件绝对路径>"`，`operation ∈ install / uninstall / start / stop / reinstall`（13.8.2），**`status` 不在其中**（它不提权，见 13.4.1）。是否再为某个 op 携带附加参数（如 install 时指定 root）仍待定 |
@@ -8087,7 +8177,8 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 提交 `5b316b3` 新增 `Storage.两个写者同时写同一个文件不会互相踩` 并把
 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」（144），见 18.29；
 提交 `8f0fd5c` 只补断言（144 不变），见 18.30；提交 `4ddb515` 只改实现与既有用例
-（144 不变），见 18.31；提交 `d108c80` 新增 `Cli.版本文本只有一个来源`（**145**），见 18.32）。
+（144 不变），见 18.31；提交 `d108c80` 新增 `Cli.版本文本只有一个来源`（145），见 18.32；
+提交 `bb7a40f` 新增 `Cli.数据根切换提示要把两个根都说清楚`（**146**），见 18.33）。
 **仍然没有的**是「上传 →
 列表 → 下载 → 分享」这条**跨模块链路**的自动化：它依旧靠端到端实测，若后续要补自动化，优先补这一段，而不是再堆各模块的孤立用例（提交 `188e85d` 补上了管道与 HTTP 两条
 「上传 → 列表 → 查询 → 软删除」的端到端用例，但**没有**覆盖下载与分享） |
