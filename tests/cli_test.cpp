@@ -67,6 +67,22 @@ FMT_TEST(Cli, 数据根切换提示要把两个根都说清楚) {
     FMT_CHECK(first.find("D:/new") != std::string::npos);
 }
 
+FMT_TEST(Cli, service子命令集合) {
+    // 这个集合决定「敲了什么会被当成什么」：在里面 → 走提权执行那条路；
+    // 不在里面 → 交互窗口报用法错误、一次性命令退回 FMT-001。
+    FMT_CHECK(fmt::cli::is_user_service_command("install"));
+    FMT_CHECK(fmt::cli::is_user_service_command("uninstall"));
+    FMT_CHECK(fmt::cli::is_user_service_command("start"));
+    FMT_CHECK(fmt::cli::is_user_service_command("stop"));
+    // reinstall：一次 UAC 换宿主 exe（卸载 + 按当前 exe 重装并启动）
+    FMT_CHECK(fmt::cli::is_user_service_command("reinstall"));
+    // status 不提权，所以不在这个集合里（它走 show_service_status()）
+    FMT_CHECK(!fmt::cli::is_user_service_command("status"));
+    FMT_CHECK(!fmt::cli::is_user_service_command(""));
+    FMT_CHECK(!fmt::cli::is_user_service_command("Install"));  // 大小写敏感
+    FMT_CHECK(!fmt::cli::is_user_service_command("nonsense"));
+}
+
 FMT_TEST(Cli, 命令切分) {
     const std::vector<std::string> simple = fmt::cli::split_command("service stop");
     FMT_CHECK_EQ(simple.size(), std::size_t{2});

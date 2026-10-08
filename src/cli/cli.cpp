@@ -107,7 +107,7 @@ void print_version() { std::printf("%s\n", version_text().c_str()); }
 // 命令总览：只列命令、不加描述；细节用 help <命令>。
 void print_command_list() {
     std::printf("可用命令：\n");
-    std::printf("  (service)  install  uninstall  start  stop  status\n");
+    std::printf("  (service)  install  uninstall  start  stop  reinstall  status\n");
     std::printf("  (bucket)   create  list  get  use  delete\n");
     std::printf("  (file)     upload  list  get  delete\n");
     std::printf("  (trash)    list  get  restore  delete\n");
@@ -128,6 +128,14 @@ bool print_command_help(const std::string& topic) {
             "             不删除 repository / trash / config / data / log / temp\n"
             "  start      启动服务；需要管理员权限\n"
             "  stop       停止服务；需要管理员权限\n"
+            "  reinstall  一次 UAC 里做完「卸载 → 按**当前这个 exe** 重新安装并启动」；\n"
+            "             需要管理员权限。两个用途：\n"
+            "               ① 用新 exe 更新服务——直接运行**新 exe** 的这条命令即可，\n"
+            "                  它会先停掉旧宿主（解开文件占用）、再指向自己并启动；\n"
+            "               ② 修复宿主 exe 被移动或删除。\n"
+            "             **业务数据一个都不动**（repository / trash / config / data / log）。\n"
+            "             注意：宿主会变成「你运行的那一份 exe」；数据根仍由连上来的\n"
+            "             CLI 声明（见窗口横幅上的「数据根：…」）。\n"
             "  status     查询服务状态；不需要管理员权限\n"
             "\n"
             "说明：启动类型为自动启动，运行账户为 LocalSystem；异常退出由 Windows\n"
@@ -317,12 +325,7 @@ bool activate_existing_window() {
     return context.activated;
 }
 
-// 用户可以直接键入的 service 命令；reinstall 是引导流程内部使用的，
-// 不在命令集里（文档冻结的是四条命令）。
-bool is_user_service_command(const std::string& operation) {
-    return operation == "install" || operation == "uninstall" || operation == "start" ||
-           operation == "stop";
-}
+// ---- service 命令：除 status 外每条都提权（is_user_service_command 定义在文件末尾）----
 
 // ---- service 四条命令：每条都提权 ----
 int run_service_command(const std::string& operation, const Options& options) {
@@ -930,7 +933,7 @@ int run_interactive(const Options& options, service::State state, Session& sessi
                 continue;
             }
             if (parts.size() < 2 || !is_user_service_command(parts[1])) {
-                std::fprintf(stderr, "用法：service install | uninstall | start | stop | status\n");
+                std::fprintf(stderr, "用法：service install | uninstall | start | stop | reinstall | status\n");
                 continue;
             }
             run_service_command(parts[1], options);
@@ -1096,7 +1099,7 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
                 return show_service_status();  // 查询不需要提权
             }
             if (args.size() < 2 || !is_user_service_command(args[1])) {
-                std::fprintf(stderr, "用法：service install | uninstall | start | stop | status\n");
+                std::fprintf(stderr, "用法：service install | uninstall | start | stop | reinstall | status\n");
                 return exit_code(ErrorCode::InvalidArgument);
             }
             return run_service_command(args[1], options);
@@ -1201,6 +1204,14 @@ std::string root_switch_notice(const std::string& previous, const std::string& c
     text += "原因是「数据根由 CLI 声明」：谁连上服务，服务就用谁的目录。\n";
     text += "如果这不是你想要的，请用数据根正确的那个 fmt.exe 再执行一条命令切回去。\n\n";
     return text;
+}
+
+// 用户可以直接键入的 service 子命令 —— **每条都要提权**（`status` 不在其中）。
+// reinstall 原来只是双击引导的内部用法，现在也是正式命令：它是「换服务宿主 exe」
+// 唯一一条**一次 UAC** 的路径（卸载 + 按当前这个 exe 重装并启动）。
+bool is_user_service_command(const std::string& operation) {
+    return operation == "install" || operation == "uninstall" || operation == "start" ||
+           operation == "stop" || operation == "reinstall";
 }
 
 }  // namespace fmt::cli

@@ -75,6 +75,11 @@ int run_elevated(const std::vector<std::string>& args);
 // 当前进程是否已经提权（TokenElevation）。
 bool is_elevated();
 
+// 用户可以直接键入的 service 子命令 —— **每条都要提权**。
+// `status` 不在其中（查询不提权），`reinstall` 在（提交后从引导内部用法改成正式命令）。
+// 暴露出来是为了能把它钉住：这个集合决定「敲了什么会被当成什么」。
+bool is_user_service_command(const std::string& operation);
+
 // 把一行命令切成参数；支持双引号包裹带空格的参数。
 std::vector<std::string> split_command(const std::string& line);
 
