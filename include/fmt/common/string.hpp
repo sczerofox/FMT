@@ -27,6 +27,19 @@ std::string to_lower(std::string_view text);
 // 去掉首尾的空白（空格、制表符、回车、换行）。
 std::string trim(std::string_view text);
 
+// Windows 上粘贴路径常带两类**看不见**的污染，屏幕上却完全正常：
+//   * Explorer 的「复制路径」会给路径套一对引号：`"C:\a\b.jpg"`
+//   * 从聊天窗口、网页、终端复制会夹进 Unicode 格式字符（Cf）：
+//     U+202A 左右方向嵌入、U+200E/200F 方向标记、U+FEFF 零宽不换行空格、
+//     U+00A0 不换行空格……它们按字面拼进路径，exists() 就找不到文件
+//
+// clean_user_path(): 去掉上述污染（引号**成对**才去，避免改掉名字里真的带引号的情况）。
+std::string clean_user_path(std::string_view text);
+
+// 文本里出现的不可见字符，按出现顺序去重，形如 {"U+202A", "U+202C"}。
+// 报错时点出码位，用户才知道「路径明明是对的」到底哪里不对。
+std::vector<std::string> invisible_characters(std::string_view text);
+
 // 按分隔符切分；保留空字段（调用方自己决定要不要丢弃）。
 std::vector<std::string> split(std::string_view text, char delimiter);
 

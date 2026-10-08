@@ -6,6 +6,33 @@
 
 #include "fmt_test.hpp"
 
+FMT_TEST(String, 清理粘贴带进来的路径污染) {
+    // U+202A ... U+202C：从聊天窗口、网页、终端复制路径时夹进来的方向格式字符。
+    // 屏幕上完全看不出来，拼进路径就让 exists() 说「文件不存在」。
+    const std::string wrapped = std::string("\xE2\x80\xAA") + "C:\\a\\b.jpg" + "\xE2\x80\xAC";
+    FMT_CHECK_EQ(fmt::clean_user_path(wrapped), std::string("C:\\a\\b.jpg"));
+
+    // Explorer 的「复制路径」套的引号：**成对**才去掉
+    FMT_CHECK_EQ(fmt::clean_user_path("\"C:\\a\\b.jpg\""), std::string("C:\\a\\b.jpg"));
+    FMT_CHECK_EQ(fmt::clean_user_path("\"C:\\a\\b.jpg"), std::string("\"C:\\a\\b.jpg"));
+    FMT_CHECK_EQ(fmt::clean_user_path("  C:\\a\\b.jpg\r\n"), std::string("C:\\a\\b.jpg"));
+
+    // 不换行空格 U+00A0（网页复制常见）
+    FMT_CHECK_EQ(fmt::clean_user_path(std::string("C:\\a\xC2\xA0\\b.jpg")),
+                 std::string("C:\\a\\b.jpg"));
+
+    // 中文路径不受影响（合法多字节序列原样保留）
+    const std::string chinese = "C:\\图片\\头像\\asdva.jpg";
+    FMT_CHECK_EQ(fmt::clean_user_path(chinese), chinese);
+
+    // 诊断：点出码位并去重
+    const std::vector<std::string> hidden = fmt::invisible_characters(wrapped);
+    FMT_CHECK_EQ(hidden.size(), std::size_t{2});
+    FMT_CHECK_EQ(hidden[0], std::string("U+202A"));
+    FMT_CHECK_EQ(hidden[1], std::string("U+202C"));
+    FMT_CHECK_EQ(fmt::invisible_characters("C:\\a\\b.jpg").size(), std::size_t{0});
+}
+
 FMT_TEST(String, UTF8与UTF16互转) {
     const std::string chinese = "小谷姐姐麻辣烫.jpg";
     const std::string restored = fmt::to_utf8(fmt::to_wide(chinese));

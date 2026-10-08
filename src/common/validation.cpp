@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+#include "fmt/common/string.hpp"
+
 namespace fmt {
 namespace {
 
@@ -123,6 +125,15 @@ Status validate_bucket_name(std::string_view name) {
         return make_error(ErrorCode::BucketNameInvalid,
                           "Bucket 名称不能包含 < > : \" | ? * 这些字符");
     }
+    // 同文件名：不可见字符不进名字（屏幕上看不出来，却会让按名查找对不上）
+    if (const std::vector<std::string> hidden = invisible_characters(name); !hidden.empty()) {
+        std::string list;
+        for (const std::string& item : hidden) {
+            list += (list.empty() ? "" : "、") + item;
+        }
+        return make_error(ErrorCode::BucketNameInvalid,
+                          "Bucket 名称里有不可见字符（" + list + "），请把名字重敲一遍");
+    }
     if (is_windows_reserved_name(name)) {
         return make_error(ErrorCode::BucketNameInvalid,
                           "Bucket 名称不能是 Windows 保留设备名：" + std::string(name));
@@ -147,6 +158,16 @@ Status validate_file_name(std::string_view name) {
     if (has_control(name) || has_invalid_char(name)) {
         return make_error(ErrorCode::FileNameInvalidChar,
                           "文件名不能包含 Windows 非法字符");
+    }
+    // 不可见字符（U+202A 左右方向嵌入等）绝不能进名字：屏幕上看不出来，
+    // 却会让按名字查找、排序、日志对不上，复制粘贴还会一路带着。
+    if (const std::vector<std::string> hidden = invisible_characters(name); !hidden.empty()) {
+        std::string list;
+        for (const std::string& item : hidden) {
+            list += (list.empty() ? "" : "、") + item;
+        }
+        return make_error(ErrorCode::FileNameInvalidChar,
+                          "文件名里有不可见字符（" + list + "），请把名字重敲一遍");
     }
     if (is_windows_reserved_name(name)) {
         return make_error(ErrorCode::FileNameReserved,

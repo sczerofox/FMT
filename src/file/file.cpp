@@ -248,9 +248,15 @@ std::string extension_of(const std::string& file_name) {
 // 上传第一阶段（锁外）
 // ---------------------------------------------------------------------------
 
-Result<PreparedUpload> prepare_upload(const PathManager& paths, const std::string& source,
-                                      const std::string& name, std::uintmax_t size_limit,
+Result<PreparedUpload> prepare_upload(const PathManager& paths, const std::string& raw_source,
+                                      const std::string& raw_name, std::uintmax_t size_limit,
                                       Logger* logger) {
+    // 先把粘贴污染清掉：Explorer 的「复制路径」会给路径套引号，从聊天窗口/网页
+    // 复制会夹进 U+202A 这类**看不见**的格式字符。不清掉的话 exists() 直接说
+    // 「文件不存在」，而用户在屏幕上看到路径完全正常——最难排查的一类问题。
+    const std::string source = clean_user_path(raw_source);
+    const std::string name = clean_user_path(raw_name);
+
     if (source.empty()) {
         return make_error(ErrorCode::UrlInvalid, "缺少上传来源（http:// URL 或本地路径）");
     }
@@ -271,6 +277,22 @@ Result<PreparedUpload> prepare_upload(const PathManager& paths, const std::strin
                           "只支持 http:// 与 https:// 的来源：" + source);
     }
     if (!remote && !file_exists(path_from_utf8(source))) {
+        // 清掉之后仍找不到：把原始输入里的不可见字符**点名**，
+        // 否则用户看到的就是「路径明明是对的，你却说不存在」。
+        const std::vector<std::string> hidden = invisible_characters(raw_source);
+        if (!hidden.empty()) {
+            std::string list;
+            for (const std::string& item : hidden) {
+                list += (list.empty() ? "" : "、") + item;
+            }
+            return make_error(ErrorCode::FileNotFound,
+                              "本地文件不存在：" + source + "（你粘贴的路径里有不可见字符 " + list +
+                                  "，它会让路径对不上；已自动清掉，请检查路径是否还有别的问题）");
+        }
+        if (source != raw_source) {
+            return make_error(ErrorCode::FileNotFound,
+                              "本地文件不存在：" + source + "（已去掉粘贴带进来的引号或空白）");
+        }
         return make_error(ErrorCode::FileNotFound, "本地文件不存在：" + source);
     }
     if (const Status status = ensure_directory(paths.temp()); !ok(status)) {

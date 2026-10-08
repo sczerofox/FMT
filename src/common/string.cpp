@@ -90,6 +90,101 @@ std::string trim(std::string_view text) {
     return std::string(text.substr(begin, end - begin + 1));
 }
 
+namespace {
+
+// 粘贴路径会带进来的不可见字符。它们都在 BMP 内、是单个码位，
+// 所以先转 UTF-16 再按码位过滤最省事（代理对不在这个集合里，会原样保留）。
+bool is_invisible_codepoint(wchar_t code) {
+    switch (code) {
+        case 0x00A0:  // 不换行空格（网页复制常见）
+        case 0x00AD:  // 软连字符
+        case 0x200B:  // 零宽空格
+        case 0x200C:  // 零宽非连字
+        case 0x200D:  // 零宽连字
+        case 0x200E:  // 从左到右标记
+        case 0x200F:  // 从右到左标记
+        case 0x202A:  // 从左到右嵌入  ← 用户这次遇到的
+        case 0x202B:  // 从右到左嵌入
+        case 0x202C:  // 方向格式弹出  ← 与 202A 成对出现
+        case 0x202D:  // 从左到右覆盖
+        case 0x202E:  // 从右到左覆盖
+        case 0x2060:  // 词连接符
+        case 0x2061:
+        case 0x2062:
+        case 0x2063:
+        case 0x2064:
+        case 0x2066:  // 方向隔离
+        case 0x2067:
+        case 0x2068:
+        case 0x2069:
+        case 0xFEFF:  // BOM / 零宽不换行空格
+            return true;
+        default:
+            return false;
+    }
+}
+
+std::string codepoint_name(wchar_t code) {
+    char buffer[16] = {};
+    std::snprintf(buffer, sizeof(buffer), "U+%04X", static_cast<unsigned>(code));
+    return std::string(buffer);
+}
+
+}  // namespace
+
+std::string clean_user_path(std::string_view text) {
+    std::string cleaned;
+    const std::wstring wide = to_wide(text);
+    if (wide.empty() && !text.empty()) {
+        // 不是合法 UTF-8：不做码位过滤，只做首尾清理，别把内容弄丢
+        cleaned = trim(text);
+    } else {
+        std::wstring kept;
+        kept.reserve(wide.size());
+        for (const wchar_t code : wide) {
+            if (!is_invisible_codepoint(code)) {
+                kept.push_back(code);
+            }
+        }
+        cleaned = trim(to_utf8(kept));
+    }
+
+    // **成对**引号才去掉：既覆盖 Explorer 的「复制路径」，又不动名字里真的带引号的情况
+    const auto strip_pair = [&cleaned](std::string_view open, std::string_view close) {
+        if (cleaned.size() < open.size() + close.size()) {
+            return false;
+        }
+        if (cleaned.compare(0, open.size(), open) != 0) {
+            return false;
+        }
+        if (cleaned.compare(cleaned.size() - close.size(), close.size(), close) != 0) {
+            return false;
+        }
+        cleaned = std::string(std::string_view(cleaned).substr(
+            open.size(), cleaned.size() - open.size() - close.size()));
+        return true;
+    };
+    if (strip_pair("\"", "\"") || strip_pair("'", "'") ||
+        strip_pair("\xE2\x80\x9C", "\xE2\x80\x9D")) {
+        cleaned = trim(cleaned);
+    }
+    return cleaned;
+}
+
+std::vector<std::string> invisible_characters(std::string_view text) {
+    std::vector<std::string> found;
+    for (const wchar_t code : to_wide(text)) {
+        if (!is_invisible_codepoint(code)) {
+            continue;
+        }
+        const std::string name = codepoint_name(code);
+        if (std::find(found.begin(), found.end(), name) == found.end()) {
+            found.push_back(name);
+        }
+    }
+    return found;
+}
+
 std::vector<std::string> split(std::string_view text, char delimiter) {
     std::vector<std::string> parts;
     std::size_t begin = 0;

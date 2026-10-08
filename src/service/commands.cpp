@@ -23,7 +23,9 @@ Result<std::string> argument(const nlohmann::json& args, std::size_t index, cons
     if (!value.is_string()) {
         return make_error(ErrorCode::InvalidArgument, std::string(what) + "必须是字符串");
     }
-    return value.get<std::string>();
+    // 位置参数先清掉粘贴污染：Explorer 的「复制路径」套的引号、聊天窗口/网页带进来的
+    // U+202A 这类不可见字符。它们会让「路径/名字明明是对的」却查不到——在这里一处收口。
+    return clean_user_path(value.get<std::string>());
 }
 
 Result<nlohmann::json> bucket_command(AppContext& context, const std::string& operation,

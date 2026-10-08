@@ -13,6 +13,7 @@
 #include "fmt/bucket/bucket.hpp"
 #include "fmt/common/hash.hpp"
 #include "fmt/common/string.hpp"
+#include "fmt/common/validation.hpp"
 #include "fmt/core/app.hpp"
 #include "fmt/trash/trash.hpp"
 #include "fmt/core/path.hpp"
@@ -744,6 +745,56 @@ FMT_TEST(Trash, 永久删除文件级条目) {
     const auto gone = files.get_by_id(record.file_id);
     FMT_CHECK(!fmt::ok(gone));
     FMT_CHECK(fmt::error_of(gone)->code == fmt::ErrorCode::FileNotFound);
+}
+
+FMT_TEST(File, 粘贴路径里的不可见字符会被清掉) {
+    Fixture f;
+
+    // 复刻用户实际遇到的样子：中文目录里的一个文件，路径前后被夹了方向格式字符
+    // （U+202A 从左到右嵌入 / U+202C 弹出）。从聊天窗口、网页、终端复制路径时常见，
+    // 屏幕上完全看不出来，但拼进路径就让 exists() 说「文件不存在」。
+    const std::filesystem::path chinese_dir = f.temp.path() / fmt::path_from_utf8("头像");
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(chinese_dir)));
+    const std::filesystem::path picture = chinese_dir / fmt::path_from_utf8("asdva.jpg");
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(picture, "pretend jpeg")));
+
+    const std::string wrapped =
+        std::string("\xE2\x80\xAA") + fmt::path_to_utf8(picture) + "\xE2\x80\xAC";
+    const auto prepared = fmt::prepare_upload(*f.paths, wrapped, "", 1024 * 1024, nullptr);
+    FMT_CHECK(fmt::ok(prepared));
+    if (fmt::ok(prepared)) {
+        FMT_CHECK_EQ(std::get<fmt::PreparedUpload>(prepared).file_name, std::string("asdva.jpg"));
+        std::error_code code;
+        std::filesystem::remove(std::get<fmt::PreparedUpload>(prepared).temp_path, code);
+    }
+
+    // Explorer 的「复制路径」会给路径套一对引号
+    const std::string quoted = "\"" + fmt::path_to_utf8(picture) + "\"";
+    const auto prepared_quoted = fmt::prepare_upload(*f.paths, quoted, "", 1024 * 1024, nullptr);
+    FMT_CHECK(fmt::ok(prepared_quoted));
+    if (fmt::ok(prepared_quoted)) {
+        std::error_code code;
+        std::filesystem::remove(std::get<fmt::PreparedUpload>(prepared_quoted).temp_path, code);
+    }
+
+    // 清掉之后仍然找不到：报错必须**点名**不可见字符，
+    // 否则用户看到的就是「路径明明是对的，你却说不存在」。
+    const std::string wrong =
+        std::string("\xE2\x80\xAA") +
+        fmt::path_to_utf8(f.temp.path() / fmt::path_from_utf8("没有这个文件.jpg")) +
+        "\xE2\x80\xAC";
+    const auto missing = fmt::prepare_upload(*f.paths, wrong, "", 1024 * 1024, nullptr);
+    FMT_CHECK(!fmt::ok(missing));
+    if (!fmt::ok(missing)) {
+        FMT_CHECK(fmt::error_of(missing)->code == fmt::ErrorCode::FileNotFound);
+        FMT_CHECK(fmt::error_of(missing)->message.find("U+202A") != std::string::npos);
+        FMT_CHECK(fmt::error_of(missing)->message.find("U+202C") != std::string::npos);
+    }
+
+    // 不可见字符也不允许进文件名
+    const std::string bad_name = std::string("a\xE2\x80\xAA") + "b.txt";
+    FMT_CHECK(!fmt::ok(fmt::validate_file_name(bad_name)));
+    FMT_CHECK_EQ(fmt::invisible_characters(bad_name).size(), std::size_t{1});
 }
 
 FMT_TEST(File, 从HTTP下载入库) {
