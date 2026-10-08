@@ -4034,7 +4034,7 @@ CLI 启动 / 退出
    而**结果只进日志**（等日志器开好后写 log/fmt.log，模块 Cli），控制台一行都不打。
    除此之外 CLI 不改任何业务数据：不写 data/*.json 的内容、不删文件、不改名。
    旧口径里「CLI 只允许创建 log/ 与 temp/ 这两个目录」的说法已被这一步覆盖。
-2. --help / --version / help / exit 不写日志、不创建任何目录（它们不该在磁盘上留下东西）。
+2. --help / --version / -v / version / help / exit 不写日志、不创建任何目录（它们不该在磁盘上留下东西；`version` 命令是提交 `d108c80` 新增的）。
 3. 两个进程的数据根可能不同（服务可能被别人启动在另一个目录）：各写各自数据根下的
    log/fmt.log；这种情况下 CLI 会额外写一行 WARN，指明服务当前数据根与服务侧日志的位置。
 4. 控制台只留交互与异常：横幅、提示符、命令结果、以及 stderr 上的异常；
@@ -4151,7 +4151,7 @@ fmt.exe help <组>          该组详情
 help / help <组>           交互循环内同上（--help 在交互里是 help 的别名）
 ```
 
-`help`（不带参数）只列命令、不加描述：
+`help`（不带参数）只列命令、不加描述（**提交 `d108c80` 起多了 `(version)` 一行**）：
 
 ```text
 可用命令：
@@ -4160,11 +4160,40 @@ help / help <组>           交互循环内同上（--help 在交互里是 help 
   (file)     upload  list  get  delete
   (trash)    list  get  restore  delete
   (help)     help [命令]
+  (version)  version                打印版本与构建日期
   (exit)     exit  quit
 
 业务命令（服务端尚未实现，现在会返回 FMT-602）：
   (share)    create  get  list  delete
 ```
+
+**`help version` 的正文（提交 `d108c80`，照源码抄）**：
+
+```text
+version —— 打印程序名、版本与构建日期
+  与启动横幅、`--version` 共用同一份文本，不会各说一套。
+  不需要服务在运行，也不写任何磁盘内容：
+    fmt.exe version          一次性执行
+    fmt> version             窗口里执行
+```
+
+> **`version` 命令（提交 `d108c80`）**：窗口里原来敲 `version` 会说「未知命令」
+> （只有 `--version` 旗标实现了）。现在两者**共用同一份文本** `fmt::cli::version_text()`
+> ——也就是横幅用的那份 `banner_text()`，**三处不可能各说一套**：
+>
+> ```text
+> fmt.exe version            一次性执行
+> fmt.exe --version / -v     一次性执行（原有）
+> fmt> version               窗口里执行（也接受 --version / -v）
+> 输出都是一行：File Manager Tool  v1.0  ( build  2026.10.09 )
+>              版本取 version::MAJOR.MINOR，构建日期由 CMake 配置时生成
+> ```
+>
+> **两个性质**：① **不需要服务在运行**（不连管道、不查服务状态、不弹 UAC）；
+> ② **不写任何磁盘内容**——一次性分支放在「开日志器」之前，所以 `log/fmt.log` 里
+> 不会因为敲 `version` 多出记录（与 `--help` / `--version` 同一条口径：**从这里开始
+> 都是真的干活，才值得写日志**）。
+> `help <组>` 支持的组也跟着多了 `version`（第 68 节的支持列表）。
 
 **这是提交 `188e85d` 之后的逐字输出**（`src/cli/cli.cpp` 的 `print_command_list()`）：
 `(file) upload list get delete` 已经移进「可用命令」组，顺序就是源码里的顺序
@@ -4183,7 +4212,7 @@ help / help <组>           交互循环内同上（--help 在交互里是 help 
 > 所以拿到的是 `FMT-602`（「操作尚未实现：share.create」）而不是「未知操作」的 `FMT-001`。
 
 `help <组>` 支持 `service` / `bucket` / `file` / `share` / `trash` / `help` / `exit`
-（`quit` 等同 `exit`）。`help service`：
+（`quit` 等同 `exit`；**提交 `d108c80` 起多了 `version`**）。`help service`：
 
 ```text
 service —— Windows 服务管理
@@ -6571,6 +6600,7 @@ HTTP 作用于**当前数据根**，默认只监听 `127.0.0.1:4122`；CLI 不�
 | **粘贴路径里的不可见字符会被清掉**（提交 `a9af276`，**复刻用户报的场景**） | `File.粘贴路径里的不可见字符会被清掉`：中文目录 `头像/` 下的文件 + `U+202A` / `U+202C` 包裹路径 → 上传预检成功；Explorer 引号包裹 → 成功；仍然找不到时消息里出现 `U+202A` 与 `U+202C`；名字里的不可见字符被 `validate_file_name()` 拒绝（`FMT-101`）。**配套用例**：`tests/string_test.cpp` 的 `String.清理粘贴带进来的路径污染`（`U+202A`/`U+202C`、成对与不成对引号、首尾空白、`U+00A0`、中文路径不受影响、`invisible_characters()` 的去重与码位名），见第 33.1.1、25 节 | ✅ |
 | **位置参数的信封形状**（提交 `2c841c8`，**复刻 CLI 崩溃**） | `Cli.位置参数的信封形状`（`tests/cli_test.cpp`）：旧写法（在位置参数**数组**上用字符串下标挂 `dry_run`）必须抛 `type_error.305`；`argument_envelope()` 产出的必须是**带 `argv` 且开关同级**的对象（第 127.7 节）。**这条钉的是机制本身**——测试不再自己拼形状，避免「测试全绿、CLI 一敲就崩」 | ✅ |
 | **两个写者同时原子写同一个文件**（提交 `5b316b3`） | `Storage.两个写者同时写同一个文件不会互相踩`：8 线程 × 40 轮写同一个文件，断言零失败、内容必须是某一次**完整**写入、且**不留 `.tmp`**（第 11 节） | ✅ |
+| **版本文本只有一个来源**（提交 `d108c80`） | `Cli.版本文本只有一个来源`（`tests/cli_test.cpp`）：断言 `version_text()` 里含 `File Manager Tool` / `v1.0` / `build`——**不钉具体日期**，因为构建日期是 CMake 配置时生成的。钉住的是「横幅 / `--version` / `version` 命令同源」这件事（第 68、127.1 节） | ✅ |
 | HTTP 下载入库 | `File.从HTTP下载入库`（本机起一个 httplib 服务端当地源） | ✅ |
 | 端到端（管道） | `Service.管道能上传与操作文件`（upload → list → get×2 → 去重被拒 → delete → get 仍可查到；**【9c3d2cb】再追加**：删除后 `file get` 命中回收站记录时 `data.trash_path` 以 `trash/user/.files/` 开头，见第 42 节） | ✅ |
 | 端到端（HTTP） | `Server.File路由与上传`（**【6a40742】追加**：`file_name = fmt-20261008-0` → 400 + `FMT-106`；**【0fc242b】追加**：`DELETE ?dry_run=1` 只读、零副作用） | ✅ |
@@ -7162,6 +7192,15 @@ V2
     手动置 true 并重启后 HTTP 完全正常。**未定**：让安装流程置 true，还是加 CLI 命令
     （如 `config http on`）。**在用户拍板前不许写成已实现**（第 78 节、
     `FMT 技术文档.md` 第 5.2、12.1、19.1 节）
+54. `version` 是正式命令，与横幅、`--version` / `-v` **同源**（提交 `d108c80`）：
+    三处都走 `cli::version_text()`（内部是 `banner_text()`），输出一行
+    「File Manager Tool  v1.0  ( build  <CMake 配置日期> )」；
+    窗口里、`fmt.exe version`、`fmt.exe --version` / `-v` 都能用。
+    **不需要服务在运行**（不连管道、不查状态）；**不写任何磁盘内容**——一次性分支在
+    开日志器之前，`log/fmt.log` 不会因此多记录（与 `--help` / `--version` 同口径）。
+    `help` 总览里有 `(version)  version  打印版本与构建日期` 一行，
+    `help version` 有正文（第 68、127.1 节）。**原口径「窗口里敲 version → 未知命令」
+    已作废**
 ```
 
 ---
@@ -7660,6 +7699,40 @@ with 404, unimplemented ones with 501」，2026-10-09 对已安装服务跑了 6
 > 当前桶，需要再敲一次 `bucket use`（第 30、56.1 节）。
 > ② `FMT-301 DownloadFailed` 的退出码是 **1**（与附录 A / 实现一致，已核对）。
 
+**`version` 命令并入的决策（提交 `d108c80`「feat(cli): add the version command」）**：
+
+```text
+现象：窗口里敲 version 回答「未知命令」，而 fmt.exe --version 可用
+      （原来只有旗标实现了）
+修复：新增命令 version —— 与横幅、--version / -v **共用同一份文本**
+      fmt::cli::version_text()（内部就是 banner_text()），三处不可能各说一套
+三种用法（同一份输出）：
+      fmt.exe version            一次性执行
+      fmt.exe --version / -v     一次性执行（原有）
+      fmt> version               窗口里执行（也接受 --version / -v）
+      输出一行：File Manager Tool  v1.0  ( build  2026.10.09 )
+                （版本取 version::MAJOR.MINOR，构建日期由 CMake 配置时生成）
+两个性质：① 不需要服务在运行（不连管道、不查服务状态）；
+         ② 不写任何磁盘内容——一次性分支放在「开日志器」之前，
+            log/fmt.log 不会因为敲 version 多出记录
+            （与 --help / --version 同口径：「从这里开始都是真的干活，才值得写日志」）
+命令总览与帮助：print_command_list() 多一行
+      (version)  version                打印版本与构建日期
+      help <组> 的支持列表多了 version，且 help version 有正文（照源码抄，第 68 节）
+测试：144 → **145 项全绿**。新增 Cli.版本文本只有一个来源
+      （断言含 File Manager Tool / v1.0 / build，**不钉具体日期**——它是配置时生成的）
+（`FMT 技术文档.md` 第 11.4、11.6、12.3.2、17.2、18.32 节）
+```
+
+> **顺带记一条实测风险（不改口径，2026-10-09）**：做 `version` 测试时在**构建目录**里跑了
+> 交互模式，CLI 按设计把**自己所在目录**声明为数据根，于是服务的数据根被切到了构建目录
+> （日志里是 `[Main] 数据根切换: D:/Data/CLionProjects/FMT/cmake-build-debug/bin
+> -> D:/Data/Temp/JMT/fmt`，随后又用部署目录的 exe 发命令切了回来）。
+> 这是「数据根由 CLI 声明」的既定行为，文档也写了「切换**只进日志、不刷控制台**」
+> （第 3 节、第 127 节）——**代价很具体：任何位置的 `fmt.exe` 一连上就会把服务的数据根搬走，
+> 而用户在控制台上看不到任何提示**。是否在控制台加一句提示**尚未决策**，
+> 本轮**不改口径**，只记事实（`FMT 技术文档.md` 第 18.31 节表下同注）。
+
 **粘贴污染并入的决策（提交 `a9af276`「fix(upload): strip what paste adds, and name it
 when it hurts」）**：
 
@@ -7811,8 +7884,8 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 >
 > **测试计数走过的台阶**：118（`188e85d`）→ 124（`a2b6cd1`）→ 126（`0ad9efc`）→
 > 129（`5bf2c1f`）→ 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→
-> 142（`a9af276`）→ **144（`5b316b3`）**（143 是 `2c841c8` 这一步）。
-> 第 109、112、125 节已按 144 更新。
+> 142（`a9af276`）→ 143（`2c841c8`）→ 144（`5b316b3`）→ 144（`8f0fd5c` 只补断言，
+> 计数不变）→ **145（`d108c80`）**。第 109、112、125 节已按 145 更新。
 
 后续开发过程中，如果发现：
 
@@ -8065,7 +8138,7 @@ Service Stopped...
 | 程序名 | 固定 `File Manager Tool`（文档名/工程名仍叫 FMT，只有横幅用这个名字） |
 | 版本部分 | `v<MAJOR>.<MINOR>`，当前 `v1.0`；工程版本仍是 `1.0.0` |
 | 构建日期 | CMake 配置时生成（`FMT_BUILD_DATE`，`%Y.%m.%d` 本地时间），每次重新配置都会变 |
-| 单一来源 | 横幅与 `--version` 调同一个 `banner_text()`，不各写一份；源码里不得硬编码版本号或日期 |
+| 单一来源 | 横幅、`--version` / `-v`、以及 `version` 命令（提交 `d108c80`）调同一个 `version_text()`（内部就是 `banner_text()`），不各写一份；源码里不得硬编码版本号或日期 |
 | 用法标题 | `--help` 里是 `用法：fmt.exe [命令]`，不再用 `FMT 1.0.0 - Windows 文件管理系统` 这类旧标题 |
 
 **双击时控制台只有这些行**（数据根体检与服务状态都不打印）：
@@ -8150,14 +8223,33 @@ fmt> help
 可用命令：
   (service)  install  uninstall  start  stop  status
   (bucket)   create  list  get  use  delete
-  (trash)    list  get  restore  delete   ← 桶级四条；文件级待阶段 5/7
+  (file)     upload  list  get  delete
+  (trash)    list  get  restore  delete
   (help)     help [命令]
+  (version)  version                打印版本与构建日期
   (exit)     exit  quit
 
 业务命令（服务端尚未实现，现在会返回 FMT-602）：
-  (file)     upload  list  get  delete
   (share)    create  get  list  delete
 ```
+
+> 上面是**当前源码**的实际输出（`d108c80` 起 `(version)` 一行也在列；`(file)` 在
+> `188e85d` 之后移进了「可用命令」组）。
+> 提交 `8a5e554` 起 `(bucket)` 与桶级 `trash` 四条进入「可用命令」组，`4fee290` 补齐
+> `get` / `delete`；「尚未实现」这句现在**只对 `(share)` 一组成立**。
+> **当前源码的逐字输出与说明见第 68 节**（那里是唯一一份完整清单）。
+
+```text
+fmt> version
+File Manager Tool  v1.0  ( build  2026.10.09 )
+执行成功...
+错误码：0
+```
+
+> **`version`（提交 `d108c80`）**：窗口里原来敲它得到「未知命令」（只有 `--version`
+> 旗标实现了）。现在它与 `--version` / `-v`、横幅**共用同一份 `version_text()`**
+> ——三处不可能各说一套。**不需要服务在运行，也不写任何磁盘内容**
+> （一次性分支在开日志器之前，`log/fmt.log` 不会多出记录）。详见第 68、127.6 节。
 
 > 上面是**当前源码**的实际输出（提交 `8a5e554` 起，`c2d545d` 补了桶级 trash 的 `list` /
 > `restore`，`4fee290` 补齐 `get` / `delete`）。
@@ -8202,7 +8294,7 @@ stderr   错误码与错误消息（执行失败：FMT-NNN <消息>、错误码�
 再加（见第 70 节）。
 
 CLI 把结果输出到控制台，**同时追加写入数据根下的 `log/fmt.log`**（见第 65 节）；
-`--help` / `--version` / `help` / `exit` 不写日志、不创建任何目录。
+`--help` / `--version` / `-v` / `version` / `help` / `exit` 不写日志、不创建任何目录。
 **控制台只留交互与异常**：双击时的数据根体检结果与服务当前状态都只进日志（见 127.1），
 只有「数据根无法补齐」「数据根文件损坏（未自动修复）」才走 stderr。
 

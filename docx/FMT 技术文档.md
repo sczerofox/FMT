@@ -2733,7 +2733,7 @@ Service 完成。唯一的例外是它**双击时对自己所在数据根做的�
 | 命名管道 `\\.\pipe\fmt.control` | 全部业务命令 | 一请求一响应，帧见 13.9 |
 | SCM API（经 UAC 提权的短命副本） | `service install/uninstall/start/stop` | 见 13.8 |
 | SCM API（**不提权**，本地直连） | `service status` | 只读查询，见 11.2 / 13.4.1 |
-| 本地处理 | `--help` / `--version` / `help` / `exit` | 不依赖 Service |
+| 本地处理 | `--help` / `--version` / `-v` / **`version`** / `help` / `exit` | 不依赖 Service（`version` 是提交 `d108c80` 新增的命令，见 11.6） |
 | HTTP `127.0.0.1:4122` | **仅浏览器** | CLI 不再使用 |
 
 **唯一写入者是 Service。** 这样不存在 CLI 与 Service 两个进程同时改 `data/*.json`
@@ -2755,7 +2755,7 @@ CLI 拿到响应后只做两件事：`ok == true` 时格式化 `data`；`ok == f
 |---|---|---|
 | `service install` / `service uninstall` / `service start` / `service stop` | **UAC 提权 + SCM API** | Service 可能尚未安装/启动，走管道会引导死锁；且 SCM 操作需要管理员 |
 | `service status` | **SCM API，不提权** | 只读查询：不需要管理员权限、不弹 UAC、不进提权副本；未安装时也要能回答「未安装」 |
-| `--help` / `--version` | 本地 | 不依赖 Service |
+| `--help` / `--version` / `-v` / **`version`** | 本地 | 不依赖 Service（**`version` 命令**提交 `d108c80` 新增：窗口里也能敲，见 11.6） |
 | `bucket *` / `file *` / `share *` / `trash *` / `config *` | **命名管道 → Service** | 业务操作，必须由 Service 执行 |
 
 服务命令**有这五条**，比早期设计少两条、多一条：
@@ -2811,7 +2811,10 @@ fmt.exe --service install        ← 作废，不再识别
 ```text
 fmt.exe
 ├── --help
-├── --version
+├── --version | -v                   ← 一次性；与横幅、`version` 命令同一份文本
+├── version                          ← **提交 d108c80 新增**：打印版本与构建日期；
+│                                      一次性与窗口里都能用（也接受 --version / -v），
+│                                      不需要服务、不写磁盘（11.6）
 ├── help    [组]                     ← 命令总览 / 某一组的详细说明
 ├── exit | quit                      ← 交互循环内退出
 ├── bucket  create <name> | list | get <name> | use <name> | delete <name>
@@ -2876,7 +2879,8 @@ fmt.exe help [组]     一次性：不带参数 = 命令总览；带组名 = 该
 help [组]             交互循环内同上（交互里也接受 --help 这个别名）
 ```
 
-**`help`（不带参数）只列命令、不加描述**（提交 `188e85d` 之后的逐字输出）：
+**`help`（不带参数）只列命令、不加描述**（提交 `188e85d` 之后的逐字输出；
+**提交 `d108c80` 起多了 `(version)` 一行**）：
 
 ```text
 可用命令：
@@ -2885,6 +2889,7 @@ help [组]             交互循环内同上（交互里也接受 --help 这个�
   (file)     upload  list  get  delete
   (trash)    list  get  restore  delete
   (help)     help [命令]
+  (version)  version                打印版本与构建日期
   (exit)     exit  quit
 
 业务命令（服务端尚未实现，现在会返回 FMT-602）：
@@ -2893,10 +2898,21 @@ help [组]             交互循环内同上（交互里也接受 --help 这个�
 
 `(file) upload list get delete` 在提交 `188e85d` 落地后移进了「可用命令」组
 （顺序就是源码 `print_command_list()` 里的顺序：service → bucket → file → trash →
-help → exit），**「尚未实现」组只剩 `(share)` 一行**。
+help → **version** → exit），**「尚未实现」组只剩 `(share)` 一行**。
+
+**`help version` 的正文（提交 `d108c80`，照源码抄）**：
+
+```text
+version —— 打印程序名、版本与构建日期
+  与启动横幅、`--version` 共用同一份文本，不会各说一套。
+  不需要服务在运行，也不写任何磁盘内容：
+    fmt.exe version          一次性执行
+    fmt> version             窗口里执行
+```
 
 **`help <组>` 打印该组详情。** 当前支持 `service` / `bucket` / `file` / `share` /
-`trash` / `help` / `exit`（`quit` 等同 `exit`）。`help service` 的输出：
+`trash` / `help` / `exit`（`quit` 等同 `exit`；**提交 `d108c80` 起多了 `version`**）。
+`help service` 的输出：
 
 ```text
 service —— Windows 服务管理
@@ -3089,7 +3105,7 @@ CLI 输出保持简洁、明确、用户可读。**CLI 也写日志文件**：�
 
 | 情况 | 处理 |
 |---|---|
-| 未知命令 | 报错 + 提示帮助 + 非 0 退出码 |
+| 未知命令 | 报错 + 提示帮助 + 非 0 退出码（**`version` 不再是未知命令**——提交 `d108c80` 起它是正式命令，见 11.6、18.32） |
 | 缺少参数 | 报错 + 提示正确用法 + 非 0 退出码 |
 | 未知参数 | 拒绝执行 + 非 0 退出码 |
 | `help <未知组>` | stderr：`没有 <组> 的帮助；输入 help 查看命令列表` + `FMT-001` + 退出码 2 |
@@ -3159,6 +3175,33 @@ fmt >
 
 横幅文本来自 `banner_text()`（`src/cli/cli.cpp`），它拼的是 `fmt/version.hpp` 的
 `MAJOR` / `MINOR` / `BUILD_DATE`（见 3.4），**不得硬编码**；`--version` 调的是同一个函数。
+
+**`version` 命令：三处共用一份文本（提交 `d108c80`）**：
+
+```cpp
+// include/fmt/cli/cli.hpp
+// 版本文本的**唯一来源**：横幅、--version / -v、version 命令都走它。
+std::string version_text();     // 实现就是 return banner_text();
+```
+
+```text
+三种用法，同一份输出：
+  fmt.exe version            一次性执行
+  fmt.exe --version / -v     一次性执行（原有）
+  fmt> version               窗口里执行（也接受 --version / -v）
+输出一行：File Manager Tool  v1.0  ( build  2026.10.09 )
+          （版本取 version::MAJOR.MINOR，构建日期由 CMake 配置时生成）
+
+两个性质：
+  ① 不需要服务在运行——不连管道、不查服务状态、不弹 UAC
+  ② 不写任何磁盘内容——一次性分支放在「开日志器」之前，log/fmt.log 不会因为敲
+     version 多出记录（与 --help / --version 同一条口径：从这里开始都是真的干活，
+     才值得写日志，见 4.4.2 与 11.13）
+
+原来：窗口里敲 version 得到「未知命令」（只有旗标实现了）——**该口径已作废**。
+用例：Cli.版本文本只有一个来源 断言含 File Manager Tool / v1.0 / build
+      （**不钉具体日期**，它是配置时生成的）。
+```
 
 **提示符：`fmt> `**（`fmt` + `>` + 一个空格，无换行）。
 
@@ -3399,7 +3442,7 @@ Service   服务的当前状态与落定后的状态（如「当前状态：运�
    结果攒成若干行、等日志器开好后写进 log/fmt.log（模块 Cli），**控制台一行都不打**。
    除此之外 CLI 不改任何业务数据：不写 data/*.json 的内容、不删文件、不改名。
    旧口径里「CLI 只允许创建 log/ 与 temp/ 这两个目录」的说法已被这一步覆盖。
-2. `--help` / `--version` / `help` / `exit` 不写日志、不创建任何目录（它们不该在磁盘上留下东西）。
+2. `--help` / `--version` / `-v` / `version` / `help` / `exit` 不写日志、不创建任何目录（它们不该在磁盘上留下东西；`version` 是提交 `d108c80` 新增的命令，11.6）。
 3. 两个进程的数据根可能不同（服务可能被别人启动在另一个目录）：各写各自数据根下的
    log/fmt.log；这种情况下 CLI 会额外写一行 WARN，指明服务当前数据根与服务侧日志的位置。
 ```
@@ -6160,23 +6203,25 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 > `fmt_test.cpp`，`FMT_TEST(suite, 名称)` / `FMT_CHECK_EQ` 宏，**零第三方依赖、可完全离线构建**，
 > 断言失败继续跑下一个用例），并在 `tests/CMakeLists.txt` 里用 `add_test(NAME fmt_tests …)`
 > 接进 CTest——所以「不写自动化测试」这条**只对 Catch2 那种形态成立**：不引外部框架，
-> 但模块行为仍有单元测试兜底。当前 **144 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
+> 但模块行为仍有单元测试兜底。当前 **145 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
 `HttpClient.*` + 提交 `0ad9efc` 新增 2 条 `File.*` + 提交 `5bf2c1f` 新增 2 条 `File.*`
 与 1 条 `Bucket.*` + **提交 `9c3d2cb` 新增 5 条** + **提交 `0fc242b` 新增 4 条** +
-**提交 `a9af276` 新增 2 条** + **提交 `2c841c8` / `5b316b3` 各新增 1 条**：
+**提交 `a9af276` 新增 2 条** + **提交 `2c841c8` / `5b316b3` 各新增 1 条** +
+**提交 `d108c80` 新增 1 条**：
 `Trash.文件级条目能列出并回退`、`Trash.回退遇同名冲突要拦住`、
 `Trash.随桶删除的文件不能单独回退`、`Trash.永久删除文件级条目`、
 `String.清理粘贴带进来的路径污染`、`File.粘贴路径里的不可见字符会被清掉`、
-`Cli.位置参数的信封形状`、`Storage.两个写者同时写同一个文件不会互相踩`
+`Cli.位置参数的信封形状`、`Storage.两个写者同时写同一个文件不会互相踩`、
+`Cli.版本文本只有一个来源`
 （另有既有用例追加断言或改口径：`File.列表与查询` 的大写 file_id、`File.软删除进回收站`
 改断言 `file.json` 且断言 `trash.json` 保持空、`Service.管道能执行Bucket命令`、
 `Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、
 `Service.启动时清理temp里的遗留临时文件`（改成「新的留着、旧的清掉」）、
 `Server.Bucket路由与状态码`、`Server.File路由与上传`；
-见 17.2.1 与 18.19、18.21、18.22、18.23、18.24、18.25、18.27、18.28、18.29），
+见 17.2.1 与 18.19、18.21、18.22、18.23、18.24、18.25、18.27、18.28、18.29、18.31、18.32），
 桶级回收站的用例见 18.17。**计数走过的台阶：118 → 124 → 126 → 129（`5bf2c1f`）
 → 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→ 142（`a9af276`）
-→ 143（`2c841c8`）→ 144（`5b316b3`）**。
+→ 143（`2c841c8`）→ 144（`5b316b3`，`8f0fd5c` 只补断言不变）→ 145（`d108c80`）**。
 > 端到端实测仍然是「真的对了」的最终判据（17.4 的硬标准不变）。
 >
 > **运行器的两条可观测性设计（提交 `a2b6cd1`，逐行照源码）**：
@@ -7938,6 +7983,52 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 | HTTP（`enabled` 手动打开后） | `GET /api/ping`、`/api/status`（含 `channel` / `pid` / `root` / `version`）、`/api/bucket`、`/api/file` ✓；`POST /api/file`（`{"path":…}`）✓、缺 `path` → 400 ✓；`POST /api/bucket`（含小写规范化 + `note`）✓、重名 → 409 ✓；`DELETE /api/file?dry_run=1` ✓、跨桶无 `force` → 400 + `FMT-016` ✓、带 `force=1` → 200 ✓；`GET /api/trash` ✓；`POST /api/trash/<名>/restore` ✓ |
 | 行为确认 | ① 删除**当前** Bucket 后 `current_bucket` 被置空，之后 `file list` 报 `FMT-305 未设置当前 Bucket`（退出码 3）；`trash restore` 把桶恢复回来**不会**自动设回当前桶，需要 `bucket use`（设计如此，见 10.1、开发文档第 30/61 节）。② `FMT-301 DownloadFailed` 的退出码是 **1**（附录 A 与实现一致） |
 
+> **实测风险（顺带记下，2026-10-09，**不改口径**）**：做 `version` 测试时在**构建目录**里
+> 跑了交互模式，CLI 按设计把**自己所在目录**声明为数据根，于是服务的数据根被切到了构建目录
+> （日志：`[Main] 数据根切换: D:/Data/CLionProjects/FMT/cmake-build-debug/bin
+> -> D:/Data/Temp/JMT/fmt`；随后又用部署目录的 exe 发了一条命令切回来）。
+> 这正是「**数据根由 CLI 声明**」的既定行为（13.10），文档也写了「切换**只进日志、
+> 不刷控制台**」（11.12 / 4.4.2）——**这句在文档里是清楚的**。
+> 但代价很具体：**任何位置的 `fmt.exe` 一连上就会把服务的数据根搬走，而用户在控制台上
+> 看不到任何提示**。是否在控制台加一句提示**尚未决策**，本轮只记事实、不动口径
+> （开发文档第 125 节同注）。
+
+---
+
+### 18.32 `version` 命令（commit `d108c80`）
+
+`d108c80`「feat(cli): add the version command」。**145 个用例全绿**（144 + 新增 1 条）。
+
+```text
+现象    窗口里敲 version 回答「未知命令」，而 fmt.exe --version 是可用的
+        （原来只有旗标实现了）
+修复    新增命令 version —— 与横幅、--version / -v **共用同一份文本**
+        `cli::version_text()`（实现就是 return banner_text();），三处不可能各说一套
+        （原来 only 旗标走 banner_text，命令侧根本没接）
+三种用法，同一份输出（11.6）：
+        fmt.exe version            一次性执行
+        fmt.exe --version / -v     一次性执行（原有）
+        fmt> version               窗口里执行（也接受 --version / -v）
+        输出一行：File Manager Tool  v1.0  ( build  2026.10.09 )
+                  （版本取 version::MAJOR.MINOR，构建日期由 CMake 配置时生成）
+两个性质 ① **不需要服务在运行**（不连管道、不查服务状态、不弹 UAC）
+        ② **不写任何磁盘内容**——一次性分支放在「开日志器」之前，log/fmt.log 不会
+           因为敲 version 多出记录（与 --help / --version 同一条口径：
+           「从这里开始都是真的干活，才值得写日志」，见 11.13）
+命令总览 print_command_list() 多一行（顺序 service → bucket → file → trash → help →
+        version → exit）：
+          (version)  version                打印版本与构建日期
+帮助   help <组> 的支持列表多了 version，且 help version 有正文（11.4，照源码抄）
+用例   Cli.版本文本只有一个来源（tests/cli_test.cpp）：断言 version_text() 里含
+        `File Manager Tool` / `v1.0` / `build`——**不钉具体日期**，因为构建日期是
+        CMake 配置时生成的；钉住的是「三处同源」这件事
+```
+
+**实现上的两处细节（读源码时值得注意）**：① `version_text()` 必须定义在**匿名命名空间
+之外**（`banner_text()` 在里面），否则声明在 `cli.hpp` 里的符号链接期找不到；
+② 一次性分支紧跟在 `--version` 分支之后、**在「开日志器」之前**——这正是「不写磁盘」的
+实现方式，不是巧合。
+
 ---
 
 ## 19. 待决事项
@@ -7984,7 +8075,7 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 | 旧 `paths::` 自由函数 | 仍保留 `executable_path` / `root` 等自由函数供启动阶段使用，与 `PathManager` 并存；后续可考虑收敛，但 `root()` 必须保留（它要先于 PathManager 存在） |
 | `text::join` 的使用纪律 | 凡是用用户输入拼接路径，必须经 `common/text`。这条纪律目前靠代码审查保证，没有编译期强制 |
 | `AppContext` 的指针持有纪律 | `paths` 与 `logger` 都必须 `unique_ptr` 持有，因为业务服务保存它们的引用。这条约束靠注释说明，没有编译期强制——改动 `AppContext` 成员时容易踩回去 |
-| 自动化回归测试 | **口径已变**：本分支阶段 2 起有了一套**自研最小运行器**（`tests/fmt_test.hpp`，`FMT_TEST` / `FMT_CHECK_EQ`，零第三方依赖、可离线构建，`add_test(NAME fmt_tests …)` 接进 CTest），当前 **144 个用例、全绿**（上一轮 118 个，
+| 自动化回归测试 | **口径已变**：本分支阶段 2 起有了一套**自研最小运行器**（`tests/fmt_test.hpp`，`FMT_TEST` / `FMT_CHECK_EQ`，零第三方依赖、可离线构建，`add_test(NAME fmt_tests …)` 接进 CTest），当前 **145 个用例、全绿**（上一轮 118 个，
 提交 `a2b6cd1` 又新增 6 条 `HttpClient.*`，见 17.2、17.2.1、18.18、18.19、18.20；
 提交 `0ad9efc` 再新增 2 条 `File.*`，见 18.21；提交 `5bf2c1f` 再新增 2 条 `File.*`
 与 1 条 `Bucket.*`，见 18.22；提交 `9c3d2cb` 再新增 5 条，见 18.23；
@@ -7994,7 +8085,9 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 （`String.清理粘贴带进来的路径污染`、`File.粘贴路径里的不可见字符会被清掉`），见 18.27；
 提交 `2c841c8` 新增 `Cli.位置参数的信封形状`（143），见 18.28；
 提交 `5b316b3` 新增 `Storage.两个写者同时写同一个文件不会互相踩` 并把
-`Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」（144），见 18.29）。
+`Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」（144），见 18.29；
+提交 `8f0fd5c` 只补断言（144 不变），见 18.30；提交 `4ddb515` 只改实现与既有用例
+（144 不变），见 18.31；提交 `d108c80` 新增 `Cli.版本文本只有一个来源`（**145**），见 18.32）。
 **仍然没有的**是「上传 →
 列表 → 下载 → 分享」这条**跨模块链路**的自动化：它依旧靠端到端实测，若后续要补自动化，优先补这一段，而不是再堆各模块的孤立用例（提交 `188e85d` 补上了管道与 HTTP 两条
 「上传 → 列表 → 查询 → 软删除」的端到端用例，但**没有**覆盖下载与分享） |

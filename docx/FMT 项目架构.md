@@ -71,7 +71,7 @@ V1 用 **JSON + 文件系统**满足需求，不使用数据库、Redis、MQ、�
 
 ## 2. 关键设计决策
 
-V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～32** 项是
+V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～33** 项是
 `arch-restart` 分支新增的**重构冻结项**，逐条对应 `FMT 重构设计.md` 第 2 节的决策索引：
 
 | # | 规则 |
@@ -110,6 +110,8 @@ V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 �
 | 31 | **粘贴路径的污染要清掉、不可见字符不许进名字（提交 `a9af276`）**：`clean_user_path()` 清掉不可见格式字符（`U+00A0` / `U+00AD` / `U+200B`–`U+200F` / `U+202A`–`U+202E` / `U+2060`–`U+2064` / `U+2066`–`U+2069` / `U+FEFF`）与**成对**引号、首尾空白，中文不受影响；**一处收口**在 `service/commands.cpp` 的 `argument()`（所有位置参数的唯一入口，CLI 与 HTTP 共用），`prepare_upload()` 再清一次来源与显式文件名。清掉后仍找不到 → `FMT-002` 并**点名码位**；**名字里不允许**这些字符：`validate_file_name()` → `FMT-101`、`validate_bucket_name()` → `FMT-202`（理由：屏幕上看不出来、用户没法重敲一遍）。用户实测：`C:\...\头像\asdva.jpg` 被 `U+202A`/`U+202C` 包住 → 「文件不存在」，现在能正常上传 |
 
 | 32 | **请求形状由同一个构造函数产出；进程间共写的两处纪律（提交 `2c841c8` + `5b316b3`，用户实测踩出来的）**：① `fmt::cli::argument_envelope(positional, dry_run, force)` 是「位置参数放 `argv`、开关放同级」的唯一产出点，预检与真实请求共用——原来把 `dry_run` 挂到位置参数**数组**上，nlohmann 抛 `type_error.305` 未捕获即 `abort()`（`file delete a7.jpg` 弹出的 Debug Error）；**测试不许自己拼形状**（旧测试照着服务端契约拼，所以全绿却挡不住崩溃）。② temp/ 的启动清理**只清十分钟以前**的 `fmt-*`：提权结果文件也叫 `fmt-elev-<pid>.json(.tmp)`，`service install` 会在同一次操作里启动服务，一律清掉会让父进程报「FMT-602 提权副本没有返回结果」——**服务其实装好了**（假失败）。③ 原子写的临时名必须唯一（`<目标>.<pid>.<序号>.tmp`）+ 进程内互斥 + 替换遇共享冲突短暂重试：固定 `<目标>.tmp` 时安装器与服务启动同时写 `service.json` 会互相踩，加上调用方忽略返回值 → `service.json` 静默不更新。④ `TrashEntry.present` 语义写死为「数据在不在磁盘上」，回退/删除的结果**不翻转它**（文件级 `5b316b3`、桶级 `8f0fd5c`——原来恢复成功后打印「状态：数据已不存在」；`8f0fd5c` 之后真机跑过建桶/删桶/回退/永久删除确认为实况）。见第 4.2、4.5、8 节与 `FMT 技术文档.md` 第 6.6、10.4、11.15、13.8.3、18.28、18.29、18.30 节 |
+
+| 33 | **`version` 是正式命令，与横幅、`--version` 同源（提交 `d108c80`）**：三处都走 `cli::version_text()`（内部就是 `banner_text()`），输出一行 `File Manager Tool  v1.0  ( build  <CMake 配置日期> )`——窗口里 `version`、`fmt.exe version`、`fmt.exe --version` / `-v` 都能用。**不需要服务在运行**（不连管道、不查状态、不弹 UAC），**不写任何磁盘内容**（一次性分支在开日志器之前，`log/fmt.log` 不会因此多记录）。`help` 总览多一行 `(version)  version  打印版本与构建日期`，`help version` 有正文。原口径「窗口里敲 `version` → 未知命令」**已作废** |
 
 系统明确**禁止自动**执行：覆盖文件、修改用户文件名、选择其他 Bucket、创建恢复目标
 Bucket、绕过下载限制、删除文件、清空损坏 JSON、**删除旧数据根的数据**、**把服务宿主的
@@ -1209,7 +1211,9 @@ CLI (管道客户端)              HTTP (浏览器)
 ```text
 fmt.exe
 ├── --help
-├── --version
+├── --version | -v
+├── version            打印版本与构建日期（提交 d108c80；一次性与窗口里都行，
+│                      与横幅、--version 共用 version_text()，不需要服务、不写磁盘）
 ├── help    [组]       命令总览（不带参数）/ 某一组详情（help service）
 ├── exit | quit        交互循环内退出
 ├── bucket  create <name> | list | get <name> | use <name> | delete <name>
@@ -1293,17 +1297,26 @@ Bucket 就整单拒绝，不覆盖、不改名、不做部分恢复；`delete` �
   (file)     upload  list  get  delete
   (trash)    list  get  restore  delete
   (help)     help [命令]
+  (version)  version                打印版本与构建日期
   (exit)     exit  quit
 
 业务命令（服务端尚未实现，现在会返回 FMT-602）：
   (share)    create  get  list  delete
 ```
 
-> 这是提交 `188e85d` 之后的逐字输出（`src/cli/cli.cpp` 的 `print_command_list()`）：
+> 这是提交 `188e85d` 之后的逐字输出（`src/cli/cli.cpp` 的 `print_command_list()`；
+> **提交 `d108c80` 起 `(version)` 一行也在列**，位置在 `help` 与 `exit` 之间）。
 > `(file)` 那一行已经移进「可用命令」组、位置在 `bucket` 与 `trash` 之间；
 > 「尚未实现」组里**只剩 `share` 一行**。上面标题里的「现在会返回 FMT-602」是**字面输出**，
 > 不是笔误：`share.*` 被 `is_known_business()` 的前缀表认得、但没有任何实现，
 > 所以拿到的是 `FMT-602`（「操作尚未实现：share.create」）而不是「未知操作」的 `FMT-001`。
+
+> **`version` 命令（提交 `d108c80`）**：窗口里原来敲 `version` 得到「未知命令」
+> （只有 `--version` 旗标实现了）。现在三处——横幅、`--version` / `-v`、`version` 命令
+> ——**共用同一份文本** `cli::version_text()`，输出一行
+> `File Manager Tool  v1.0  ( build  2026.10.09 )`；**不需要服务在运行**，
+> 也**不写任何磁盘内容**（一次性分支在开日志器之前）。
+> 上面那张「本地处理」表已把它与 `--help` / `--version` 并列。
 
 三类命令的走向完全不同，实现时不能混：
 
@@ -1312,7 +1325,7 @@ Bucket 就整单拒绝，不覆盖、不改名、不做部分恢复；`delete` �
 | `bucket` / `file` / `share` / `trash` | **命名管道 → 服务** | CLI 不碰文件系统；服务未运行则 `FMT-601`、退出码 8。**`bucket` 已在阶段 4 落地**（`bucket.*` 五种 op + 两条入口），**桶级 `trash.list` / `trash.get` / `trash.restore` / `trash.delete` 同阶段落地**（`get` / `delete` 提交 `4fee290`；`file.json` 的 `trash_reason`、`trash/<user>/.original` 见第 5.4.1 节）；**`file` 四条也在提交 `188e85d` 落地**（`file.upload` 走两段式；`file.json` 的读写、`trash.json` 的文件级条目写入都在 `src/file/`）；**只剩 `share` 仍返回 `FMT-602`**（原口径「`file` / `share` 两组」「与 `trash.get` / `trash.delete`」均已作废） |
 | `service install` / `uninstall` / `start` / `stop`（提权副本另有 `reinstall`） | **直连 SCM + UAC 提权** | 不经管道、不经 HTTP，见第 4.5 节 |
 | `service status` | **直连 SCM，不提权** | 只读查询：不需要管理员权限、不弹 UAC、不走提权副本；未安装时 `FMT-601`、退出码 8 |
-| `--help` / `--version` / `help` / `exit` | 本地处理 | 不连服务、不弹 UAC、不写日志 |
+| `--help` / `--version` / `-v` / `version` / `help` / `exit` | 本地处理 | 不连服务、不弹 UAC、不写日志（`version` 命令提交 `d108c80` 新增） |
 
 `service` 命令的硬性约束（第 2 节第 23 项、第 4.5 节）：
 
@@ -1411,7 +1424,7 @@ CLI 侧的三条边界（详见 `FMT 技术文档.md` 第 11.12 节）：
    除此之外 CLI 只允许创建 <数据根>/log/ 与执行提权命令前要用的 <数据根>/temp/ 这两个目录
    （都不属于业务数据：日志不是业务数据，temp/ 按定义随时可以清空）；
    CLI 仍然不改任何业务数据——不写 data/*.json 的内容、不删文件、不改名。
-2. `--help` / `--version` / `help` / `exit` 不写日志、不创建任何目录。
+2. `--help` / `--version` / `-v` / `version` / `help` / `exit` 不写日志、不创建任何目录。
 3. 两个进程的数据根可能不同（服务可能被别人启动在另一个目录）：各写各自数据根下的
    log/fmt.log；这种情况下 CLI 会额外写一行 WARN，指明服务当前数据根与服务侧日志的位置。
 4. 控制台只留横幅、提示符、命令结果与异常；服务的当前状态、数据根体检结果都只进日志
@@ -1691,7 +1704,7 @@ before a bucket goes」；
 | `common/hash`（**提交 `188e85d`**）：`Md5`（Windows CNG / bcrypt 增量接口）+ `md5_hex()`；`bcrypt.lib` 在 `src/common/CMakeLists.txt` 链接 | `include/fmt/common/hash.hpp`、`src/common/hash.cpp` |
 | `core`：`PathManager`（`trash_file` 落点 `trash/<user>/.files/<bucket>/YYYY/MM/DD/`，提交 `4fee290`） | `src/core/` |
 | `common/http_client`（**提交 `a2b6cd1`**）：`is_remote_url()` + `http_download()`——WinHTTP + Schannel 的流式 GET（跟随重定向、连接/发送/接收超时、`Accept-Encoding: identity`、只有 2xx 交给 sink、sink 返回 false 即中止、证书失败给准提示）；`src/common/CMakeLists.txt` 链 `winhttp`，`src/file/CMakeLists.txt` 不再链 cpp-httplib | `include/fmt/common/http_client.hpp`、`src/common/http_client.cpp` |
-| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**144 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`），提交 `2c841c8` 增到 143（`Cli.位置参数的信封形状`），提交 `5b316b3` 增到 144（`Storage.两个写者同时写同一个文件不会互相踩`，并把 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
+| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**145 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`），提交 `2c841c8` 增到 143（`Cli.位置参数的信封形状`），提交 `5b316b3` 增到 144（`Storage.两个写者同时写同一个文件不会互相踩`，并把 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」），提交 `d108c80` 增到 145（`Cli.版本文本只有一个来源`）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
 | vendored 第三方库 | `third_party/nlohmann/json.hpp`、`third_party/cpp-httplib/httplib.h`（**只服务 HTTP 服务端**；URL 下载走系统 `winhttp`） |
 | 版本号的单一来源（CMake 生成头） | `cmake/version.hpp.in` |
 | 构建辅助脚本 | `tools/build.ps1` |
