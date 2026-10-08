@@ -8,6 +8,41 @@
 #include "fmt/core/path.hpp"
 #include "fmt_test.hpp"
 
+FMT_TEST(Cli, 位置参数的信封形状) {
+    const nlohmann::json positional = nlohmann::json::array({"a7.jpg"});
+
+    // 旧写法（把开关直接挂到位置参数数组上）会抛 type_error.305；
+    // 未捕获就是用户看到的「Debug Error! abort() has been called」弹窗。
+    nlohmann::json broken = positional;
+    bool threw = false;
+    try {
+        broken["dry_run"] = true;
+    } catch (const nlohmann::json::exception&) {
+        threw = true;
+    }
+    FMT_CHECK(threw);
+
+    // 新写法：位置参数在 argv，开关与它**同级**
+    const nlohmann::json check = fmt::cli::argument_envelope(positional, /*dry_run=*/true);
+    FMT_CHECK(check.is_object());
+    FMT_CHECK(check.contains("argv"));
+    FMT_CHECK_EQ(check["argv"][0].get<std::string>(), std::string("a7.jpg"));
+    FMT_CHECK(check.value("dry_run", false));
+    FMT_CHECK(!check.contains("force"));
+
+    const nlohmann::json real =
+        fmt::cli::argument_envelope(positional, /*dry_run=*/false, /*force=*/true);
+    FMT_CHECK(real.contains("argv"));
+    FMT_CHECK(real.value("force", false));
+    FMT_CHECK(!real.contains("dry_run"));
+
+    // 没有位置参数的命令（file list）也要拿到合法对象
+    const nlohmann::json empty = fmt::cli::argument_envelope(nlohmann::json::array(), false, true);
+    FMT_CHECK(empty.is_object());
+    FMT_CHECK(!empty.contains("argv"));
+    FMT_CHECK(empty.value("force", false));
+}
+
 FMT_TEST(Cli, 命令切分) {
     const std::vector<std::string> simple = fmt::cli::split_command("service stop");
     FMT_CHECK_EQ(simple.size(), std::size_t{2});

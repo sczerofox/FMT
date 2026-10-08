@@ -18,11 +18,27 @@
 #include <string>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "fmt/common/error.hpp"
 #include "fmt/common/logger.hpp"
 #include "fmt/ipc/pipe.hpp"
 
 namespace fmt::cli {
+
+// 一条业务命令的**参数信封**：位置参数放 `args.argv`，开关（dry_run / force 等）
+// 放**同级**字段。
+//
+// 为什么要有这个函数：开关放错层级会抛 nlohmann 的 type_error.305
+// （"cannot use operator[] with a string argument with array"），未捕获就是
+// `abort()` 弹窗——Debug 版里表现为「Debug Error! abort() has been called」。
+// 预检与真实请求必须用**同一个**信封构造函数，两边才不会各写一套、各错一处。
+//
+//   positional: 位置参数数组（可以为空）
+//   dry_run   : 只预检、不改数据
+//   force     : 已确认执行（破坏性操作）
+nlohmann::json argument_envelope(const nlohmann::json& positional, bool dry_run = false,
+                                 bool force = false);
 
 // ---- CLI 侧日志 ----
 //

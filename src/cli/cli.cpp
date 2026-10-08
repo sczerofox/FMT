@@ -21,6 +21,23 @@ namespace {
 Logger* g_logger = nullptr;
 }  // namespace
 
+nlohmann::json argument_envelope(const nlohmann::json& positional, bool dry_run, bool force) {
+    // 开关必须与 argv **同级**。以前这里写成 `args = positional; args["dry_run"] = true;`，
+    // 而 positional 是数组——nlohmann 对数组用字符串下标会抛 type_error.305，
+    // 未捕获就是 abort()：用户敲 `file delete a7.jpg` 时弹出的那个 Debug Error 就是它。
+    nlohmann::json args = nlohmann::json::object();
+    if (!positional.empty()) {
+        args["argv"] = positional;
+    }
+    if (dry_run) {
+        args["dry_run"] = true;
+    }
+    if (force) {
+        args["force"] = true;
+    }
+    return args;
+}
+
 void set_logger(Logger* logger) { g_logger = logger; }
 
 Logger* logger() { return g_logger; }
@@ -699,8 +716,7 @@ ConfirmOutcome confirm_before_acting(const std::string& operation, const nlohman
     check.op = operation;
     check.root = options.data_root;
     check.pid = GetCurrentProcessId();
-    check.args = arguments;
-    check.args["dry_run"] = true;
+    check.args = argument_envelope(arguments, /*dry_run=*/true);
 
     Result<ipc::Response> checked = session.client.call(check, ipc::kCommandTimeoutMs);
     if (!ok(checked)) {
@@ -784,14 +800,8 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     request.root = options.data_root;
     request.pid = GetCurrentProcessId();
 
-    if (!arguments.empty()) {
-        request.args["argv"] = arguments;
-    }
-    // 预检已经做过、用户也已经同意：这里带 force 让服务端放行。
-    // 服务端仍然会独立校验（预检被绕过时也不会误删）。
-    if (confirmed || destructive) {
-        request.args["force"] = true;
-    }
+    // 位置参数与开关走**同一个**信封构造：预检与真实请求因此不可能各错一处。
+    request.args = argument_envelope(arguments, /*dry_run=*/false, confirmed || destructive);
 
     log_info("Cli", "命令 " + operation + " 已发送（id " + std::to_string(request.id) + "）");
 
