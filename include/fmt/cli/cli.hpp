@@ -85,6 +85,12 @@ std::vector<std::string> split_command(const std::string& line);
 // 分开写就会漂移，所以只留这一个来源。
 std::string version_text();
 
+// 「服务数据根被搬走了」的提示文本（切换发生时打到 stderr）。
+// 之所以要有这么一句：数据根由 CLI 声明，任何位置的 fmt.exe 一连上就会把服务
+// 的数据根换成它自己所在目录——桶、文件、回收站会整体变成另一个目录的内容，
+// 而这件事原来只写进日志，用户在控制台上看不到。
+std::string root_switch_notice(const std::string& previous, const std::string& current);
+
 // 提权执行一条 service 命令，结果经临时文件回传（见 §13.8.5）。
 struct ElevatedOutcome {
     bool ok = true;

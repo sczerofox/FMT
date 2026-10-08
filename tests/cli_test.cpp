@@ -54,6 +54,19 @@ FMT_TEST(Cli, 位置参数的信封形状) {
     FMT_CHECK(empty.value("force", false));
 }
 
+FMT_TEST(Cli, 数据根切换提示要把两个根都说清楚) {
+    // 这句提示是用户唯一能看到的信号（数据根由 CLI 声明，换个目录的 fmt.exe
+    // 一连上就会把服务的数据根搬走）。所以两个根、原因、怎么切回去都得在。
+    const std::string notice = fmt::cli::root_switch_notice("D:/old", "D:/new");
+    FMT_CHECK(notice.find("D:/old") != std::string::npos);
+    FMT_CHECK(notice.find("D:/new") != std::string::npos);
+    FMT_CHECK(notice.find("数据根") != std::string::npos);
+    FMT_CHECK(notice.find("切回去") != std::string::npos);
+    // 空的前一个根（服务首次启动）也不能打出「原来：」后面空着没说明
+    const std::string first = fmt::cli::root_switch_notice("", "D:/new");
+    FMT_CHECK(first.find("D:/new") != std::string::npos);
+}
+
 FMT_TEST(Cli, 命令切分) {
     const std::vector<std::string> simple = fmt::cli::split_command("service stop");
     FMT_CHECK_EQ(simple.size(), std::size_t{2});

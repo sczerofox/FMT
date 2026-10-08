@@ -403,13 +403,9 @@ Status ensure_connected(Session& session, const Options& options) {
     // 目录下。以前这件事**只写进日志**，用户在控制台上完全看不到——数据、桶、回收站
     // 会整体换成另一个目录的内容，却没有任何提示。现在在切换发生的那一刻就报出来。
     if (session.root_switched) {
-        std::fprintf(stderr,
-                     "\n注意：服务的数据根已切换\n"
-                     "  原来：%s\n"
-                     "  现在：%s\n"
-                     "原因是「数据根由 CLI 声明」：谁连上服务，服务就用谁的目录。\n"
-                     "如果这不是你想要的，请用数据根正确的那个 fmt.exe 再执行一条命令切回去。\n\n",
-                     session.previous_root.c_str(), to_forward_slashes(options.data_root).c_str());
+        std::fprintf(stderr, "%s", root_switch_notice(session.previous_root,
+                                                      to_forward_slashes(options.data_root))
+                                      .c_str());
     }
 
     session.connected = true;
@@ -1197,5 +1193,14 @@ int run(const std::vector<std::string>& args, const Options& options) {
 // 必须定义在匿名命名空间**外面**（banner_text 在里面，但那里面的名字对外不可见，
 // 声明在 cli.hpp 里的函数不能跟着进去——否则链接期找不到符号）。
 std::string version_text() { return banner_text(); }
+
+std::string root_switch_notice(const std::string& previous, const std::string& current) {
+    std::string text = "\n注意：服务的数据根已切换\n";
+    text += "  原来：" + previous + "\n";
+    text += "  现在：" + current + "\n";
+    text += "原因是「数据根由 CLI 声明」：谁连上服务，服务就用谁的目录。\n";
+    text += "如果这不是你想要的，请用数据根正确的那个 fmt.exe 再执行一条命令切回去。\n\n";
+    return text;
+}
 
 }  // namespace fmt::cli
