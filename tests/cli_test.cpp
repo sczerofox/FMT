@@ -8,6 +8,17 @@
 #include "fmt/core/path.hpp"
 #include "fmt_test.hpp"
 
+FMT_TEST(Cli, 版本文本只有一个来源) {
+    // 横幅、`--version`、`version` 命令都调 version_text()：分开写就会漂移
+    //（以前窗口里敲 version 是「未知命令」，而 --version 能用）。
+    const std::string text = fmt::cli::version_text();
+    FMT_CHECK(text.find("File Manager Tool") != std::string::npos);
+    FMT_CHECK(text.find("v1.0") != std::string::npos);
+    FMT_CHECK(text.find("build") != std::string::npos);
+    // 构建日期由 CMake 在配置时生成，所以只断言长度，不钉具体日期
+    FMT_CHECK(text.size() > 30);
+}
+
 FMT_TEST(Cli, 位置参数的信封形状) {
     const nlohmann::json positional = nlohmann::json::array({"a7.jpg"});
 

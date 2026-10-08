@@ -78,6 +78,13 @@ bool is_elevated();
 // 把一行命令切成参数；支持双引号包裹带空格的参数。
 std::vector<std::string> split_command(const std::string& line);
 
+// 版本一行（程序名 + 版本 + 构建日期）。**三处共用同一份文本**：
+//   * 交互窗口开头的横幅
+//   * 一次性 `fmt.exe --version` / `-v`
+//   * 命令 `version`（窗口里敲，或 `fmt.exe version`）
+// 分开写就会漂移，所以只留这一个来源。
+std::string version_text();
+
 // 提权执行一条 service 命令，结果经临时文件回传（见 §13.8.5）。
 struct ElevatedOutcome {
     bool ok = true;

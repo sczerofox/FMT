@@ -21,8 +21,8 @@ namespace {
 Logger* g_logger = nullptr;
 }  // namespace
 
-nlohmann::json argument_envelope(const nlohmann::json& positional, bool dry_run, bool force) {
-    // 开关必须与 argv **同级**。以前这里写成 `args = positional; args["dry_run"] = true;`，
+// 版本文本的**唯一来源**：横幅、--version、version 命令都走它。
+nlohmann::json argument_envelope(const nlohmann::json& positional, bool dry_run, bool force) {    // 开关必须与 argv **同级**。以前这里写成 `args = positional; args["dry_run"] = true;`，
     // 而 positional 是数组——nlohmann 对数组用字符串下标会抛 type_error.305，
     // 未捕获就是 abort()：用户敲 `file delete a7.jpg` 时弹出的那个 Debug Error 就是它。
     nlohmann::json args = nlohmann::json::object();
@@ -102,7 +102,7 @@ std::string banner_text() {
            std::string(version::MINOR) + "  ( build  " + std::string(version::BUILD_DATE) + " )";
 }
 
-void print_version() { std::printf("%s\n", banner_text().c_str()); }
+void print_version() { std::printf("%s\n", version_text().c_str()); }
 
 // 命令总览：只列命令、不加描述；细节用 help <命令>。
 void print_command_list() {
@@ -112,6 +112,7 @@ void print_command_list() {
     std::printf("  (file)     upload  list  get  delete\n");
     std::printf("  (trash)    list  get  restore  delete\n");
     std::printf("  (help)     help [命令]\n");
+    std::printf("  (version)  version                打印版本与构建日期\n");
     std::printf("  (exit)     exit  quit\n");
     std::printf("\n业务命令（服务端尚未实现，现在会返回 FMT-602）：\n");
     std::printf("  (share)    create  get  list  delete\n");
@@ -135,6 +136,15 @@ bool print_command_help(const std::string& topic) {
     }
     if (topic == "exit" || topic == "quit") {
         std::printf("exit / quit —— 退出命令行窗口\n");
+        return true;
+    }
+    if (topic == "version") {
+        std::printf(
+            "version —— 打印程序名、版本与构建日期\n"
+            "  与启动横幅、`--version` 共用同一份文本，不会各说一套。\n"
+            "  不需要服务在运行，也不写任何磁盘内容：\n"
+            "    fmt.exe version          一次性执行\n"
+            "    fmt> version             窗口里执行\n");
         return true;
     }
     if (topic == "help") {
@@ -884,6 +894,10 @@ int run_interactive(const Options& options, service::State state, Session& sessi
             }
             continue;
         }
+        if (head == "version" || head == "--version" || head == "-v") {
+            std::printf("%s\n", version_text().c_str());
+            continue;
+        }
         if (head == "service") {
             if (parts.size() >= 2 && parts[1] == "status") {
                 show_service_status();  // 查询不需要提权
@@ -1104,6 +1118,11 @@ int run(const std::vector<std::string>& args, const Options& options) {
         print_version();
         return 0;
     }
+    if (!args.empty() && args[0] == "version") {
+        // 与 --version 同源：不需要服务、不碰磁盘（所以放在开日志器之前）
+        print_version();
+        return 0;
+    }
 
     // 双击：先把数据根补齐（含 log/），再开日志器——这样「新建目录」的清单是
     // 完整的六个，这些行也不会因为日志器还没开而丢掉。
@@ -1143,5 +1162,10 @@ int run(const std::vector<std::string>& args, const Options& options) {
     set_logger(nullptr);  // 先摘掉指针，再让 file_logger 析构
     return code;
 }
+
+// 版本文本的**唯一来源**：横幅、--version、version 命令都走它。
+// 必须定义在匿名命名空间**外面**（banner_text 在里面，但那里面的名字对外不可见，
+// 声明在 cli.hpp 里的函数不能跟着进去——否则链接期找不到符号）。
+std::string version_text() { return banner_text(); }
 
 }  // namespace fmt::cli
