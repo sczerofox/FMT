@@ -45,14 +45,31 @@ FMT_TEST(Server, 未知路由返回错误信封) {
 
     httplib::Client client("127.0.0.1", server.port());
 
-    // 尚未实现的业务路由
+    // 已知模块但没这个接口 → **501 Not Implemented**
+    //（原来是 500，等于说「服务器坏了」；而这只是「这个接口没做」）
     const auto pending = client.Get("/api/file/list");
     FMT_CHECK(pending != nullptr);
     if (pending != nullptr) {
-        FMT_CHECK_EQ(pending->status, 500);
+        FMT_CHECK_EQ(pending->status, 501);
         const nlohmann::json body = nlohmann::json::parse(pending->body);
         FMT_CHECK(!body["ok"].get<bool>());
         FMT_CHECK_EQ(body["error"]["code"].get<std::string>(), std::string("FMT-602"));
+    }
+
+    // share 整组还没实现：同样 501，不是 500
+    const auto share = client.Get("/api/share/x");
+    FMT_CHECK(share != nullptr);
+    if (share != nullptr) {
+        FMT_CHECK_EQ(share->status, 501);
+    }
+
+    // 完全打错的 /api 路径 → **404 Not Found** + FMT-017
+    const auto unknown = client.Get("/api/nosuch");
+    FMT_CHECK(unknown != nullptr);
+    if (unknown != nullptr) {
+        FMT_CHECK_EQ(unknown->status, 404);
+        const nlohmann::json body = nlohmann::json::parse(unknown->body);
+        FMT_CHECK_EQ(body["error"]["code"].get<std::string>(), std::string("FMT-017"));
     }
 
     // 完全不存在的路径

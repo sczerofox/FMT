@@ -19,6 +19,7 @@ constexpr Entry kTable[] = {
     // ---- FMT-0xx 通用、JSON、路径 ----
     {ErrorCode::InvalidArgument, "InvalidArgument", 2, "参数错误"},
     {ErrorCode::ConfirmRequired, "ConfirmRequired", 2, "该操作需要显式确认（force）"},
+    {ErrorCode::RouteNotFound, "RouteNotFound", 3, "没有这个接口"},
     {ErrorCode::FileNotFound, "FileNotFound", 3, "文件不存在"},
     {ErrorCode::FileAlreadyExists, "FileAlreadyExists", 4, "文件已存在"},
     {ErrorCode::PermissionDenied, "PermissionDenied", 5, "权限不足"},

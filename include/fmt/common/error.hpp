@@ -35,6 +35,7 @@ enum class ErrorCode : int {
     PathEscape = 14,               // 路径穿越               退出码 2
     ConsistencyError = 15,         // 数据一致性异常         退出码 6
     ConfirmRequired = 16,          // 该操作需要显式确认     退出码 2
+    RouteNotFound = 17,            // 没有这个接口（HTTP 404）退出码 3
 
     // ---- FMT-1xx 文件名校验 ----
     FileNameEmpty = 100,           // 文件名为空             退出码 2

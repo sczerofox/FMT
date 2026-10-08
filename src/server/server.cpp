@@ -69,6 +69,12 @@ int http_status_for(ErrorCode code) {
         case ErrorCode::Md5Duplicate:
         case ErrorCode::RestoreConflict:
             return 409;
+        case ErrorCode::RouteNotFound:
+            return 404;
+        case ErrorCode::ServiceOperationFailed:
+            // 「服务端还没实现这个接口」是 501，不是 500：500 等于说服务器坏了，
+            // 而真相是这个功能还没做（share 就属于这一类）。
+            return 501;
         default:
             return 500;
     }
@@ -324,10 +330,26 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
     // 兜底：已经登记的模块里还没实现的操作。
     impl_->server->Get(R"(/api/.*)", [](const httplib::Request& request,
                                         httplib::Response& response) {
-        response.status = 500;
+        // 兜底路由要分清两件事（原来一律 500，等于告诉调用方「服务器坏了」）：
+        //   已知模块但还没实现（例如 /api/share/...）→ 404? 不：**501** Not Implemented
+        //   完全没这个路径（例如打错字）            → **404** Not Found
+        const std::string& path = request.path;
+        const bool known_module =
+            starts_with(path, "/api/bucket") || starts_with(path, "/api/file") ||
+            starts_with(path, "/api/trash") || starts_with(path, "/api/share") ||
+            starts_with(path, "/api/config") || starts_with(path, "/api/server") ||
+            starts_with(path, "/api/preview");
+        if (known_module) {
+            response.status = 501;
+            response.set_content(
+                dump(envelope_error(make_error(ErrorCode::ServiceOperationFailed,
+                                               "接口尚未实现：" + path))),
+                kJsonContentType);
+            return;
+        }
+        response.status = 404;
         response.set_content(
-            dump(envelope_error(make_error(ErrorCode::ServiceOperationFailed,
-                                           "操作尚未实现：" + request.path))),
+            dump(envelope_error(make_error(ErrorCode::RouteNotFound, "没有这个接口：" + path))),
             kJsonContentType);
     });
 
