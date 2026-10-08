@@ -3,11 +3,13 @@
 > 项目名称：FMT
 > 项目类型：Windows 文件管理系统
 > 文档定位：**本次重构（V1 重构版）的差异说明与冻结决策索引**
-> 状态：冻结，作为阶段 2 / 阶段 3 的编码依据；**阶段 2～5（上）已实现并提交**
+> 状态：冻结，作为阶段 2 / 阶段 3 的编码依据；**阶段 2～5 已实现并提交**
 > （阶段 4 = Bucket，commit 32249ea；**Bucket 删除/回退的回收站形状与桶级 `trash list` / `trash restore`
 > 随后落地，commit c2d545d**；桶级 `trash get` / `trash delete` 收尾于 `4fee290`；
-> **阶段 5 的 `file` 四条命令与上传两段式在 commit `188e85d` 落地**），
-> 下一步是阶段 5 剩下的 `share` 与阶段 7 的**文件级** trash 读取侧
+> **阶段 5 的 `file` 四条命令与上传两段式在 commit `188e85d` 落地**；
+> 保留形状与回收站路径 `9c3d2cb`、**预检与确认 `711da4c`**（缺口收尾 `6a40742`）、
+> **回收站两级读侧 `0fc242b`**），
+> 下一步只剩阶段 5 的 `share` 与阶段 7 的「永久删除时清理 `share.json`」
 > 分支：`arch-restart`（基线 `bdbe33d`，旧实现保留在 `dev`）
 
 本文档不替代三份主文档，只回答一个问题：**相对旧设计，这次改了什么、为什么改、按什么顺序做。**
@@ -85,6 +87,8 @@ share 清理（第 10 节）。
 | 23 | **上传支持 `http://`、`https://` 或本机路径（提交 `188e85d`，`a2b6cd1` 再改口径）**：**`https://` 现在支持**——原口径「`https://` 返回 `FMT-300 UrlInvalid`（V1 不引入 OpenSSL）」**已被 `a2b6cd1` 推翻**。下载改由 `include/fmt/common/http_client.hpp` + `src/common/http_client.cpp` 的 **WinHTTP + Schannel** 流式 GET 客户端完成（`src/common/CMakeLists.txt` 链 `winhttp`；`src/file/CMakeLists.txt` **不再链 cpp-httplib**，浏览器服务端仍用它）。**为什么换**：`cpp-httplib` 的 `Client` 走 https 必须 OpenSSL，自己编要 Perl + NASM，破坏「只依赖 vendored 单头文件、离线可构建」；静态链接 OpenSSL 虽不引 DLL，但 `/MT` 与常见 `/MD` 静态包混 CRT 会出问题。WinHTTP 是**系统组件**，TLS 走 **Schannel**（系统证书库），**不分发任何 DLL**，还自动使用系统代理（`AUTOMATIC_PROXY`，失败退回 `DEFAULT_PROXY`）。**判定顺序**：`http://` 或 `https://` → 下载；含 `"://"` 但不是 http/https → `FMT-300`（**不是 `FMT-002`**）；其余 → 本地路径，存在性不过 → `FMT-002`。行为：只有 2xx 的响应体交给 sink（非 2xx 直接丢弃）、sink 返回 false 即中止（返回成功且 `aborted=true`，被拒的那块不计入 `bytes`）、显式要求 `Accept-Encoding: identity`（服务器仍压缩 → `FMT-301`）、超时 → `FMT-302`、证书类失败读 `WINHTTP_OPTION_SECURITY_FLAGS` 给准提示、URL 带用户名密码不接受。`file.upload` 用 `ipc::kUploadTimeoutMs = 30 分钟`（其余命令仍 30 秒，见第 9 节末）。**文件名可省略**：省略时从来源推断（砍 `scheme://host` → 去查询串/锚点/结尾斜杠 → 取最后一段 → 百分号解码），**绝不拿主机名当文件名**；推断为空 → `FMT-100`，要求用户显式给名字。**MD5 去重与重名判断的作用域都是「同用户 + 任何 Bucket + 正常文件」**（不是桶内），分别回 `FMT-304` / `FMT-105`，都不自动改名 |
 | 24 | **Bucket 名称统一小写（提交 `9c3d2cb`）**：`BucketService::create()` 先把名称按 **ASCII 折叠**转小写、再校验、再建目录（`create WORK` 建成 `work`），返回值从 `Status` 改成 `Result<BucketCreation>`（`{requested, name, renamed, became_current}`），`renamed` 为真时 `bucket.create` 的 `data` 带 `note`（「Bucket 名称统一使用小写：已把 WORK 转为 work」）、CLI 单独打一行 `提示：…`；`use` / `get` / `delete` 一律经 `canonical_name()` 规范化到**磁盘上的实际名字**（不区分大小写地扫桶目录，找不到才退回小写形式），所以 `current_bucket`、`file.json` 的 `bucket`、`.original` 的 `original` **只有一份拼写**；`bucket.use` 的 `bucket` 字段回的是规范化后的名字，被改过时也给 `note` |
 | 25 | **`fmt-YYYYMMDD-N` 是保留形状（提交 `9c3d2cb`）**：文件名与 `file_id` 同形会被 `validate_file_name()` 拒绝（新错误码 `FMT-106 FileNameLikeFileId`，退出码 2，判定函数 `looks_like_file_id()`），理由与 Windows 保留设备名同类——定位是「先按 `file_id` 查、查不到再按名字查」，同名会遮住名字这一路。旧数据里已经存在的这种名字，`file delete` 在两个索引命中**不同**记录时报 `FMT-001`，消息里点名两条记录并让用户直接用 `file_id`；**只给 delete 加**（`locate_record()` 只被 `remove()` 用），`file get` 的两种查询范围保持不变（只读查询最坏是把 id 命中的那条给用户看，破坏性操作不能猜）。`file get` 对回收站里的记录另返回 `trash_path`（相对数据根、正斜杠），仓库里找不到时**不返回** `path` |
+| 26 | **先检查 → 说清楚冲突的具体对象 → 再确认（提交 `711da4c`；缺口收尾 `6a40742`）**：`file.delete` / `trash.delete` / `bucket.delete` 三类破坏性 op 支持 **`args.dry_run = true`**（HTTP `?dry_run=1`，由 `src/server/server.cpp` 的 `delete_args()` 解析，同时保留 `?force=1` 与请求体 `{"force":true}`）。服务端返回**只读预检**：`file.delete` → `FileDeleteCheck`（`ambiguous` / `other_bucket` / `blocked` / `needs_confirm` / `current_bucket` / `file_id` / `file_name` / `bucket` / `path` / `candidates[]` / `message`）；`trash.delete` → `TrashCheck`（`needs_confirm` **恒为 true** + 条目 + 消息）；`bucket.delete` → `BucketDeleteCheck`（有内容才 `needs_confirm`）。CLI 的 `confirm_before_acting()` / `print_precheck()`：**连服务 → 发预检（零副作用）→ 打印情况 → 交互问 `确认执行？(y/N)` / 一次性要 `--yes` → 同意后才带 `force` 发真实请求**；用户在确认之前**一个破坏性请求都不会发出去**。**歧义（名字与 `file_id` 撞在两条记录上）是 `blocked` 而不是 `needs_confirm`**——y 无法表达「删哪一个」，只能让用户改用 `file_id`。**新错误码 `FMT-016 ConfirmRequired`**（退出码 2，HTTP 400）：缺 `force` 的永久删除 / 跨 Bucket 删除 / 非空桶删除返回它，**不再复用 `FMT-001`**。服务端**独立校验**：预检被绕过也拦得住（**预检负责「说清楚」，force 负责「兜底」**）。顺带：跨 Bucket 成功时 `message` 带 `（Bucket：<桶>）`、`data` 增加 `bucket` 字段 |
+| 27 | **回收站是一份两级视图（提交 `0fc242b`）**：新建 `include/fmt/trash/trash.hpp` + `src/trash/trash.cpp` 的 `TrashService`，**组合** `FileService`（文件级）与 `BucketService`（桶级），合并成统一 `TrashEntry`（`type` / `id` / `name` / `bucket` / `deleted_at` / `bytes` / `files` / `present` / `restorable` / `trash_path` / `message`）并做**跨命名空间标识解析**（① 回收站目录名 → ② `file_id` → ③ 桶原名 → ④ 文件名；③④ 多条 → 候选）。**权威来源**：文件级 = `file.json`（新增 `deleted_at` 字段），桶级 = `trash/<user>/.original`；**`data/trash.json` 不再写入**（只读兼容老记录，回退/永久删除时顺手清掉）。`trash.list` → `{entries, count, files, buckets}`、`get`/`restore`/`delete` → `{entry, message?}`、预检 → `{needs_confirm, blocked, entry, message?}`，**旧的 `deleted_buckets` 与顶层 `trashed`/`original`/`files`/`bytes` 形状作废**。`trash list` 必须标出 `[文件]` / `[桶]`。回退的三种硬拒绝（同名冲突 `FMT-401`、随桶删除 `FMT-402`、数据缺失 `FMT-002`）都是 `blocked`；`bucket.delete` 也新增预检（有内容时提醒「之后只能整体恢复这个桶」） |
 
 
 ---
@@ -202,10 +206,15 @@ settle_state() 返回落定后的 State，回来仍是等待类就说明「没�
 `message` + 相关字段，`get` 回 `{bucket, is_current, path}`；
 **`bucket.delete` 的 `data` 增加 `trashed_name`，`message` 是
 `Bucket 已删除（移入回收站）：<原名>  ->  <回收站名>`**；
-`trash.list` 回 `{deleted_buckets:[{trashed, original, deleted_at, present}], count}`，
-`trash.restore` 回 `{trashed, original, restored_to, message}`；
-**`trash.get` 回 `{trashed, original, deleted_at, present, path, files, bytes}`，
-`trash.delete` 回 `{trashed, original, removed_files, removed_records, message}`**）。
+`trash` 四条的 `data` 在**提交 `0fc242b` 起统一成一份条目形状**：
+`trash.list` 回 `{entries:[{type,id,name,bucket,deleted_at,bytes,files,present,restorable,trash_path?,reason?}], count, files, buckets}`，
+`trash.get` 回 `{entry}`，`trash.restore` / `trash.delete` 回 `{entry, message}`，
+`dry_run` 预检回 `{needs_confirm, blocked, entry, message?}`
+（**原来的 `deleted_buckets` 与顶层 `trashed` / `original` / `restored_to` / `removed_files` /
+`removed_records` 形状全部作废**）。`bucket.delete` 的 `dry_run` 回
+`{bucket, is_current, files, bytes, has_content, needs_confirm, blocked, message?}`；
+`file.delete` 的 `dry_run` 回
+`{ambiguous, other_bucket, blocked, needs_confirm, current_bucket, file_id?, file_name?, bucket?, path?, candidates[]?, message?}`。
 **提交 `9c3d2cb` 起 `bucket.create` / `bucket.use` 的 `data` 增加 `note`**（只在名称被规范化时出现，
 形如 `"note": "Bucket 名称统一使用小写：已把 WORK 转为 work"`），`create` 回的 `bucket` 是**实际建成的名字**、
 `use` 回的 `bucket` 是**规范化后的名字**；CLI 把 `note` 打成单独一行 `提示：…`。
@@ -222,11 +231,14 @@ file.get      args.argv = [<file_id 或 文件名>]            ← 先当 file_i
                                                             查不到再当文件名查（当前用户 +
                                                             正常文件）；命中回收站记录时
                                                             另回 trash_path
-file.delete   args.argv = [<file_id 或 文件名>]            ← 软删除，**不需要 force**；
-                                                            提交 0ad9efc 起与 file.get 同一套
-                                                            定位规则（locate_record()）；
+file.delete   args.argv = [<file_id 或 文件名>]            ← 软删除；提交 0ad9efc 起与 file.get
+                                                            同一套定位规则（locate_record()）；
                                                             提交 9c3d2cb 起两者同时命中
-                                                            **不同**记录 → FMT-001 报歧义
+                                                            **不同**记录 → FMT-001 报歧义。
+                                                            提交 711da4c 起：同桶**不需要 force**，
+                                                            **跨 Bucket 需要 force**，否则
+                                                            → FMT-016 ConfirmRequired；
+                                                            支持 args.dry_run = true（只读预检）
 ```
 
 `file.upload` 是唯一不落在 `execute_business()` 里的 op：运行体 `ServerRuntime::run_upload()`
@@ -235,12 +247,15 @@ file.delete   args.argv = [<file_id 或 文件名>]            ← 软删除，*
 只处理 `file.list` / `file.get` / `file.delete`。
 
 > 原口径「`trash.get` / `trash.delete`（永久删除）仍未实现，返回 `FMT-602`（阶段 7）」
-> **已作废**（提交 `4fee290`）：桶级四条 trash 命令全部可用。**提交 `188e85d` 之后范围再收一次**：
-> 仍未实现的只有**文件级**条目（`file delete` 产生的）的 list/get/restore/delete，
-> 属阶段 7——注意 `file delete` 自己**已经可用**，它只是「写得进、读不出」。
-> **永久删除必须先确认**：服务端要求请求带 `force == true`（否则 `FMT-001` / 退出码 2），
-> CLI 交互窗口问一次、一次性命令必须 `--yes`，HTTP 用 `?force=1` 或 `{"force":true}`；
-> 删除顺序是「先删目录、再清 `trash_reason="bucket"` 的 file.json 记录、最后摘
+> **已作废**（提交 `4fee290`）：桶级四条 trash 命令全部可用。**提交 `0fc242b` 之后范围再收一次**：
+> **文件级条目也能 list / get / restore / delete 了**（`TrashService` 把两级合成一份视图，
+> `trash.list` 回 `{entries, count, files, buckets}`、单条回 `{entry, message?}`，
+> 旧的 `deleted_buckets` 形状作废）。原口径「文件级写得进、读不出、属阶段 7」**已作废**。
+> **破坏性操作要先确认**（提交 `711da4c`）：服务端要求请求带 `force == true`，否则
+> **`FMT-016 ConfirmRequired`**（退出码 2，HTTP 400；原来记的是 `FMT-001`）；
+> CLI 先发一次只读预检（`args.dry_run`）把情况说清楚，再问 `y/N`，一次性命令必须 `--yes`，
+> HTTP 用 `?force=1` 或 `{"force":true}`、预检用 `?dry_run=1`；
+> 桶级删除顺序是「先删目录、再清 `trash_reason="bucket"` 的 file.json 记录、最后摘
 > `trash/<user>/.original`」——**文件级（`trash_reason="file"`）的记录绝不动**。
 
 `hello` 的响应 `data` 里带两个新字段：
@@ -275,20 +290,28 @@ POST   /api/bucket                → bucket.create   body: {"name":"工作"} �
 GET    /api/bucket/<name>         → bucket.get
 POST   /api/bucket/<name>/use     → bucket.use
 DELETE /api/bucket/<name>         → bucket.delete
-GET    /api/trash                 → trash.list
-POST   /api/trash/<名字>/restore  → trash.restore <名字>   （路径参数百分号解码）
-GET    /api/trash/<名字>          → trash.get <名字>       （提交 4fee290）
-DELETE /api/trash/<名字>          → trash.delete <名字>    （提交 4fee290）
+GET    /api/trash                 → trash.list               （0fc242b 起 returns entries/…）
+POST   /api/trash/<标识>/restore  → trash.restore <标识>    （路径参数百分号解码；
+                                    ?dry_run=1 只预检）
+GET    /api/trash/<标识>          → trash.get <标识>        （提交 4fee290；0fc242b 起两级通用）
+DELETE /api/trash/<标识>          → trash.delete <标识>     （提交 4fee290；0fc242b 起两级通用）
                                     需 ?force=1（或 force=true）或 body {"force":true}，
-                                    否则 400 + FMT-001
+                                    否则 400 + **FMT-016**（提交 711da4c 起，原来记的是 FMT-001）；
+                                    ?dry_run=1 只预检
 GET    /api/file                  → file.list               （提交 188e85d）
 POST   /api/file                  → file.upload             body: {"url":"…"} 或 {"path":"…"}，
                                     可带 "file_name"（可省略 → 服务端从来源推断）
 GET    /api/file/<id_or_name>     → file.get                （路径参数百分号解码）
-DELETE /api/file/<file_id_or_name> → file.delete            （**软删除、不需要 force**；
-                                    提交 0ad9efc 起路径参数也可以是文件名，
-                                    路由正则没改，仍是 ([^/]+) + url_decode()）
+DELETE /api/file/<file_id_or_name> → file.delete            （同桶软删除不需要 force；
+                                    跨 Bucket 需要 force，否则 400 + **FMT-016**；
+                                    ?dry_run=1 只预检；提交 0ad9efc 起路径参数也可以是
+                                    文件名，路由正则没改，仍是 ([^/]+) + url_decode()）
 ```
+
+> **`DELETE` 的公共参数（提交 `711da4c` / `0fc242b`）**：`src/server/server.cpp` 的
+> `delete_args()` 统一解析 `?dry_run=1`（只预检）与 `?force=1` / `force=true` /
+> 请求体 `{"force":true}`（已确认），`/api/trash/<标识>` 与 `/api/file/<标识>` 共用；
+> 翻译成 `args.dry_run` / `args.force` 后交给同一份业务实现。
 
 - **路径参数里的中文会被客户端百分号编码**（`/api/bucket/%E5%B7%A5%E4%BD%9C`），
   服务端必须先用 `common/string` 的 `url_decode` 还原成 UTF-8 再当业务参数用；
@@ -306,10 +329,12 @@ DELETE /api/file/<file_id_or_name> → file.delete            （**软删除、�
   所以上传不会再把 `bucket list` 与其它 HTTP 业务请求一起堵住。
 
 `file` / `share` / `config` 的 `/api/*` 路由仍是**设计约定**，随阶段 6、7 落地细化；
-**桶级回收站的四条路由已落地**：`GET /api/trash`（列条目）、`POST /api/trash/<名字>/restore`
-（回退）、`GET /api/trash/<名字>`（条目详情）、`DELETE /api/trash/<名字>`（永久删除，需要
-`?force=1` 或请求体 `{"force":true}`，否则 `400 + FMT-001`）——路径参数由服务端 `url_decode`
-解码；后两条在收尾提交 `4fee290` 补齐（原口径「属阶段 7，现在返回 `FMT-602`」**已作废**）；
+**`/api/trash` 四条路由两级都已落地**：`GET /api/trash`（列 `entries`）、
+`POST /api/trash/<标识>/restore`（回退）、`GET /api/trash/<标识>`（条目详情）、
+`DELETE /api/trash/<标识>`（永久删除，需要 `?force=1` 或请求体 `{"force":true}`，
+否则 `400 + FMT-016`；`?dry_run=1` 只预检）——路径参数由服务端 `url_decode` 解码，
+标识解析见 `FMT 技术文档.md` 第 10.4 节；桶级四条在 `4fee290` 补齐、
+文件级在 `0fc242b` 打通（原口径「属阶段 7，现在返回 `FMT-602`」**已作废**）；
 **`/api/file` 四条已在提交 `188e85d` 落地**（`GET` / `POST /api/file`、
 `GET /api/file/<id_or_name>`、`DELETE /api/file/<file_id_or_name>`——路径参数名在
 `0ad9efc` 放宽成「也可以是文件名」），所以上面那句「设计约定」
@@ -568,7 +593,8 @@ CLI 侧 service::last_start_failure() 读回该编号 → code_from_number → �
 │                            落地文件级删除后，桶级扫描会把 trash/<user>/<bucket>/
 │                            当成「孤儿桶条目」列出来；桶级扫描跳过点开头的条目，
 │                            并且只认 <名字>_<14 位时间戳>（可带 _<1-3 位序号>）形状的目录
-│                            代价：文件级条目也因此一条都列不出来（读取侧属阶段 7）
+│                            代价：文件级条目因此长期列不出来——**已在提交 0fc242b 解决**
+│                            （src/trash/ 的 TrashService 把两级合成一份视图）
 ├── config/
 │   ├── config.json          version / current_user / current_bucket /
 │   │                        max_upload_size / size_unit / language
@@ -584,13 +610,13 @@ CLI 侧 service::last_start_failure() 读回该编号 → code_from_number → �
 │   │                          fmt-YYYYMMDD-N 片段推出（技术文档 8.5）
 │   ├── share.json           {"version":1,"shares":[]}
 │   └── trash.json           {"version":1,"trash":[]}
-│                            只为**文件级**条目服务（阶段 5 起）；
-│                            提交 188e85d 起 file delete 真的会往这里追加
-│                            type="file" 的记录（file_id / file_name /
-│                            original_path / trash_path / deleted_at）；
-│                            但**读取侧还没做**：trash list/get/restore 只认桶级条目
-│                            Bucket 级记录（旧 type=bucket）**作废**：
-│                            桶级身份改记 trash/<user>/.original
+│                            **提交 0fc242b 起不再写入**：文件级条目的权威是 file.json
+│                            （is_trash / trash_reason / deleted_at，路径由 file_id 推出）；
+│                            这里保留为**只读兼容**（老记录里的 deleted_at，回退/永久删除
+│                            时顺手清掉）。原口径「file delete 往这里追加 type=file 的记录、
+│                            trash list/get/restore 只认桶级」**已作废**：
+│                            Bucket 级记录（旧 type=bucket）更早已作废，
+│                            桶级身份记在 trash/<user>/.original
 ├── log/
 │   ├── fmt.log              Service 与 CLI 追加同一个文件
 │   └── error.log            仅 ERROR 级
@@ -641,7 +667,7 @@ CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位�
 | `ShellExecuteExW` 其它失败 / 结果文件不存在（提权副本崩了） | `FMT-602 ServiceOperationFailed` | 8 |
 | 需要管理员权限（打印「需要管理员权限」，或 `ShellExecuteExW` 失败且 `ERROR_ACCESS_DENIED` 5） | `FMT-603 AdminRequired` | 5 |
 | 用户在 UAC 点「否」（`ERROR_CANCELLED` 1223） | `FMT-004 PermissionDenied` | 5 |
-| 永久删除回收站条目（`trash delete`）**没有显式确认** | `FMT-001 InvalidArgument`（「永久删除不可恢复，需要确认（force = true）」） | 2 |
+| **需要显式确认的操作缺 `force`**——永久删除（两级 `trash delete`）、跨 Bucket 的 `file delete`、非空桶的 `bucket delete`（提交 `711da4c`） | **`FMT-016 ConfirmRequired`**（默认消息「该操作需要显式确认（force）」；具体消息说明要确认什么，例如「永久删除不可恢复，需要确认（force = true）」「<预检消息>；确认删除请加 force（CLI：--yes）」；**HTTP 400**） | 2 |
 | 回收站条目不存在（`trash get` / `trash delete` 也走它，不只是回退） | `FMT-400 TrashEntryNotFound` | 3 |
 | 上传时来源协议不是 http/https（如 `ftp://`，提交 `a2b6cd1`；原文此处写的是 `https://`，已作废） | `FMT-300 UrlInvalid`（「只支持 http:// 与 https:// 的来源：<来源>」；**不是 `FMT-002`**） | 2 |
 | 上传时 URL 带用户名密码 / 端口非法 / 缺主机名（提交 `a2b6cd1`） | `FMT-300 UrlInvalid` | 2 |
@@ -668,10 +694,10 @@ CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位�
 | 2 | `common`（Error / Result / Time / String / Path / Logger）、`config`、`storage`、`core` 初始化 | 能在指定数据根建出六个目录（`repository/` `trash/` `config/` `data/` `log/` `temp/`）+ 默认 JSON（**`ensure_root`/`check_root` 由 Service 与 CLI 共用**，第二次运行日志里只多一行「数据根完整」、控制台无输出）；JSON 损坏报 7 且不动原文件 | ✅ 完成 |
 | 3 | `service`（SCM 五命令 `install`/`uninstall`/`start`/`stop`/`status` + 统一查询接口 `query_status()`/`query_state()`/`installed_binary_path()`/`last_start_failure()` + 按 `dwWaitHint` 自适应的 `settle_state()` + ServiceMain + 失败编号上报 `dwServiceSpecificExitCode` + Recovery + 服务状态文件）、`ipc`（管道 + 安全描述符）、`cli`（循环、横幅 `File Manager Tool  v1.0  ( build  <日期> )`、`help` 总览与分组详情、单实例、提权、双击幂等体检与补齐、落定判定与 reinstall 兜底） | **全新环境双击 → 一次 UAC → 服务装好且开机自启 → 控制台干净（无「建了什么」）→ `service stop/start` 各弹一次 UAC、`service status` 不弹 UAC、输出与样例一致；`help` / `help service` 输出与样例一致；复制 exe 到新目录双击 → 在新目录建出数据，日志里有「数据根切换」** | ✅ 完成 |
 | 4 | `bucket` + `common/validation` 名称校验 | create / list / get / use / delete + `current_bucket`；Bucket 无独立 ID；删除移入回收站且**目录名一律带删除时间戳**（同秒冲突加 `_2`）；**Bucket 删除/回退的回收站形状**：`trash/<user>/.original` 是桶级记录唯一权威、回退**整单判定**（目标已存在 → `FMT-401`，不覆盖/不改名/不部分恢复）、`file.json` 增加 `trash_reason`、桶级 `trash list` / `get` / `restore` / `delete` 四条入口都在（`get` / `delete` 在提交 `4fee290` 补齐；永久删除要显式确认，顺序为「目录 → `trash_reason="bucket"` 的 file.json 记录 → `.original`」，文件级记录绝不动）；文件级条目落点定为 `trash/<user>/.files/<bucket>/YYYY/MM/DD/`（`PathManager::build` 的 `inner` 参数），桶级扫描跳点开头 + 只认 `<名字>_<14 位时间戳>`（可带 `_<1-3 位序号>`）形状；管道与 HTTP 两条入口行为一致；`current_bucket` 失效校验在**服务启动**与**数据根切换**时由运行体自动执行（失效置空、有效不动） | ✅ 完成（commit 32249ea；回收站形状 c2d545d；`trash get` / `trash delete` 与 `.files` 落点 4fee290；收尾 8a5e554、acc90a3，见 `FMT 技术文档.md` 第 18.15、18.17 节） |
-| 5 | `file` / `upload` / `trash` / `share` | 需求里的文件、分享、回收站。**桶级回收站的四条命令已在阶段 4 全部落地**（`trash list` / `get` / `restore` / `delete`，commit c2d545d + `4fee290`），阶段 5/7 补**文件级**条目：`trash list`/`get`/`restore`/`delete`（文件级口径）、文件级永久删除与文件级（逐个文件判定的）恢复、文件级条目落在 `trash/<user>/.files/<bucket>/YYYY/MM/DD/` 下。**开工前先定锁粒度**：阶段 4 是「两条入口共用一把互斥锁」，上传/下载持锁会挡住 `bucket list` 与浏览器请求（见第 12 节） | 🟡 **`file` 部分已完成，且 https 可用**（提交 `188e85d` + `a2b6cd1` + `0ad9efc` + `9c3d2cb`）：`file upload <来源> [文件名]` / `file list` / `file get <file_id\|文件名>` / `file delete <file_id\|文件名>` 四条都可用（上传两段式、MD5 去重、重名拒绝、软删除写文件级 trash 条目、存储日期由 `file_id` 推出；`file delete` 的参数在 `0ad9efc` 扩成两种、定位与 `file get` 一致——先 `file_id` 再文件名，名字在回收站 → `FMT-001` 带 `file_id`；**`9c3d2cb` 再补三处**：文件名与 `file_id` 同形 → 上传拒绝 `FMT-106`、`file delete` 两个索引命中不同记录 → `FMT-001` 报歧义、`file get` 对回收站记录回 `trash_path`；**来源 `http://` 与 `https://` 都支持**，走 WinHTTP + Schannel，不用 OpenSSL、不分发 DLL，见第 2 节第 23 项）；**锁粒度已定并落地**——「把长任务移出锁」的简化形态（第 12 节）。**剩下的**：`share` 整组（阶段 5）、**文件级 trash 的读取侧**（list/get/restore/delete 与永久删除，阶段 7）。**「https 不支持」不再是限制** |
+| 5 | `file` / `upload` / `trash` / `share` | 需求里的文件、分享、回收站。**桶级回收站的四条命令已在阶段 4 全部落地**（`trash list` / `get` / `restore` / `delete`，commit c2d545d + `4fee290`）；**文件级在提交 `0fc242b` 打通**：`src/trash/` 的 `TrashService` 把两级合成一份视图，`trash list`/`get`/`restore`/`delete` 两级通用、`list` 标出 `[文件]` / `[桶]`，文件级条目落在 `trash/<user>/.files/<bucket>/YYYY/MM/DD/` 下。**破坏性操作先检查再确认**（提交 `711da4c`：预检 + `FMT-016` + `y/N` / `--yes`）。**开工前先定锁粒度**：阶段 4 是「两条入口共用一把互斥锁」，上传/下载持锁会挡住 `bucket list` 与浏览器请求（见第 12 节） | 🟡 **`file` 与 `trash` 都已完成，且 https 可用**（提交 `188e85d` + `a2b6cd1` + `0ad9efc` + `9c3d2cb` + `711da4c` + `0fc242b`）：`file upload/list/get/delete` 四条都可用（上传两段式、MD5 去重、重名拒绝、软删除；`file delete` 跨 Bucket 要确认）；**`trash` 四条两级通用**（文件级与桶级合成 `TrashEntry`，回退的三种硬拒绝是 `blocked`）；**来源 `http://` 与 `https://` 都支持**（WinHTTP + Schannel）；**锁粒度已定并落地**——「把长任务移出锁」的简化形态（第 12 节）。**剩下的**：`share` 整组（阶段 5 剩下的部分）与永久删除时的 `share.json` 清理（阶段 7）。**「https 不支持」不再是限制** |
 
 | 6 | `server`（HTTP + Preview） | 浏览器可用（`/api/bucket` 五条 + `/api/trash` 四条 + `/api/file` 四条路由已在阶段 4、5 落地；下载/预览路由与页面仍未开始） | ⏳ 未开始 |
-| 7 | 文件级 Trash 收尾：文件级 `trash get` / 永久删除与文件级恢复；**永久删除时清理相关 Share**（`share.json`，第 60 节口径） | 文件级条目端到端可用；永久删除不留 share 残留 | ⏳ 未开始（**当前缺口**：share 模块属阶段 6，现在永久删除**没有**清理 `share.json` 的动作，只清 `file.json` 里 `trash_reason="bucket"` 的记录；**另一个缺口**：`file delete` 已在写文件级条目，但 `trash list` / `get` / `restore` 只认桶级条目，软删除的文件暂时看不到也恢复不了） |
+| 7 | 收尾：**永久删除时清理相关 Share**（`share.json`，第 60 节口径）+ 文件级口径的真机实测 | 永久删除不留 share 残留；两级回收站端到端实测通过 | ⏳ 未开始（**当前只剩一个缺口**：share 模块属阶段 6，现在永久删除**没有**清理 `share.json` 的动作，只清 `file.json` 里 `trash_reason="bucket"` 的记录。原缺口「文件级条目只写不读、软删除的文件看不到也恢复不了」**已在提交 `0fc242b` 关闭**：`trash list` / `get` / `restore` / `delete` 两级都能用，`list` 标出 `[文件]` / `[桶]`） |
 
 阶段 2 + 3 完成后，「双击即用的服务 + CLI」闭环成立。
 
@@ -709,6 +735,8 @@ CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位�
 | 26 | 名字 / 标识的比较是 `==` 精确比较（旧实现没意识到 Windows 的路径不区分大小写） | **一律改 `iequals()`（ASCII 折叠）**：`commit_upload()` 的重名判定、`get_by_name()`、`locate_record()` 的三处比较；桶侧 `list()` 的 `is_current`、`remove()` 的 `was_current`、`find_trashed()` 的两轮定位（提交 `5bf2c1f`） | **这是数据损坏修复，不是体验优化**：`doc.txt` 之后再传 `DOC.TXT` 时精确比较会放过，而两者在 Windows 上落到**同一个磁盘路径**——第二次上传**覆盖**第一个文件的字节，`file.json` 里第一条记录还写着旧的 `size`/`md5`，即**同一个磁盘文件被两条记录指向 + 字节被覆盖 + 元数据失真**。回归用例 `File.大小写不同的同名必须被当成重名` 先复现、后修复（`FMT 技术文档.md` 第 18.22 节、`FMT 开发文档.md` 第 38 节） |
 | 27 | `current_bucket` 存**用户敲的拼写**（`bucket use WORK` 存 `WORK`，而目录叫 `work`），文件级记录里的 `bucket` 与 `.original` 的 `original` 也就可能各留一份拼写；同形的文件名（`fmt-YYYYMMDD-N`）被「先查 id、再查名字」的第一步遮住，只能靠运气 | **提交 `9c3d2cb` 收口**：① Bucket 名称 `create` 时先按 ASCII 折叠转小写再建目录（`WORK` → `work`，`renamed` 为真时回 `note` 提示用户），`use` / `get` / `delete` 用 `canonical_name()` 规范化到**磁盘上的实际名字**——`current_bucket`、`file.json` 的 `bucket`、`.original` 的 `original` 只留一份拼写，restore 拼出来的目录名才一致；② 文件名与 `file_id` 同形 → 上传时按**保留形状**拒绝（`FMT-106`，与 Windows 保留设备名同类），旧数据里已经存在的这种名字在 `file delete` 报歧义（`FMT-001`，点名两条记录让用户用 `file_id`） | 目录不区分大小写，`WORK` 与 `work` 本来就是同一个目录；不统一拼写，记录之间会各留一份、日后比对与恢复都踩坑。名字与 `file_id` 同形则是定位规则本身的结构性歧义：一个文件叫 `fmt-20261008-0`、另一个文件的 `file_id` 恰好是它，按名字提交的删除就会删错对象 |
 | 28 | `iequals()` 把 `>= 0x80` 的字节交给 `std::tolower`（C locale 下虽是恒等，但一旦有人调 `setlocale` 就会把 UTF-8 名字改坏）；`file get` 对回收站记录只说「在回收站」不说在哪 | **提交 `9c3d2cb`**：`iequals()` 改成**只折叠 ASCII**（`>= 0x80` 原样比较）——这是「比较一律不区分大小写」那条口径的**实现约束**，中文名字不受影响；`file get` 命中的记录在回收站时**增加** `trash_path`（相对数据根、正斜杠），仓库里找不到该文件时**不返回** `path`（设计如此，不是缺失），CLI 多打一行「回收站路径：…」 | `setlocale` 一旦被调用，`std::tolower` 就会按当前 locale 改字节，UTF-8 多字节序列会被拆坏；「在回收站」配上「在回收站哪儿」才算可用信息 |
+| 29 | 破坏性操作（删文件、永久删除、删桶）要么直接执行、要么只问一句 `y/N`；跨 Bucket 按名字删除会**静默**删到别的桶；缺确认复用 `FMT-001`，脚本分不清「参数错」与「忘了确认」 | **提交 `711da4c`**：三类 op 都先发**只读预检**（`args.dry_run` / `?dry_run=1`），把「属于哪个桶、哪两条记录撞车、要永久删掉什么」原样打印，再问 `确认执行？(y/N)`（一次性命令要 `--yes`）；**用户同意前不发任何破坏性请求**；歧义 / 同名冲突 / 随桶删除 / 数据缺失算 `blocked`（y/N 解决不了，让用户改用 `file_id`）；新错误码 **`FMT-016 ConfirmRequired`**（退出码 2，HTTP 400），服务端仍独立校验 `force` | 「说清楚」和「兜底」是两件事：预检让用户知道自己在删什么，`force` 保证绕过预检的客户端也删不掉跨桶的东西。`FMT-016` 独立编号让脚本能区分「参数写错」与「忘了确认」 |
+| 30 | 回收站只有桶级能读（`deleted_buckets`），文件级「写得进、读不出」；权威散在 `trash.json`（第二份副本）与 `.original` 两处 | **提交 `0fc242b`**：新建 `src/trash/` 的 `TrashService`，把两级合成统一 `TrashEntry` 列表 + 跨命名空间标识解析；**权威改为「文件级 = `file.json`（含 `deleted_at`）、桶级 = `.original`」**，`data/trash.json` 不再写入（只读兼容）；`trash.list` 回 `{entries, count, files, buckets}` 并标出 `[文件]` / `[桶]`；回退的三种硬拒绝（`FMT-401` / `FMT-402` / `FMT-002`）都是 `blocked`；`bucket.delete` 也有预检（非空桶提醒「只能整体恢复这个桶」，缺 `force` → `FMT-016`） | 文件级条目本来就已经在 `file.json` 里有全部信息，再维护一份 `trash.json` 只会制造两个可能不一致的真相；两级合成一份视图，用户才不必先猜「这个名字是文件还是桶」 |
 
 ---
 
@@ -721,7 +749,7 @@ CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位�
 | 提权副本的结果通道细节 | **已定稿，从未决清单移出**：结果经结果文件 `<数据根>\temp\fmt-elev-<父进程 pid>.json` 回传（第 4.4 节），数据根不可写时退回 `%TEMP%` 同名文件并记一行 WARN；命名管道方案作废 |
 | 数据根切换的并发保护 | 目前依赖「只有一个 CLI 窗口」，多窗口场景不在本次范围 |
 | 名字长得像 `file_id` 时会被「先查 id」遮住 | **已定稿，从未决清单移出（提交 `9c3d2cb`，第 2 节第 25 项、第 11 节差异 #27）**：两条可选做法**都做了**，不是二选一——① 上传时拒绝形如 `fmt-YYYYMMDD-N` 的**保留形状**（`FMT-106 FileNameLikeFileId`，退出码 2，`looks_like_file_id()`；显式名与从来源推断的名字都拦）；② 旧数据里已经存在的这种名字，`file delete` 在两个索引命中**不同**记录时报 `FMT-001`「有歧义：…」并点名两条记录、让用户直接用 `file_id`。**只给 `file delete` 加**（`locate_record()` 只被 `remove()` 用）；`file get` 的两种查询范围保持不变（按 `file_id` 全局含回收站，按文件名只查当前用户的正常文件）——这是**有意的差异**：get 只读，最坏是把 id 命中的那条给用户看；delete 破坏性，不能猜 |
-| 按名字删除可能删到别的 Bucket 的文件（**待决，提交 `5bf2c1f` 之后记入**） | 名字的作用域是「同用户跨 Bucket」（第 4.2 节、`FMT 开发文档.md` 第 9.2、43 节），所以人在「生活」桶里敲 `file delete a.txt` 可能把「工作」桶里的 `a.txt` 删掉，而成功消息里只有文件名。可选做法（未定）：`message` 带上 Bucket，形如 `文件已移入回收站：a.txt（Bucket：工作）` |
+| 按名字删除可能删到别的 Bucket 的文件 | **已定稿，从未决清单移出（提交 `711da4c`，第 2 节第 26 项、第 11 节差异 #29）**：**跨桶要确认**——CLI 先发只读预检（`file.delete` + `dry_run`）打印「属于哪个桶、当前是哪个桶」，交互问 `y/N`、一次性要 `--yes`，服务端缺 `force` 返回 **`FMT-016 ConfirmRequired`**（退出码 2），成功后 `message` 与 `data.bucket` 都带归属。**不改成「按名字只在当前桶里找」**：那会让跨桶同名重新变成「文件不存在」，正是 `0ad9efc` / `5bf2c1f` 修掉的误导诊断；该改的是**提示**，不是把结果悄悄缩窄 |
 | `bucket use` 的拼写要不要规范化 | **已定稿，从未决清单移出（提交 `9c3d2cb`，第 2 节第 24 项、第 11 节差异 #27）**：**落盘时规范化成磁盘上的实际名字**。新增私有 `BucketService::canonical_name()`（不区分大小写地扫桶目录，返回磁盘上的实际拼写；找不到才退回 `to_lower()`），`use` 存进 `current_bucket` 的就是它（`use WORK` 存 `work`），`get` 返回的 `name`、`delete` 的回收站目录名与 `.original` 里的 `original` 同样用它——restore 拼出来的目录名才与原来一致。显示层原有的 `iequals()` 照旧（第 11 节差异 #26） |
 | **阶段 5 的锁粒度（开工前必须定）** | **已定，从未决清单移出（提交 `188e85d`）**：阶段 4 的并发形态是**管道连接级严格串行**、**HTTP 线程池并发**、**业务命令共用运行体的一把互斥锁**（互斥不是队列）。原来的代价是「一个慢命令卡住两条入口的所有业务命令」，上传/下载尤其明显。**实现选的是「把长任务移出锁」的简化形态——长任务不持锁**：`prepare_upload()`（下载/复制到 `temp/`、边写边算 MD5、边判大小上限）在**锁外**，`commit_upload()`（去重 → 重名 → `file_id` → 搬文件 → 写 `file.json`）在**锁内**，运行体 `ServerRuntime::run_upload()` 把两段串起来、管道与 HTTP 共用这一份；`file.upload` 因此是唯一不落在 `execute_business()` 里的 op。**没有引入细粒度锁**（`file_mutex` / `id_mutex` 仍是目标形态）。**换根也不会插进下载期间**：换根只由 `hello` 触发，而管道 accept/serve 串行，上传期间不会再处理第二个请求（`FMT 技术文档.md` 第 15.1 ④、15.3、18.16、18.19 节） |
 | `file.upload` 的命令超时值 | **已定并落地（提交 `a2b6cd1`，从未决清单移出，保留残余风险）**：`include/fmt/ipc/protocol.hpp` 新增 `kUploadTimeoutMs = 30 * 60 * 1000`（30 分钟），CLI 对 `file.upload` 用它、**其余命令仍是 `kCommandTimeoutMs = 30000`**（`src/cli/cli.cpp:651` 按 operation 选值）。CLI 在等待超时时额外打印「提示：等待服务响应超时。服务端可能仍在处理，稍后用 file list 确认；也可以查看 log/fmt.log。」**这是「已知边界 + 现有缓解」，不是彻底解决**：30 分钟上限到了仍可能出现「用户看到失败、服务端已经入库」；原文要求的「进度语义」仍未做。`FMT 技术文档.md` 第 19.1 节保留此条 |
