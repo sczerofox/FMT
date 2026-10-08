@@ -173,8 +173,9 @@ FMT_TEST(Server, Bucket路由与状态码) {
     if (trash != nullptr) {
         FMT_CHECK_EQ(trash->status, 200);
         const nlohmann::json body = nlohmann::json::parse(trash->body);
-        FMT_CHECK_EQ(body["data"]["deleted_buckets"].size(), std::size_t{1});
-        FMT_CHECK_EQ(body["data"]["deleted_buckets"][0].value("original", std::string{}),
+        FMT_CHECK_EQ(body["data"]["entries"].size(), std::size_t{1});
+        FMT_CHECK_EQ(body["data"]["entries"][0].value("type", std::string{}), std::string("bucket"));
+        FMT_CHECK_EQ(body["data"]["entries"][0].value("name", std::string{}),
                      std::string("工作"));
     }
 
@@ -186,7 +187,7 @@ FMT_TEST(Server, Bucket路由与状态码) {
         if (restored != nullptr) {
             FMT_CHECK_EQ(restored->status, 200);
             const nlohmann::json body = nlohmann::json::parse(restored->body);
-            FMT_CHECK_EQ(body["data"]["original"].get<std::string>(), std::string("工作"));
+            FMT_CHECK_EQ(body["data"]["entry"].value("name", std::string{}), std::string("工作"));
         }
     }
     const auto back = client.Get("/api/bucket/" + fmt::url_encode("工作"));
@@ -211,8 +212,8 @@ FMT_TEST(Server, Bucket路由与状态码) {
         if (detail != nullptr) {
             FMT_CHECK_EQ(detail->status, 200);
             const nlohmann::json body = nlohmann::json::parse(detail->body);
-            FMT_CHECK_EQ(body["data"]["original"].get<std::string>(), std::string("工作"));
-            FMT_CHECK(body["data"]["present"].get<bool>());
+            FMT_CHECK_EQ(body["data"]["entry"].value("name", std::string{}), std::string("工作"));
+            FMT_CHECK(body["data"]["entry"].value("present", false));
         }
 
         // 预检：?dry_run=1 要把要永久删掉的东西说清楚，且不改数据
@@ -222,8 +223,8 @@ FMT_TEST(Server, Bucket路由与状态码) {
             FMT_CHECK_EQ(plan->status, 200);
             const nlohmann::json body = nlohmann::json::parse(plan->body);
             FMT_CHECK(body["data"]["needs_confirm"].get<bool>());
-            FMT_CHECK_EQ(body["data"]["original"].get<std::string>(), std::string("工作"));
-            FMT_CHECK(body["data"].contains("files"));
+            FMT_CHECK_EQ(body["data"]["entry"].value("name", std::string{}), std::string("工作"));
+            FMT_CHECK(body["data"]["entry"].contains("files"));
         }
 
         // 没确认 -> 400 + FMT-016（需要显式确认）
@@ -247,7 +248,7 @@ FMT_TEST(Server, Bucket路由与状态码) {
         FMT_CHECK(empty_trash != nullptr);
         if (empty_trash != nullptr) {
             FMT_CHECK_EQ(
-                nlohmann::json::parse(empty_trash->body)["data"]["deleted_buckets"].size(),
+                nlohmann::json::parse(empty_trash->body)["data"]["entries"].size(),
                 std::size_t{0});
         }
     }

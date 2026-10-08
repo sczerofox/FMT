@@ -133,6 +133,8 @@ bool print_command_help(const std::string& topic) {
             "  use <名称>      切换当前 Bucket（只改 current_bucket，不动数据）\n"
             "  delete <名称>   移到回收站，名字变成 <名称>_<时间戳>；\n"
             "                  删的是当前 Bucket 时置空，不自动切换\n"
+            "                  **桶里有文件时会先提醒**：删除后只能整体恢复这个桶，\n"
+            "                  没法只恢复其中某个文件；一次性命令要加 --yes\n"
             "\n"
             "名称统一使用小写：create WORK 会建成 work（会提示你）；\n"
             "其余命令按名找桶时不区分大小写，找得到就按磁盘上的实际名字处理。\n"
@@ -171,19 +173,24 @@ bool print_command_help(const std::string& topic) {
     }
     if (topic == "trash") {
         std::printf(
-            "trash —— 回收站（当前是桶级条目；文件级条目随阶段 5/7 进来）\n"
-            "  list             列出回收站里的条目\n"
-            "  get <名称>       查看单个条目：原桶名、删除时间、目录、文件数与占用\n"
-            "  restore <名称>   回退一个被删除的 Bucket。名称可以是回收站里的名字\n"
-            "                   （lazy-fox_20261008012233），也可以是原桶名（同名只有\n"
-            "                   一个时）。原位置已有同名 Bucket 就整单拒绝，不覆盖、\n"
-            "                   不改名、不做部分恢复。\n"
-            "  delete <名称>    **永久删除，不可恢复**：删掉数据与记录。\n"
-            "                   交互窗口里会问一次；一次性命令必须加 --yes，例如\n"
+            "trash —— 回收站（两类条目：文件级 [文件] 与桶级 [桶]，都会标出来）\n"
+            "  list             列出回收站里的条目，标出是文件还是桶\n"
+            "  get <标识>       查看单个条目：类型、标识、删除时间、路径、大小/文件数\n"
+            "  restore <标识>   [文件] 按 file_id 回退到原 Bucket 的原位置；\n"
+            "                   [桶]   回退整个 Bucket（名称可以是回收站里的名字，\n"
+            "                          也可以是原桶名——同名只有一个时）。\n"
+            "                   目标位置已有同名正常文件/Bucket 就拒绝，不覆盖、不改名；\n"
+            "                   随桶一起删除的文件**只能整体恢复那个桶**，单独恢复会被拒绝。\n"
+            "  delete <标识>    **永久删除，不可恢复**：删掉数据与记录。\n"
+            "                   交互窗口里会先说明要删什么、再问一次；\n"
+            "                   一次性命令必须加 --yes，例如\n"
             "                   fmt.exe trash delete lazy-fox_20261008012233 --yes\n"
             "\n"
-            "桶级记录写在 trash/<用户>/.original，目录名一律带删除时间戳；\n"
-            "文件级条目收在 trash/<用户>/.files/ 下，两者不会互相干扰。\n");
+            "标识可以是 file_id（文件）、回收站里的目录名（桶）或原名；\n"
+            "命中多条会报候选，请用 file_id 或完整的回收站名指定。\n"
+            "文件级条目记在 file.json 里（is_trash / trash_reason / deleted_at 是权威），\n"
+            "数据收在 trash/<用户>/.files/ 下；桶级记录在 trash/<用户>/.original，\n"
+            "目录名一律带删除时间戳，两者不会互相干扰。\n");
         return true;
     }
 
@@ -484,6 +491,9 @@ void print_failure(const Error& error) {
     std::fprintf(stderr, "错误码：%d\n", exit_code(error.code));
 }
 
+// 定义在下面（print_business_data 与 print_precheck 都要用它）
+void print_trash_entry(const nlohmann::json& entry);
+
 // 业务命令的结果按形状打印：Bucket 列表、单条信息、或服务给的 message。
 // 服务端返回结构化数据，怎么展示放在 CLI 这一侧。
 void print_business_data(const nlohmann::json& data) {
@@ -511,38 +521,32 @@ void print_business_data(const nlohmann::json& data) {
         return;
     }
 
-    // 回收站列表：deleted_buckets: [{trashed, original, deleted_at, present}, …]
-    if (const auto items = data.find("deleted_buckets");
-        items != data.end() && items->is_array()) {
+    // 回收站列表：entries: [{type, id, name, …}, …]——**文件与桶都标出来**
+    if (const auto items = data.find("entries"); items != data.end() && items->is_array()) {
         for (const nlohmann::json& item : *items) {
-            const std::string trashed = item.value("trashed", std::string{});
-            const std::string original = item.value("original", std::string{});
-            std::string note;
-            if (original.empty()) {
-                note = "  (原名称未记录，无法回退)";
-            } else {
-                note = "  ->  " + original;
+            const bool is_file = item.value("type", std::string{}) == "file";
+            std::string line = std::string(is_file ? "  [文件]  " : "  [桶]    ") +
+                               item.value("name", std::string{});
+            if (is_file) {
+                line += "（Bucket " + item.value("bucket", std::string{}) + "，" +
+                        format_size(item.value("bytes", std::uintmax_t{0})) + "）";
+            } else if (item.value("id", std::string{}) != item.value("name", std::string{})) {
+                line += "  ->  " + item.value("id", std::string{});
             }
-            if (!item.value("present", true)) {
-                note += "  (目录已不存在)";
-            }
-            std::printf("  %s%s\n", trashed.c_str(), note.c_str());
+            std::printf("%s\n", line.c_str());
         }
-        std::printf("共 %zu 个已删除的 Bucket\n", items->size());
+        std::printf("共 %zu 项（%zu 个文件、%zu 个桶）\n", items->size(),
+                    data.value("files", std::size_t{0}), data.value("buckets", std::size_t{0}));
         return;
     }
 
-    // 单条回收站条目：trashed + original + files
-    if (data.contains("trashed") && data.contains("files")) {
-        std::printf("回收站条目：%s\n", data.value("trashed", std::string{}).c_str());
-        const std::string original = data.value("original", std::string{});
-        std::printf("原 Bucket：%s\n",
-                    original.empty() ? "（未记录，无法回退）" : original.c_str());
-        std::printf("删除时间：%s\n", data.value("deleted_at", std::string{}).c_str());
-        std::printf("目录：%s\n", data.value("path", std::string{}).c_str());
-        std::printf("状态：%s\n", data.value("present", false) ? "在" : "目录已不存在");
-        std::printf("文件数：%zu\n", data.value("files", std::size_t{0}));
-        std::printf("占用：%s\n", format_size(data.value("bytes", std::uintmax_t{0})).c_str());
+    // 单条回收站条目（trash get / restore / delete 的结果）
+    if (data.contains("entry") && data["entry"].is_object()) {
+        print_trash_entry(data["entry"]);
+        if (const auto message = data.find("message");
+            message != data.end() && message->is_string()) {
+            std::printf("%s\n", message->get<std::string>().c_str());
+        }
         return;
     }
 
@@ -601,6 +605,33 @@ void print_business_data(const nlohmann::json& data) {
     }
 }
 
+// 破坏性操作里的一项回收站条目：**文件与桶都要标出来**（用户要求）。
+void print_trash_entry(const nlohmann::json& entry) {
+    const std::string type = entry.value("type", std::string{});
+    const bool is_file = (type == "file");
+
+    std::printf("[%s] %s\n", is_file ? "文件" : "桶", entry.value("name", std::string{}).c_str());
+    std::printf("  标识：%s\n", entry.value("id", std::string{}).c_str());
+    if (is_file) {
+        std::printf("  Bucket：%s\n", entry.value("bucket", std::string{}).c_str());
+        std::printf("  大小：%s\n", format_size(entry.value("bytes", std::uintmax_t{0})).c_str());
+    } else if (entry.value("files", std::size_t{0}) > 0) {
+        std::printf("  文件数：%zu\n", entry.value("files", std::size_t{0}));
+    }
+    if (!entry.value("deleted_at", std::string{}).empty()) {
+        std::printf("  删除时间：%s\n", entry.value("deleted_at", std::string{}).c_str());
+    }
+    if (!entry.value("trash_path", std::string{}).empty()) {
+        std::printf("  回收站路径：%s\n", entry.value("trash_path", std::string{}).c_str());
+    }
+    if (!entry.value("present", true)) {
+        std::printf("  状态：数据已不存在\n");
+    }
+    if (!entry.value("restorable", true)) {
+        std::printf("  可回退：否（%s）\n", entry.value("reason", std::string{}).c_str());
+    }
+}
+
 // 破坏性操作的预检结果打印（**不走** print_business_data：那是给真实结果用的，
 // 预检里的布尔字段不该被当成结果 dump 出来）。
 void print_precheck(const nlohmann::json& data) {
@@ -619,13 +650,15 @@ void print_precheck(const nlohmann::json& data) {
         }
     }
 
-    // 永久删除的预检：把要删掉的东西列清楚
-    if (data.contains("trashed") && data.contains("files")) {
-        std::printf("回收站条目：%s\n", data.value("trashed", std::string{}).c_str());
-        const std::string original = data.value("original", std::string{});
-        std::printf("原 Bucket：%s\n",
-                    original.empty() ? "（未记录）" : original.c_str());
-        std::printf("删除时间：%s\n", data.value("deleted_at", std::string{}).c_str());
+    // 回收站条目的预检（回退 / 永久删除）
+    if (data.contains("entry") && data["entry"].is_object()) {
+        print_trash_entry(data["entry"]);
+    }
+
+    // bucket.delete 的预检：桶里有多少东西
+    if (data.contains("has_content")) {
+        std::printf("Bucket：%s\n", data.value("bucket", std::string{}).c_str());
+        std::printf("当前：%s\n", data.value("is_current", false) ? "是" : "否");
         std::printf("文件数：%zu\n", data.value("files", std::size_t{0}));
         std::printf("占用：%s\n", format_size(data.value("bytes", std::uintmax_t{0})).c_str());
     }
@@ -715,8 +748,10 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
         return exit_code(error_of(status)->code);
     }
 
-    // 破坏性操作（软删除也进回收站、永久删除则不可恢复）：先检查、说清楚、再确认。
-    const bool destructive = (operation == "file.delete" || operation == "trash.delete");
+    // 破坏性操作：先检查、说清楚、再确认。
+    // bucket.delete 也在内——桶里有东西时要提醒「之后只能整体恢复这个桶」。
+    const bool destructive = (operation == "file.delete" || operation == "trash.delete" ||
+                              operation == "bucket.delete");
     if (destructive &&
         !confirm_before_acting(operation, arguments, confirmed, session, options, interactive)) {
         // 交互窗口里用户拒绝 = 正常退出；一次性命令缺 --yes = 需要确认（退出码 2）

@@ -53,6 +53,16 @@ struct BucketCreation {
     bool became_current = false;  // 是不是顺手设成了当前 Bucket
 };
 
+// 删除 Bucket 前的预检（只读）：桶里有没有东西、删掉之后要怎么才能拿回来。
+struct BucketDeleteCheck {
+    std::string bucket;
+    bool is_current = false;
+    std::size_t files = 0;
+    std::uintmax_t bytes = 0;
+    bool has_content = false;  // 有内容就要提醒 + 确认
+    std::string message;
+};
+
 // 回收站里的一个 Bucket 条目。
 //
 // **桶级记录的唯一权威是 `trash/<user>/.original`**：它跟着数据走，`data/*.json`
@@ -91,6 +101,8 @@ public:
     Result<BucketInfo> get(std::string_view name);
     Status use(std::string_view name);
     Result<BucketRemoval> remove(std::string_view name);
+    // 删除前的预检：只读。桶里有东西就提醒「之后只能整体恢复这个桶」。
+    Result<BucketDeleteCheck> check_remove(std::string_view name) const;
 
     // 回收站里的 Bucket 列表（索引 + 目录扫描；异常状态如实报告，不擅自修）。
     Result<std::vector<TrashBucket>> list_trashed();

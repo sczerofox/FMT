@@ -249,6 +249,48 @@ Status BucketService::use(std::string_view name) {
 // delete（移入回收站）
 // ---------------------------------------------------------------------------
 
+Result<BucketDeleteCheck> BucketService::check_remove(std::string_view name) const {
+    if (config_.current_user.empty()) {
+        return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
+    }
+    if (name.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少 Bucket 名称");
+    }
+
+    const std::string actual = canonical_name(name);
+    const std::filesystem::path directory = bucket_path(actual);
+    if (!directory_exists(directory)) {
+        return make_error(ErrorCode::BucketNotFound, "Bucket 不存在：" + std::string(name));
+    }
+
+    BucketDeleteCheck check;
+    check.bucket = actual;
+    check.is_current = iequals(config_.current_bucket, actual);
+
+    std::error_code code;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(directory, code)) {
+        std::error_code type_code;
+        if (entry.is_regular_file(type_code)) {
+            ++check.files;
+            check.bytes += entry.file_size(type_code);
+        }
+    }
+    check.has_content = check.files > 0;
+
+    // 提醒的重点：整棵树进回收站之后**只能整体恢复**——不能只拿回其中某个文件。
+    if (check.has_content) {
+        check.message = "「" + actual + "」里有 " + std::to_string(check.files) + " 个文件（" +
+                        format_size(check.bytes) + "）。删除后整个桶移入回收站，" +
+                        "之后只能整体恢复这个桶，无法只恢复其中某个文件";
+        if (check.is_current) {
+            check.message += "；当前 Bucket 会被置空";
+        }
+    } else if (check.is_current) {
+        check.message = "「" + actual + "」是空的，删除后当前 Bucket 会被置空";
+    }
+    return check;
+}
+
 Result<BucketRemoval> BucketService::remove(std::string_view name) {
     if (const Status status = require_current_user(); !ok(status)) {
         return *error_of(status);

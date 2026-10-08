@@ -14,6 +14,7 @@
 #include "fmt/common/hash.hpp"
 #include "fmt/common/string.hpp"
 #include "fmt/core/app.hpp"
+#include "fmt/trash/trash.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/storage/storage.hpp"
 #include "fmt_test.hpp"
@@ -302,17 +303,20 @@ FMT_TEST(File, 软删除进回收站) {
     FMT_CHECK(fmt::ok(list));
     FMT_CHECK_EQ(std::get<std::vector<fmt::FileRecord>>(list).size(), std::size_t{0});
 
-    // trash.json 有一条文件级记录，路径都是相对数据根的
-    const auto document = fmt::read_json_file(f.paths->trash_data());
+    // **file.json 是唯一权威**：is_trash / trash_reason / deleted_at 都在记录里，
+    // 不再往 trash.json 写第二份（路径由 file_id 与记录推出）
+    const auto document = fmt::read_json_file(f.paths->file_data());
     FMT_CHECK(fmt::ok(document));
-    const nlohmann::json& entries = std::get<nlohmann::json>(document)["trash"];
-    FMT_CHECK_EQ(entries.size(), std::size_t{1});
-    FMT_CHECK_EQ(entries[0].value("file_id", std::string{}), record.file_id);
-    FMT_CHECK_EQ(entries[0].value("type", std::string{}), std::string("file"));
-    FMT_CHECK_EQ(entries[0].value("original_path", std::string{}).rfind("repository/user/", 0),
-                 std::size_t{0});
-    FMT_CHECK_EQ(entries[0].value("trash_path", std::string{}).rfind("trash/user/.files/", 0),
-                 std::size_t{0});
+    const nlohmann::json& records = std::get<nlohmann::json>(document)["files"];
+    FMT_CHECK_EQ(records.size(), std::size_t{1});
+    FMT_CHECK(records[0].value("is_trash", false));
+    FMT_CHECK_EQ(records[0].value("trash_reason", std::string{}), std::string("file"));
+    FMT_CHECK(!records[0].value("deleted_at", std::string{}).empty());
+
+    // trash.json 保持原样（不再写桶级也不再写文件级条目）
+    const auto legacy = fmt::read_json_file(f.paths->trash_data());
+    FMT_CHECK(fmt::ok(legacy));
+    FMT_CHECK_EQ(std::get<nlohmann::json>(legacy)["trash"].size(), std::size_t{0});
 
     // 再删一次：已经在回收站里
     const auto again = files.remove(record.file_id);
@@ -545,6 +549,201 @@ FMT_TEST(File, 删除预检会把情况说清楚) {
     const auto path = files.resolve_path(std::get<fmt::FileRecord>(uploaded));
     FMT_CHECK(fmt::ok(path));
     FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(path)));
+}
+
+// ---------------------------------------------------------------------------
+// 回收站读侧（文件级）：列出 / 回退 / 冲突 / 随桶删除 / 永久删除
+// ---------------------------------------------------------------------------
+
+FMT_TEST(Trash, 文件级条目能列出并回退) {
+    Fixture f;
+    const auto uploaded = upload_local(f, "doc.txt");
+    FMT_CHECK(fmt::ok(uploaded));
+    if (!fmt::ok(uploaded)) {
+        return;
+    }
+    const fmt::FileRecord record = std::get<fmt::FileRecord>(uploaded);
+
+    fmt::FileService files(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(files.remove(record.file_id)));
+
+    // 列表里能看到，并且标出这是文件（用户要求区分文件与桶）
+    fmt::TrashService trash(*f.paths, f.config, nullptr);
+    const auto listed = trash.list();
+    FMT_CHECK(fmt::ok(listed));
+    if (!fmt::ok(listed)) {
+        return;
+    }
+    const std::vector<fmt::TrashEntry>& entries = std::get<std::vector<fmt::TrashEntry>>(listed);
+    FMT_CHECK_EQ(entries.size(), std::size_t{1});
+    FMT_CHECK_EQ(entries[0].type, std::string("file"));
+    FMT_CHECK_EQ(entries[0].id, record.file_id);
+    FMT_CHECK_EQ(entries[0].name, std::string("doc.txt"));
+    FMT_CHECK_EQ(entries[0].bucket, std::string("工作"));
+    FMT_CHECK(entries[0].present);
+    FMT_CHECK(entries[0].restorable);
+    FMT_CHECK(!entries[0].deleted_at.empty());  // deleted_at 现在记在 file.json 里
+
+    // 按 file_id 也能取到同一条
+    const auto single = trash.get(record.file_id);
+    FMT_CHECK(fmt::ok(single));
+    if (fmt::ok(single)) {
+        FMT_CHECK_EQ(std::get<fmt::TrashEntry>(single).id, record.file_id);
+    }
+
+    // 回退：搬回仓库、记录复位
+    const auto restored = trash.restore(record.file_id);
+    FMT_CHECK(fmt::ok(restored));
+    const auto path = files.resolve_path(record);
+    FMT_CHECK(fmt::ok(path));
+    FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(path)));
+
+    const auto after = files.get_by_id(record.file_id);
+    FMT_CHECK(fmt::ok(after));
+    if (fmt::ok(after)) {
+        FMT_CHECK(!std::get<fmt::FileRecord>(after).is_trash);
+        FMT_CHECK_EQ(std::get<fmt::FileRecord>(after).trash_reason, std::string{});
+        FMT_CHECK_EQ(std::get<fmt::FileRecord>(after).deleted_at, std::string{});
+    }
+
+    const auto empty = trash.list();
+    FMT_CHECK(fmt::ok(empty));
+    FMT_CHECK_EQ(std::get<std::vector<fmt::TrashEntry>>(empty).size(), std::size_t{0});
+}
+
+FMT_TEST(Trash, 回退遇同名冲突要拦住) {
+    Fixture f;
+    const auto first = upload_local(f, "doc.txt");
+    FMT_CHECK(fmt::ok(first));
+    if (!fmt::ok(first)) {
+        return;
+    }
+    const fmt::FileRecord record = std::get<fmt::FileRecord>(first);
+
+    fmt::FileService files(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(files.remove(record.file_id)));
+
+    // 删掉之后又上传了同名文件（内容不同）：回收站里那份就回不去了
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(f.source, "another content")));
+    const auto second = upload_local(f, "doc.txt");
+    FMT_CHECK(fmt::ok(second));
+    if (!fmt::ok(second)) {
+        return;
+    }
+
+    fmt::TrashService trash(*f.paths, f.config, nullptr);
+
+    // 预检：说清楚是跟哪一条撞了，并且**不是**靠确认能解决的
+    const auto checked = trash.check_restore(record.file_id);
+    FMT_CHECK(fmt::ok(checked));
+    if (fmt::ok(checked)) {
+        const fmt::TrashCheck& check = std::get<fmt::TrashCheck>(checked);
+        FMT_CHECK(check.blocked);
+        FMT_CHECK(!check.needs_confirm);
+        FMT_CHECK(check.message.find(std::get<fmt::FileRecord>(second).file_id) !=
+                  std::string::npos);
+    }
+
+    const auto restored = trash.restore(record.file_id);
+    FMT_CHECK(!fmt::ok(restored));
+    FMT_CHECK(fmt::error_of(restored)->code == fmt::ErrorCode::RestoreConflict);
+    FMT_CHECK_EQ(fmt::exit_code(fmt::error_of(restored)->code), 4);
+
+    // 两份数据都还在：新的在仓库里，旧的还在回收站
+    const auto target = files.resolve_path(std::get<fmt::FileRecord>(second));
+    FMT_CHECK(fmt::ok(target));
+    FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(target)));
+
+    const auto source_check = files.check_restore(record.file_id);
+    FMT_CHECK(fmt::ok(source_check));
+    if (fmt::ok(source_check)) {
+        FMT_CHECK(fmt::file_exists(
+            std::get<fmt::FileService::FileRestoreCheck>(source_check).source));
+    }
+}
+
+FMT_TEST(Trash, 随桶删除的文件不能单独回退) {
+    Fixture f;
+    const auto uploaded = upload_local(f, "doc.txt");
+    FMT_CHECK(fmt::ok(uploaded));
+    if (!fmt::ok(uploaded)) {
+        return;
+    }
+    const fmt::FileRecord record = std::get<fmt::FileRecord>(uploaded);
+
+    // 删掉整个桶：那些文件的 trash_reason 是 "bucket"
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+    const auto removal = buckets.remove("工作");
+    FMT_CHECK(fmt::ok(removal));
+    if (!fmt::ok(removal)) {
+        return;
+    }
+
+    fmt::TrashService trash(*f.paths, f.config, nullptr);
+
+    // 列表里只有那个桶（文件不单独列，否则重复计数）
+    const auto listed = trash.list();
+    FMT_CHECK(fmt::ok(listed));
+    if (fmt::ok(listed)) {
+        const std::vector<fmt::TrashEntry>& entries = std::get<std::vector<fmt::TrashEntry>>(listed);
+        FMT_CHECK_EQ(entries.size(), std::size_t{1});
+        FMT_CHECK_EQ(entries[0].type, std::string("bucket"));
+        FMT_CHECK_EQ(entries[0].name, std::string("工作"));
+    }
+
+    // 按 file_id 查得到，但明确告诉你只能整体恢复桶
+    const auto entry = trash.get(record.file_id);
+    FMT_CHECK(fmt::ok(entry));
+    if (fmt::ok(entry)) {
+        FMT_CHECK(!std::get<fmt::TrashEntry>(entry).restorable);
+        FMT_CHECK(std::get<fmt::TrashEntry>(entry).message.find("整体恢复") != std::string::npos);
+    }
+
+    const auto restored = trash.restore(record.file_id);
+    FMT_CHECK(!fmt::ok(restored));
+    FMT_CHECK(fmt::error_of(restored)->code == fmt::ErrorCode::RestoreBucketMissing);
+    FMT_CHECK_EQ(fmt::exit_code(fmt::error_of(restored)->code), 3);
+    FMT_CHECK(fmt::error_of(restored)->message.find("整体恢复") != std::string::npos);
+}
+
+FMT_TEST(Trash, 永久删除文件级条目) {
+    Fixture f;
+    const auto uploaded = upload_local(f, "doc.txt");
+    FMT_CHECK(fmt::ok(uploaded));
+    if (!fmt::ok(uploaded)) {
+        return;
+    }
+    const fmt::FileRecord record = std::get<fmt::FileRecord>(uploaded);
+
+    fmt::FileService files(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(files.remove(record.file_id)));
+    const auto trashed_path = files.trash_path_of(record);
+    FMT_CHECK(fmt::ok(trashed_path));
+    FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(trashed_path)));
+
+    fmt::TrashService trash(*f.paths, f.config, nullptr);
+
+    // 预检：永久删除永远要确认，并把要毁掉的东西说清楚
+    const auto checked = trash.check_purge(record.file_id);
+    FMT_CHECK(fmt::ok(checked));
+    if (fmt::ok(checked)) {
+        const fmt::TrashCheck& check = std::get<fmt::TrashCheck>(checked);
+        FMT_CHECK(check.needs_confirm);
+        FMT_CHECK(!check.blocked);
+        FMT_CHECK_EQ(check.entry.type, std::string("file"));
+        FMT_CHECK(check.message.find("不可恢复") != std::string::npos);
+    }
+
+    // 预检不改数据
+    FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(trashed_path)));
+
+    const auto purged = trash.purge(record.file_id);
+    FMT_CHECK(fmt::ok(purged));
+    FMT_CHECK(!fmt::file_exists(std::get<std::filesystem::path>(trashed_path)));
+    // 记录也一并清掉
+    const auto gone = files.get_by_id(record.file_id);
+    FMT_CHECK(!fmt::ok(gone));
+    FMT_CHECK(fmt::error_of(gone)->code == fmt::ErrorCode::FileNotFound);
 }
 
 FMT_TEST(File, 从HTTP下载入库) {

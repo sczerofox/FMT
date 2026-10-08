@@ -34,6 +34,9 @@ struct FileRecord {
     std::string md5;           // 32 位小写十六进制
     bool is_trash = false;
     std::string trash_reason;  // "bucket" / "file" / 空
+    // 进回收站的时间（ISO 8601，本地时间）。**file.json 是唯一权威**：
+    // 路径可由 file_id 与记录推出，所以不需要第二份回收站索引。
+    std::string deleted_at;
 };
 
 // 「要删的到底是哪一个、有没有要先说清楚的情况」——**预检，零副作用**。
@@ -97,6 +100,28 @@ public:
     // 删除前的预检：只读，不改任何东西（跨桶确认与歧义检测都靠它）。
     Result<FileDeleteCheck> check_remove(std::string_view file_id_or_name) const;
 
+    // 回收站里的**文件级**条目（当前用户、is_trash、trash_reason == "file"）。
+    // 随桶一起删除的不算：它们的整棵树挂在桶级条目下，只能整体恢复（第 58 节）。
+    Result<std::vector<FileRecord>> list_trashed();
+
+    struct FileRestoreCheck {
+        FileRecord record;
+        bool bucket_deleted = false;  // 随桶删除：只能整体恢复桶
+        bool conflict = false;        // 目标位置已有同名正常文件
+        FileRecord conflicting;       // 冲突的那一条（file_id 要报给用户）
+        bool missing = false;         // 回收站里找不到数据
+        std::filesystem::path source;
+        std::filesystem::path target;
+        std::string message;          // 给用户看的一句话
+    };
+
+    // 回退前的预检：只读。同名冲突、随桶删除、数据缺失都在这儿说清楚。
+    Result<FileRestoreCheck> check_restore(std::string_view file_id) const;
+    // 回退：搬回仓库 -> is_trash = false、trash_reason / deleted_at 清空。
+    Result<FileRecord> restore(std::string_view file_id);
+    // 永久删除：删数据 -> 删 file.json 里的记录（顺带清掉老的 trash.json 记录）。
+    Result<FileRecord> purge(std::string_view file_id);
+
     // 仓库里的实际路径；回收站里的实际路径。
     Result<std::filesystem::path> resolve_path(const FileRecord& record) const;
     Result<std::filesystem::path> trash_path_of(const FileRecord& record) const;
@@ -117,6 +142,9 @@ private:
         std::size_t by_name = 0;
     };
     RecordMatch match_record(const std::vector<FileRecord>& records, std::string_view key) const;
+    // 记录在仓库里的目标路径（**按规则推**，不做兜底搜索）：file_id 定日期，
+    // 记录定用户/桶/文件名。回退时要往这里搬回去。
+    Result<std::filesystem::path> repository_path_of(const FileRecord& record) const;
     std::filesystem::path bucket_path() const;
 
     const PathManager& paths_;

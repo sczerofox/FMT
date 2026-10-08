@@ -8,6 +8,7 @@
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/file/file.hpp"
+#include "fmt/trash/trash.hpp"
 
 namespace fmt::service {
 namespace {
@@ -127,6 +128,44 @@ Result<nlohmann::json> bucket_command(AppContext& context, const std::string& op
         }
         const std::string value = std::get<std::string>(name);
 
+        // ① 预检（dry_run）：桶里有东西就提醒「之后只能整体恢复这个桶」
+        if (args.value("dry_run", false)) {
+            const Result<BucketDeleteCheck> checked = buckets.check_remove(value);
+            if (!ok(checked)) {
+                return *error_of(checked);
+            }
+            const BucketDeleteCheck& check = std::get<BucketDeleteCheck>(checked);
+
+            nlohmann::json data = nlohmann::json::object();
+            data["bucket"] = check.bucket;
+            data["is_current"] = check.is_current;
+            data["files"] = check.files;
+            data["bytes"] = check.bytes;
+            data["has_content"] = check.has_content;
+            // 空桶不打扰用户；有内容才要一次确认
+            data["needs_confirm"] = check.has_content;
+            data["blocked"] = false;
+            if (!check.message.empty()) {
+                data["message"] = check.message;
+            }
+            return data;
+        }
+
+        // ② 兜底：预检被绕过时，有内容的桶也必须确认过才删。
+        const auto force = args.find("force");
+        const bool forced = force != args.end() && force->is_boolean() && force->get<bool>();
+        if (!forced) {
+            const Result<BucketDeleteCheck> checked = buckets.check_remove(value);
+            if (!ok(checked)) {
+                return *error_of(checked);
+            }
+            const BucketDeleteCheck& check = std::get<BucketDeleteCheck>(checked);
+            if (check.has_content) {
+                return make_error(ErrorCode::ConfirmRequired,
+                                  check.message + "；确认删除请加 force（CLI：--yes）");
+            }
+        }
+
         const Result<BucketRemoval> removal = buckets.remove(value);
         if (!ok(removal)) {
             return *error_of(removal);
@@ -141,7 +180,8 @@ Result<nlohmann::json> bucket_command(AppContext& context, const std::string& op
         data["was_current"] = result.was_current;
         data["current_bucket"] = context.config.current_bucket;
         data["message"] =
-            "Bucket 已删除（移入回收站）：" + value + "  ->  " + result.trashed_name;
+            "Bucket 已删除（移入回收站）：" + value + "  ->  " + result.trashed_name +
+            "（之后只能整体恢复这个桶）";
         return data;
     }
 
@@ -151,27 +191,78 @@ Result<nlohmann::json> bucket_command(AppContext& context, const std::string& op
 // 回收站：桶级条目。文件级条目随阶段 5/7 一起进来。
 Result<nlohmann::json> trash_command(AppContext& context, const std::string& operation,
                                      const nlohmann::json& args) {
-    BucketService buckets(*context.paths, context.config, context.logger.get());
+    TrashService trash(*context.paths, context.config, context.logger.get());
+
+    const auto entry_json = [](const TrashEntry& entry) {
+        nlohmann::json item = nlohmann::json::object();
+        item["type"] = entry.type;  // file / bucket：CLI 据此标注
+        item["id"] = entry.id;      // 文件=file_id；桶=回收站目录名
+        item["name"] = entry.name;
+        item["bucket"] = entry.bucket;
+        item["deleted_at"] = entry.deleted_at;
+        item["bytes"] = entry.bytes;
+        item["files"] = entry.files;
+        item["present"] = entry.present;
+        item["restorable"] = entry.restorable;
+        if (!entry.trash_path.empty()) {
+            item["trash_path"] = entry.trash_path;
+        }
+        if (!entry.message.empty()) {
+            item["reason"] = entry.message;
+        }
+        return item;
+    };
+
+    // 预检结论：说清楚 + 要不要确认 + 能不能靠确认解决
+    const auto check_json = [&entry_json](const TrashCheck& check) {
+        nlohmann::json data = nlohmann::json::object();
+        data["needs_confirm"] = check.needs_confirm;
+        data["blocked"] = check.blocked;
+        data["entry"] = entry_json(check.entry);
+        if (!check.message.empty()) {
+            data["message"] = check.message;
+        }
+        return data;
+    };
 
     if (operation == "trash.list") {
-        const Result<std::vector<TrashBucket>> items = buckets.list_trashed();
+        const Result<std::vector<TrashEntry>> items = trash.list();
         if (!ok(items)) {
             return *error_of(items);
         }
 
         nlohmann::json array = nlohmann::json::array();
-        for (const TrashBucket& entry : std::get<std::vector<TrashBucket>>(items)) {
-            nlohmann::json item = nlohmann::json::object();
-            item["trashed"] = entry.trashed_name;
-            item["original"] = entry.original_name;
-            item["deleted_at"] = entry.deleted_at;
-            item["present"] = entry.directory_present;
-            array.push_back(std::move(item));
+        std::size_t files = 0;
+        std::size_t buckets = 0;
+        for (const TrashEntry& entry : std::get<std::vector<TrashEntry>>(items)) {
+            if (entry.type == "file") {
+                ++files;
+            } else {
+                ++buckets;
+            }
+            array.push_back(entry_json(entry));
         }
 
         nlohmann::json data = nlohmann::json::object();
-        data["deleted_buckets"] = std::move(array);
-        data["count"] = data["deleted_buckets"].size();
+        data["entries"] = std::move(array);
+        data["count"] = data["entries"].size();
+        data["files"] = files;
+        data["buckets"] = buckets;
+        return data;
+    }
+
+    if (operation == "trash.get") {
+        const Result<std::string> name = argument(args, 0, "回收站条目名称");
+        if (!ok(name)) {
+            return *error_of(name);
+        }
+        const Result<TrashEntry> entry = trash.get(std::get<std::string>(name));
+        if (!ok(entry)) {
+            return *error_of(entry);
+        }
+
+        nlohmann::json data = nlohmann::json::object();
+        data["entry"] = entry_json(std::get<TrashEntry>(entry));
         return data;
     }
 
@@ -182,42 +273,25 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
         }
         const std::string value = std::get<std::string>(name);
 
-        const Result<TrashBucket> restored = buckets.restore(value);
+        // 预检：同名冲突 / 随桶删除 / 数据缺失 —— 三种都不是「确认一下就能做」的事
+        if (args.value("dry_run", false)) {
+            const Result<TrashCheck> checked = trash.check_restore(value);
+            if (!ok(checked)) {
+                return *error_of(checked);
+            }
+            return check_json(std::get<TrashCheck>(checked));
+        }
+
+        const Result<TrashEntry> restored = trash.restore(value);
         if (!ok(restored)) {
             return *error_of(restored);
         }
-        const TrashBucket& entry = std::get<TrashBucket>(restored);
+        const TrashEntry& entry = std::get<TrashEntry>(restored);
 
         nlohmann::json data = nlohmann::json::object();
-        data["trashed"] = entry.trashed_name;
-        data["original"] = entry.original_name;
-        data["restored_to"] =
-            relative_path_text(context.paths->root(), buckets.directory_of(entry.original_name));
-        data["message"] = "Bucket 已回退：" + entry.original_name;
-        return data;
-    }
-
-    if (operation == "trash.get") {
-        const Result<std::string> name = argument(args, 0, "回收站条目名称");
-        if (!ok(name)) {
-            return *error_of(name);
-        }
-        const std::string value = std::get<std::string>(name);
-
-        const Result<TrashBucketDetail> detail = buckets.get_trashed(value);
-        if (!ok(detail)) {
-            return *error_of(detail);
-        }
-        const TrashBucketDetail& found = std::get<TrashBucketDetail>(detail);
-
-        nlohmann::json data = nlohmann::json::object();
-        data["trashed"] = found.bucket.trashed_name;
-        data["original"] = found.bucket.original_name;
-        data["deleted_at"] = found.bucket.deleted_at;
-        data["present"] = found.bucket.directory_present;
-        data["path"] = relative_path_text(context.paths->root(), found.directory);
-        data["files"] = found.file_count;
-        data["bytes"] = found.byte_count;
+        data["entry"] = entry_json(entry);
+        data["message"] =
+            (entry.type == "file" ? "文件已回退：" : "Bucket 已回退：") + entry.name;
         return data;
     }
 
@@ -228,56 +302,31 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
         }
         const std::string value = std::get<std::string>(name);
 
-        // ① 预检（dry_run）：把要永久删掉的东西**说清楚**——原桶名、删除时间、
-        //    多少文件、占多少空间。永久删除没有「确认一下就行」之外的补救。
+        // 预检：把要永久删掉的东西说清楚
         if (args.value("dry_run", false)) {
-            const Result<TrashBucketDetail> detail = buckets.get_trashed(value);
-            if (!ok(detail)) {
-                return *error_of(detail);
+            const Result<TrashCheck> checked = trash.check_purge(value);
+            if (!ok(checked)) {
+                return *error_of(checked);
             }
-            const TrashBucketDetail& found = std::get<TrashBucketDetail>(detail);
-
-            nlohmann::json data = nlohmann::json::object();
-            data["needs_confirm"] = true;  // 永久删除永远要确认
-            data["trashed"] = found.bucket.trashed_name;
-            data["original"] = found.bucket.original_name;
-            data["deleted_at"] = found.bucket.deleted_at;
-            data["present"] = found.bucket.directory_present;
-            data["files"] = found.file_count;
-            data["bytes"] = found.byte_count;
-
-            std::string message = "永久删除后不可恢复：" + found.bucket.trashed_name;
-            message += "（原桶 " + (found.bucket.original_name.empty()
-                                      ? std::string("未记录")
-                                      : found.bucket.original_name);
-            message += "，" + std::to_string(found.file_count) + " 个文件，" +
-                       format_size(found.byte_count) + "）";
-            data["message"] = message;
-            return data;
+            return check_json(std::get<TrashCheck>(checked));
         }
 
-        // ② **永久删除不可恢复**：调用方必须显式确认（CLI 在用户回答 y 之后才置 force）。
-        //    少一次误操作就少一次数据丢失，宁可多要一个字段。
+        // 永久删除不可恢复：调用方必须显式确认（CLI 在用户回答 y 之后才置 force）
         const auto force = args.find("force");
         if (force == args.end() || !force->is_boolean() || !force->get<bool>()) {
             return make_error(ErrorCode::ConfirmRequired,
                               "永久删除不可恢复，需要确认（force = true）");
         }
 
-        const Result<TrashPurge> purged = buckets.purge(value);
+        const Result<TrashEntry> purged = trash.purge(value);
         if (!ok(purged)) {
             return *error_of(purged);
         }
-        const TrashPurge& result = std::get<TrashPurge>(purged);
+        const TrashEntry& entry = std::get<TrashEntry>(purged);
 
         nlohmann::json data = nlohmann::json::object();
-        data["trashed"] = result.trashed_name;
-        data["original"] = result.original_name;
-        data["removed_files"] = result.removed_files;
-        data["removed_records"] = result.removed_records;
-        data["message"] = "已永久删除：" + result.trashed_name + "（" +
-                          std::to_string(result.removed_files) + " 个文件，" +
-                          std::to_string(result.removed_records) + " 条记录）";
+        data["entry"] = entry_json(entry);
+        data["message"] = "已永久删除：" + entry.name;
         return data;
     }
 

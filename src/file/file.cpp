@@ -145,31 +145,32 @@ void find_in_date_tree(const std::filesystem::path& base, const std::filesystem:
     }
 }
 
-// ---- data/trash.json 的文件级条目（第 17.1 节）----
+// ---- data/trash.json 的老记录（**只读兼容**）----
+//
+// 新的口径是 **file.json 唯一权威**（is_trash / trash_reason / deleted_at 都在记录里，
+// 路径由 file_id 与记录推出），所以不再往 trash.json 追加条目。这里只保留两件事：
+//   * legacy_deleted_at()：老数据没有 deleted_at 字段时，从旧记录里补上
+//   * remove_trash_record()：永久删除/回退时顺手清掉遗留的旧记录
 
-Status append_trash_record(const PathManager& paths, const FileRecord& record,
-                           const std::string& original_path, const std::string& trash_path) {
-    nlohmann::json document = make_collection(1, "trash");
-    if (file_exists(paths.trash_data())) {
-        Result<nlohmann::json> parsed = read_json_file(paths.trash_data());
-        if (!ok(parsed)) {
-            return *error_of(parsed);
-        }
-        document = std::get<nlohmann::json>(parsed);
-        if (const Status version = check_version(document, 1); !ok(version)) {
-            return version;
+std::string legacy_deleted_at(const PathManager& paths, const std::string& file_id) {
+    if (!file_exists(paths.trash_data())) {
+        return {};
+    }
+    const Result<nlohmann::json> parsed = read_json_file(paths.trash_data());
+    if (!ok(parsed)) {
+        return {};
+    }
+    const nlohmann::json& document = std::get<nlohmann::json>(parsed);
+    const auto items = document.find("trash");
+    if (items == document.end() || !items->is_array()) {
+        return {};
+    }
+    for (const nlohmann::json& item : *items) {
+        if (item.is_object() && item.value("file_id", std::string{}) == file_id) {
+            return item.value("deleted_at", std::string{});
         }
     }
-
-    nlohmann::json item = nlohmann::json::object();
-    item["file_id"] = record.file_id;
-    item["file_name"] = record.file_name;
-    item["original_path"] = original_path;
-    item["trash_path"] = trash_path;
-    item["deleted_at"] = local_datetime_iso();
-    item["type"] = kTrashReasonFile;
-    document["trash"].push_back(std::move(item));
-    return write_json_file(paths.trash_data(), document);
+    return {};
 }
 
 Status remove_trash_record(const PathManager& paths, std::string_view file_id) {
@@ -436,6 +437,7 @@ Result<std::vector<FileRecord>> FileService::load_records() const {
         record.md5 = item.value("md5", std::string{});
         record.is_trash = item.value("is_trash", false);
         record.trash_reason = item.value("trash_reason", std::string{});
+        record.deleted_at = item.value("deleted_at", std::string{});
         records.push_back(std::move(record));
     }
     return records;
@@ -458,6 +460,7 @@ Status FileService::save_records(const std::vector<FileRecord>& records) const {
         item["md5"] = record.md5;
         item["is_trash"] = record.is_trash;
         item["trash_reason"] = record.trash_reason;
+        item["deleted_at"] = record.deleted_at;
         document["files"].push_back(std::move(item));
     }
     return write_json_file(paths_.file_data(), document);
@@ -650,14 +653,17 @@ Result<FileRecord> FileService::get_by_name(std::string_view file_name) {
     return make_error(ErrorCode::FileNotFound, "文件不存在：" + std::string(file_name));
 }
 
-Result<std::filesystem::path> FileService::resolve_path(const FileRecord& record) const {
+Result<std::filesystem::path> FileService::repository_path_of(const FileRecord& record) const {
     Result<DateParts> date = date_from_file_id(record.file_id);
     if (!ok(date)) {
         return *error_of(date);
     }
+    return paths_.repository_file(record.user, record.bucket, std::get<DateParts>(date),
+                                 record.file_name);
+}
 
-    Result<std::filesystem::path> derived = paths_.repository_file(
-        record.user, record.bucket, std::get<DateParts>(date), record.file_name);
+Result<std::filesystem::path> FileService::resolve_path(const FileRecord& record) const {
+    Result<std::filesystem::path> derived = repository_path_of(record);
     if (!ok(derived)) {
         return *error_of(derived);
     }
@@ -852,31 +858,22 @@ Result<FileRecord> FileService::remove(std::string_view file_id_or_name) {
     if (const Status status = ensure_directory(to.parent_path()); !ok(status)) {
         return *error_of(status);
     }
-    // 第 43 节：移动到 Trash -> is_trash = true -> 更新 trash.json。
+    // 第 43 节：移动到 Trash -> is_trash = true。
+    // **file.json 是唯一权威**：路径可由 file_id 与记录推出，不再往 trash.json 写第二份
+    // （老的 trash.json 记录只在读取时兼容，见 legacy_deleted_at）。
     if (const Status status = move_file(from, to); !ok(status)) {
-        return *error_of(status);
-    }
-
-    if (const Status status =
-            append_trash_record(paths_, records[index],
-                                relative_path_text(paths_.root(), from),
-                                relative_path_text(paths_.root(), to));
-        !ok(status)) {
-        std::error_code ignored;
-        std::filesystem::rename(to, from, ignored);  // 回滚
         return *error_of(status);
     }
 
     records[index].is_trash = true;
     records[index].trash_reason = kTrashReasonFile;
+    records[index].deleted_at = local_datetime_iso();
     if (const Status status = save_records(records); !ok(status)) {
-        // 回滚：先撤掉 trash 记录，再把文件搬回仓库
-        const Status undone = remove_trash_record(paths_, records[index].file_id);
+        // 回滚：记录没写成，把文件搬回仓库，磁盘与 JSON 都回到原状
         std::error_code ignored;
         std::filesystem::rename(to, from, ignored);
         if (logger_ != nullptr) {
-            logger_->error("File", "写 file.json 失败，已回滚软删除" +
-                                       (ok(undone) ? std::string{} : "（trash.json 回滚也失败）"));
+            logger_->error("File", "写 file.json 失败，已回滚软删除");
         }
         return *error_of(status);
     }
@@ -886,6 +883,277 @@ Result<FileRecord> FileService::remove(std::string_view file_id_or_name) {
                                   " -> " + path_to_utf8(to));
     }
     return records[index];
+}
+
+// ---------------------------------------------------------------------------
+// 回收站（文件级）：列出 / 预检 / 回退 / 永久删除
+// ---------------------------------------------------------------------------
+
+Result<std::vector<FileRecord>> FileService::list_trashed() {
+    if (config_.current_user.empty()) {
+        return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
+    }
+
+    Result<std::vector<FileRecord>> loaded = load_records();
+    if (!ok(loaded)) {
+        return *error_of(loaded);
+    }
+
+    std::vector<FileRecord> files;
+    for (FileRecord& record : std::get<std::vector<FileRecord>>(loaded)) {
+        // 只列**文件级**条目：随桶一起删除的整棵树挂在桶级条目下面（第 58 节），
+        // 在这里再列一遍就是重复计数。
+        if (record.user != config_.current_user || !record.is_trash ||
+            record.trash_reason != kTrashReasonFile) {
+            continue;
+        }
+        if (record.deleted_at.empty()) {
+            record.deleted_at = legacy_deleted_at(paths_, record.file_id);  // 老数据兼容
+        }
+        files.push_back(std::move(record));
+    }
+
+    // 最近删除的排前面；时间拿不到时按 file_id（入库顺序）
+    std::sort(files.begin(), files.end(), [](const FileRecord& left, const FileRecord& right) {
+        if (left.deleted_at != right.deleted_at) {
+            return left.deleted_at > right.deleted_at;
+        }
+        return left.file_id < right.file_id;
+    });
+    return files;
+}
+
+Result<FileService::FileRestoreCheck> FileService::check_restore(std::string_view file_id) const {
+    if (config_.current_user.empty()) {
+        return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
+    }
+    if (file_id.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少 file_id");
+    }
+
+    Result<std::vector<FileRecord>> loaded = load_records();
+    if (!ok(loaded)) {
+        return *error_of(loaded);
+    }
+    const std::vector<FileRecord> records = std::get<std::vector<FileRecord>>(loaded);
+
+    std::size_t index = records.size();
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (iequals(records[i].file_id, file_id)) {
+            index = i;
+            break;
+        }
+    }
+    if (index == records.size()) {
+        return make_error(ErrorCode::FileNotFound, "回收站里没有这个文件：" + std::string(file_id));
+    }
+
+    const FileRecord& record = records[index];
+    FileRestoreCheck check;
+    check.record = record;
+    if (record.deleted_at.empty()) {
+        check.record.deleted_at = legacy_deleted_at(paths_, record.file_id);
+    }
+
+    if (record.user != config_.current_user) {
+        return make_error(ErrorCode::PermissionDenied, "这个文件不属于当前用户");
+    }
+    if (!record.is_trash) {
+        return make_error(ErrorCode::InvalidArgument,
+                          "该文件不在回收站里：" + std::string(file_id));
+    }
+
+    // ① 随桶一起删除的：只能整体恢复那个桶。
+    //    那个桶现在整棵树躺在 trash/<用户>/<桶>_<时间戳>/ 里，从这里抽单个文件出来，
+    //    会让「桶级条目」与「文件位置」对不上（第 56、58 节）。
+    if (record.trash_reason != kTrashReasonFile) {
+        check.bucket_deleted = true;
+        check.message = "「" + record.file_name + "」是随 Bucket「" + record.bucket +
+                        "」一起删除的，只能整体恢复那个桶（trash restore <桶的回收站名>）";
+        return check;
+    }
+
+    Result<std::filesystem::path> source = trash_path_of(record);
+    if (!ok(source)) {
+        return *error_of(source);
+    }
+    check.source = std::get<std::filesystem::path>(source);
+    if (!file_exists(check.source)) {
+        check.missing = true;
+        check.message = "回收站里找不到文件数据：" +
+                        relative_path_text(paths_.root(), check.source);
+        return check;
+    }
+
+    Result<std::filesystem::path> target = repository_path_of(record);
+    if (!ok(target)) {
+        return *error_of(target);
+    }
+    check.target = std::get<std::filesystem::path>(target);
+
+    // ② 目标位置的同名正常文件：名字在同用户范围内唯一，所以要么没有、要么撞一条。
+    //    **不覆盖、不改名**——与桶级回退同一口径。
+    for (const FileRecord& other : records) {
+        if (other.user == config_.current_user && !other.is_trash &&
+            iequals(other.file_name, record.file_name)) {
+            check.conflict = true;
+            check.conflicting = other;
+            break;
+        }
+    }
+    if (check.conflict) {
+        check.message = "回退失败：Bucket「" + record.bucket + "」里已经有同名正常文件：" +
+                        check.conflicting.file_name + "（file_id " + check.conflicting.file_id +
+                        "）。请先改名或删除它，或者用 trash delete 永久删除回收站里这一份";
+        return check;
+    }
+
+    // ③ 目标位置被文件系统里别的东西占着（不在 file.json 里的残留）：同样拦住，
+    //    不然 move_file 会把它覆盖掉。
+    if (file_exists(check.target)) {
+        check.conflict = true;
+        check.message = "回退失败：目标位置已经有同名文件（file.json 里没有这条记录）：" +
+                        relative_path_text(paths_.root(), check.target);
+        return check;
+    }
+
+    return check;
+}
+
+Result<FileRecord> FileService::restore(std::string_view file_id) {
+    Result<FileRestoreCheck> checked = check_restore(file_id);
+    if (!ok(checked)) {
+        return *error_of(checked);
+    }
+    const FileRestoreCheck& check = std::get<FileRestoreCheck>(checked);
+
+    // 预检发现的三种情况分别对应一个明确的错误码：能靠确认解决的一个都没有。
+    if (check.bucket_deleted) {
+        return make_error(ErrorCode::RestoreBucketMissing, check.message);
+    }
+    if (check.conflict) {
+        return make_error(ErrorCode::RestoreConflict, check.message);
+    }
+    if (check.missing) {
+        return make_error(ErrorCode::FileNotFound, check.message);
+    }
+
+    if (const Status status = ensure_directory(check.target.parent_path()); !ok(status)) {
+        return *error_of(status);
+    }
+    if (const Status status = move_file(check.source, check.target); !ok(status)) {
+        return *error_of(status);
+    }
+
+    Result<std::vector<FileRecord>> loaded = load_records();
+    if (!ok(loaded)) {
+        std::error_code ignored;
+        std::filesystem::rename(check.target, check.source, ignored);
+        return *error_of(loaded);
+    }
+    std::vector<FileRecord> records = std::get<std::vector<FileRecord>>(loaded);
+
+    std::size_t index = records.size();
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (iequals(records[i].file_id, check.record.file_id)) {
+            index = i;
+            break;
+        }
+    }
+    if (index == records.size()) {
+        std::error_code ignored;
+        std::filesystem::rename(check.target, check.source, ignored);
+        return make_error(ErrorCode::ConsistencyError,
+                          "file.json 里找不到这条记录了：" + check.record.file_id);
+    }
+
+    records[index].is_trash = false;
+    records[index].trash_reason.clear();
+    records[index].deleted_at.clear();
+    if (const Status status = save_records(records); !ok(status)) {
+        std::error_code ignored;
+        std::filesystem::rename(check.target, check.source, ignored);  // 搬回回收站
+        return *error_of(status);
+    }
+
+    // 兼容清理：老的 trash.json 里那条也顺手去掉（没有就算了，不是错误）
+    const Status cleaned = remove_trash_record(paths_, records[index].file_id);
+    if (!ok(cleaned) && logger_ != nullptr) {
+        logger_->warn("File", "清理遗留的 trash.json 记录失败：" + error_of(cleaned)->message);
+    }
+
+    if (logger_ != nullptr) {
+        logger_->info("File", "回退：" + records[index].file_id + " " + records[index].file_name +
+                                  " -> " + path_to_utf8(check.target));
+    }
+    return records[index];
+}
+
+Result<FileRecord> FileService::purge(std::string_view file_id) {
+    if (config_.current_user.empty()) {
+        return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
+    }
+    if (file_id.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少 file_id");
+    }
+
+    Result<std::vector<FileRecord>> loaded = load_records();
+    if (!ok(loaded)) {
+        return *error_of(loaded);
+    }
+    std::vector<FileRecord> records = std::get<std::vector<FileRecord>>(loaded);
+
+    std::size_t index = records.size();
+    for (std::size_t i = 0; i < records.size(); ++i) {
+        if (iequals(records[i].file_id, file_id)) {
+            index = i;
+            break;
+        }
+    }
+    if (index == records.size()) {
+        return make_error(ErrorCode::FileNotFound, "回收站里没有这个文件：" + std::string(file_id));
+    }
+    if (records[index].user != config_.current_user) {
+        return make_error(ErrorCode::PermissionDenied, "这个文件不属于当前用户");
+    }
+    if (!records[index].is_trash) {
+        return make_error(ErrorCode::InvalidArgument,
+                          "该文件不在回收站里（正常文件请用 file delete）：" + std::string(file_id));
+    }
+
+    const FileRecord record = records[index];
+
+    // ① 先删数据。失败就什么都没变（记录还在，可以重来）。
+    const Result<std::filesystem::path> source = trash_path_of(record);
+    if (!ok(source)) {
+        return *error_of(source);
+    }
+    const std::filesystem::path path = std::get<std::filesystem::path>(source);
+    if (file_exists(path)) {
+        std::error_code code;
+        std::filesystem::remove(path, code);
+        if (code) {
+            return make_error(ErrorCode::StorageError,
+                              "永久删除失败：" + path_to_utf8(path) + "（" + code.message() + "）");
+        }
+    }
+
+    // ② 再删记录。
+    records.erase(records.begin() + static_cast<std::ptrdiff_t>(index));
+    if (const Status status = save_records(records); !ok(status)) {
+        return *error_of(status);
+    }
+
+    // ③ 兼容清理老的 trash.json 记录。
+    const Status cleaned = remove_trash_record(paths_, record.file_id);
+    if (!ok(cleaned) && logger_ != nullptr) {
+        logger_->warn("File", "清理遗留的 trash.json 记录失败：" + error_of(cleaned)->message);
+    }
+
+    if (logger_ != nullptr) {
+        logger_->info("File", "永久删除文件：" + record.file_id + " " + record.file_name);
+    }
+    return record;
 }
 
 }  // namespace fmt

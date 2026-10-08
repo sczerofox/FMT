@@ -229,10 +229,11 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     const fmt::ipc::Response listed = runtime.handle(list);
     FMT_CHECK(listed.ok);
     if (listed.ok) {
-        FMT_CHECK_EQ(listed.data["deleted_buckets"].size(), std::size_t{1});
-        FMT_CHECK_EQ(listed.data["deleted_buckets"][0].value("original", std::string{}),
-                     std::string("工作"));
-        FMT_CHECK(listed.data["deleted_buckets"][0].value("present", false));
+        FMT_CHECK_EQ(listed.data["entries"].size(), std::size_t{1});
+        // 回收站条目现在统一形状：type / id / name，**文件与桶都标出来**
+        FMT_CHECK_EQ(listed.data["entries"][0].value("type", std::string{}), std::string("bucket"));
+        FMT_CHECK_EQ(listed.data["entries"][0].value("name", std::string{}), std::string("工作"));
+        FMT_CHECK(listed.data["entries"][0].value("present", false));
     }
 
     // 回退：桶回到 repository/<user>/工作
@@ -243,7 +244,8 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     const fmt::ipc::Response restored = runtime.handle(restore);
     FMT_CHECK(restored.ok);
     if (restored.ok) {
-        FMT_CHECK_EQ(restored.data.value("original", std::string{}), std::string("工作"));
+        FMT_CHECK_EQ(restored.data["entry"].value("name", std::string{}), std::string("工作"));
+        FMT_CHECK_EQ(restored.data["entry"].value("type", std::string{}), std::string("bucket"));
     }
     FMT_CHECK(fmt::directory_exists(root / "repository" / "user" / fmt::path_from_utf8("工作")));
 
@@ -274,9 +276,9 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     const fmt::ipc::Response detail = runtime.handle(get);
     FMT_CHECK(detail.ok);
     if (detail.ok) {
-        FMT_CHECK_EQ(detail.data.value("original", std::string{}), std::string("工作"));
-        FMT_CHECK(detail.data.value("present", false));
-        FMT_CHECK_EQ(detail.data.value("files", std::size_t{9}), std::size_t{0});
+        FMT_CHECK_EQ(detail.data["entry"].value("name", std::string{}), std::string("工作"));
+        FMT_CHECK(detail.data["entry"].value("present", false));
+        FMT_CHECK_EQ(detail.data["entry"].value("files", std::size_t{9}), std::size_t{0});
     }
 
     // 永久删除必须先确认：不带 force 一律拒绝
@@ -298,7 +300,8 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     const fmt::ipc::Response purged = runtime.handle(forced);
     FMT_CHECK(purged.ok);
     if (purged.ok) {
-        FMT_CHECK_EQ(purged.data.value("trashed", std::string{}), second);
+        FMT_CHECK_EQ(purged.data["entry"].value("id", std::string{}), second);
+        FMT_CHECK_EQ(purged.data["entry"].value("type", std::string{}), std::string("bucket"));
     }
 
     fmt::ipc::Request list_after;
@@ -306,7 +309,7 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     list_after.op = "trash.list";
     const fmt::ipc::Response after = runtime.handle(list_after);
     FMT_CHECK(after.ok);
-    FMT_CHECK_EQ(after.data["deleted_buckets"].size(), std::size_t{0});
+    FMT_CHECK_EQ(after.data["entries"].size(), std::size_t{0});
 }
 
 FMT_TEST(Service, 运行体声明数据根并幂等初始化) {
@@ -572,10 +575,31 @@ FMT_TEST(Service, 破坏性操作先预检再确认) {
     upload_again.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(source)});
     FMT_CHECK(runtime.handle(upload_again).ok);
 
+    // 桶里有文件：删除前必须确认（提醒「之后只能整体恢复这个桶」）
+    fmt::ipc::Request bucket_check;
+    bucket_check.id = 70;
+    bucket_check.op = "bucket.delete";
+    bucket_check.args["argv"] = nlohmann::json::array({"工作"});
+    bucket_check.args["dry_run"] = true;
+    const fmt::ipc::Response bucket_plan = runtime.handle(bucket_check);
+    FMT_CHECK(bucket_plan.ok);
+    if (bucket_plan.ok) {
+        FMT_CHECK(bucket_plan.data.value("has_content", false));
+        FMT_CHECK(bucket_plan.data.value("needs_confirm", false));
+        FMT_CHECK(bucket_plan.data.value("message", std::string{}).find("只能整体恢复") !=
+                  std::string::npos);
+    }
+
     fmt::ipc::Request delete_bucket;
     delete_bucket.id = 57;
     delete_bucket.op = "bucket.delete";
     delete_bucket.args["argv"] = nlohmann::json::array({"工作"});
+    const fmt::ipc::Response unconfirmed_bucket = runtime.handle(delete_bucket);
+    FMT_CHECK(!unconfirmed_bucket.ok);
+    FMT_CHECK(unconfirmed_bucket.error.code == fmt::ErrorCode::ConfirmRequired);
+
+    delete_bucket.id = 71;
+    delete_bucket.args["force"] = true;
     const fmt::ipc::Response bucket_removed = runtime.handle(delete_bucket);
     FMT_CHECK(bucket_removed.ok);
     const std::string trashed = bucket_removed.data.value("trashed_name", std::string{});
@@ -590,9 +614,11 @@ FMT_TEST(Service, 破坏性操作先预检再确认) {
     FMT_CHECK(plan.ok);
     if (plan.ok) {
         FMT_CHECK(plan.data.value("needs_confirm", false));
-        FMT_CHECK_EQ(plan.data.value("original", std::string{}), std::string("工作"));
-        FMT_CHECK_EQ(plan.data.value("files", std::size_t{9}), std::size_t{1});
-        FMT_CHECK(plan.data.value("bytes", std::uintmax_t{0}) > 0);
+        // 统一形状：条目信息在 entry 里，文件与桶都标出来
+        FMT_CHECK_EQ(plan.data["entry"].value("type", std::string{}), std::string("bucket"));
+        FMT_CHECK_EQ(plan.data["entry"].value("name", std::string{}), std::string("工作"));
+        FMT_CHECK_EQ(plan.data["entry"].value("files", std::size_t{9}), std::size_t{1});
+        FMT_CHECK(plan.data["entry"].value("bytes", std::uintmax_t{0}) > 0);
         FMT_CHECK(plan.data.value("message", std::string{}).find("不可恢复") != std::string::npos);
     }
 
