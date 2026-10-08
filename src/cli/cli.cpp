@@ -398,6 +398,20 @@ Status ensure_connected(Session& session, const Options& options) {
 
     session.root_switched = hello_response.data.value("switched", false);
     session.previous_root = hello_response.data.value("previous_root", std::string{});
+
+    // 「数据根由 CLI 声明」意味着任何位置的 fmt.exe 一连上就会把服务的数据根搬到自己
+    // 目录下。以前这件事**只写进日志**，用户在控制台上完全看不到——数据、桶、回收站
+    // 会整体换成另一个目录的内容，却没有任何提示。现在在切换发生的那一刻就报出来。
+    if (session.root_switched) {
+        std::fprintf(stderr,
+                     "\n注意：服务的数据根已切换\n"
+                     "  原来：%s\n"
+                     "  现在：%s\n"
+                     "原因是「数据根由 CLI 声明」：谁连上服务，服务就用谁的目录。\n"
+                     "如果这不是你想要的，请用数据根正确的那个 fmt.exe 再执行一条命令切回去。\n\n",
+                     session.previous_root.c_str(), to_forward_slashes(options.data_root).c_str());
+    }
+
     session.connected = true;
 
     log_info("Ipc", "已连接服务，数据根声明为：" + to_forward_slashes(options.data_root));
@@ -856,6 +870,22 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
 int run_interactive(const Options& options, service::State state, Session& session) {
     std::printf("%s\n", banner_text().c_str());
     std::printf("%s\n", service_state_line(state).c_str());
+
+    // 数据根就是「服务在看哪个目录」。**永远显示一行**：这是排查问题时最要紧的信息，
+    // 以前只写在日志里，用户得去翻文件。与本程序所在目录不一致时再补一句说明
+    //（连上之后服务会切到本目录——数据根由 CLI 声明）。
+    if (Result<service::ServiceState> loaded = service::load_state(); ok(loaded)) {
+        const std::string service_root = std::get<service::ServiceState>(loaded).current_root;
+        if (!service_root.empty()) {
+            std::printf("数据根：%s\n", service_root.c_str());
+            if (!iequals(service_root, to_forward_slashes(options.data_root))) {
+                std::printf(
+                    "注意：本程序所在目录是 %s，连上之后服务会切到本目录"
+                    "（数据根由 CLI 声明）。\n",
+                    to_forward_slashes(options.data_root).c_str());
+            }
+        }
+    }
     log_info("Cli", "进入交互循环，数据根：" + to_forward_slashes(options.data_root));
 
     bool blank_before_prompt = true;  // 横幅之后先空一行，输出不会和提示符挤在一起
