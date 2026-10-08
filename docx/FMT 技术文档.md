@@ -2554,18 +2554,22 @@ struct TrashCheck {
     std::string message;
 };
 
-**`present` 的语义写死为「数据在不在磁盘上」（提交 `5b316b3`）**：
+**`present` 的语义写死为「数据在不在磁盘上」（提交 `5b316b3` + `8f0fd5c`）**：
 
 ```text
 含义      文件：.files/ 下那个文件在不在；桶：那个回收站目录在不在
-结果条目  restore / purge **不翻转它**：恢复成功后数据在仓库里，它就是 true；
+结果条目  restore / purge **不翻转它**（**两级四种结果都是**：5b316b3 改文件级两处、
+          8f0fd5c 再删掉桶级两处）：恢复成功后数据在仓库里，它就是 true；
           永久删除后数据确实没了，但结果同样不由它表达——两者都由 message 说明
 为什么    原来 restore 把它置成 false（本意是「已经不在回收站里了」），
           于是 trash restore 成功后 CLI 打印「状态：数据已不存在」——而数据刚刚
           被搬回仓库、明明在。这是实测报上来的误导信息
-残余不一致 桶级 restore / purge 两处代码仍置 false（那两个分支没跟着改），
-          所以 trash restore <桶> 的打印里仍会出现「状态：数据已不存在」——如实记录，
-          待统一到「结果不翻转」(0fc242b/5b316b3)
+断言      Service.管道能执行回收站命令（桶级 restore / purge 各一条 present 断言）、
+          Trash.文件级条目能列出并回退 / Trash.永久删除文件级条目（文件级各一条）；
+          **计数仍是 144**（8f0fd5c 只补断言，没有新增用例）
+真机      8f0fd5c 之后对着已安装的服务跑过：建桶 → 删桶 → trash list → trash restore
+          （打印里没有「状态：数据已不存在」）→ trash delete → trash list 归零，
+          完整输出见 18.30
 ```
 
 class TrashService {
@@ -7746,7 +7750,7 @@ CLI 用的是 wmain（宽字符），中文路径本身没问题；是这两个�
 
 ---
 
-### 18.29 服务重装暴露的两处进程间竞争 + 回收站结果的误导字段（commit `5b316b3`）
+### 18.29 服务重装暴露的两处进程间竞争 + 回收站结果的误导字段（commit `5b316b3`；桶级由 `8f0fd5c` 补齐）
 
 `5b316b3`「fix: stop the state file and the temp sweep from fighting each other」。
 **144 个用例全绿**（143 + 新增 1 条，另改 1 条既有用例）。这一批都是**用户在自己机器上
@@ -7777,14 +7781,17 @@ CLI 用的是 wmain（宽字符），中文路径本身没问题；是这两个�
    用例：Storage.两个写者同时写同一个文件不会互相踩（8 线程 × 40 轮写同一个文件，
         断言零失败、内容必须是某一次**完整**写入、且不留 .tmp）
 
-③ 回收站恢复结果里的误导字段（10.4）
+③ 回收站恢复结果里的误导字段（10.4；文件级 `5b316b3`、桶级 `8f0fd5c`）
    现象：trash restore 成功后打印「状态：数据已不存在」，而数据刚刚被搬回仓库
-   原因：TrashService::restore() 把返回条目的 present 改成 false（本意是「已经不在
-        回收站里了」），但 present 的语义是**数据在不在磁盘上**
-   修复：恢复/永久删除**不再翻转这个字段**，结果由 message 说明；语义写死在
-        10.4 / 开发文档 53.1、53.3 的字段表里。
-        **残余不一致**：桶级 restore / purge 那两处仍置 false（打印里仍会出现
-        「状态：数据已不存在」），如实记录待统一
+   原因：TrashService::restore() / purge() 把返回条目的 present 改成 false（本意是
+        「已经不在回收站里了」），但 present 的语义是**数据在不在磁盘上**
+   修复：5b316b3 改掉文件级两处，**8f0fd5c 再删掉桶级两处**（`src/trash/trash.cpp`
+        的 restore / purge 里的 `done.present = false`）——两级、restore / purge
+        四种结果都不再翻转它，结果由 message 说明；语义写死在 10.4 与开发文档
+        53.1、53.3 的字段表里。
+        测试补断言：Service.管道能执行回收站命令（桶级）、Trash.文件级条目能列出
+        并回退 / Trash.永久删除文件级条目（文件级），**计数仍是 144**
+        （只加断言，没有新增用例）
 
 ④ 既有用例改口径：Service.启动时清理temp里的遗留临时文件
    （现在是「**新的留着**、把时间拨回一小时后的**旧的清掉**、用户手放的其它文件始终不动」）
@@ -7792,6 +7799,48 @@ CLI 用的是 wmain（宽字符），中文路径本身没问题；是这两个�
 
 这一批修完之后，作者又在**已安装的服务**上跑了一遍真流程：上传、软删除、
 `trash list` / `restore`、交互窗口答 n 的取消路径、以及一次重装。
+
+---
+
+### 18.30 桶级 `present` 补齐 + 真机核实（commit `8f0fd5c`）
+
+`8f0fd5c`「fix(trash): stop the bucket results from claiming the data is gone」。
+**144 个用例仍全绿**（只补断言，没有新增用例）。
+
+```text
+修什么    src/trash/trash.cpp 里**桶级**的 restore 与 purge 也把 `done.present = false`
+          删掉了（文件级在 5b316b3 已经改过）——现在两级、restore/purge 四种结果
+          **都不再翻转 present**：它只表示「数据在不在磁盘上」，操作结果由 message 说明
+补断言    Service.管道能执行回收站命令：桶级 trash.restore 与 trash.delete 的结果条目
+          各断言 present == true
+          Trash.文件级条目能列出并回退 / Trash.永久删除文件级条目：文件级同样各一条
+          （这正是该挡住这条误导信息的地方）
+```
+
+**对着已安装的服务实测（已核实，`8f0fd5c` 之后跑过一遍）**：
+
+```text
+bucket create tmp-verify
+bucket delete tmp-verify --yes
+  Bucket：tmp-verify / 当前：否 / 文件数：0 / 占用：0B
+  Bucket 已删除（移入回收站）：tmp-verify -> tmp-verify_20261008192822（之后只能整体恢复这个桶）
+trash list
+  [桶]    tmp-verify  ->  tmp-verify_20261008192822
+共 1 项（0 个文件、1 个桶）
+trash restore tmp-verify_20261008192822
+  [桶] tmp-verify
+    标识：tmp-verify_20261008192822
+    删除时间：2026-10-08T19:28:22
+  Bucket 已回退：tmp-verify          ← 没有「状态：数据已不存在」
+trash delete tmp-verify_20261008192822 --yes
+  永久删除后不可恢复：tmp-verify_20261008192822（原桶 tmp-verify，0 个文件，0B）
+  已永久删除：tmp-verify
+trash list → 共 0 项
+```
+
+真机顺带确认了两件之前只写在文档里的行为：**空桶删除不打扰用户**
+（`needs_confirm = false`，`--yes` 多余但无害），以及 `bucket delete` 成功后消息里
+带「**（之后只能整体恢复这个桶）**」（10.1、11.15）。
 
 ---
 

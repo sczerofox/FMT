@@ -3194,7 +3194,7 @@ HTTP：GET /api/trash
 | `deleted_at` | 删除时间（本地时间 ISO 8601）：文件取 `file.json` 的 `deleted_at`（老数据从 `trash.json` 补），桶取 `.original` |
 | `bytes` | 文件 = `size`；桶级 = 目录占用总字节数（**提交 `18f16ca` 起列表里就算出来**，见下面的代价说明） |
 | `files` | 文件 = 1；桶级 = 目录里的实际文件数（同上） |
-| `present` | **数据在不在磁盘上**（提交 `5b316b3` 写死语义）：文件 = `.files/` 下那个文件还在不在，桶 = 那个回收站目录还在不在。**回退/永久删除的结果不翻转它**（结果由 `message` 说明）；`false` 一律如实报告，不擅自清理。**原口径**「回退成功时把它置 false（表示已经不在回收站里）→ CLI 打印『状态：数据已不存在』」**已作废**：那正是提交 `5b316b3` 修掉的误导信息（数据刚被搬回仓库）。**残余不一致**：桶级的 `restore` / `purge` 结果条目目前仍把它置 `false`（桶级那两处代码没跟着改），所以 `trash restore <桶>` 的打印里仍会出现「状态：数据已不存在」——如实记录，待统一 |
+| `present` | **数据在不在磁盘上**（提交 `5b316b3` 写死语义、`8f0fd5c` 补齐桶级）：文件 = `.files/` 下那个文件还在不在，桶 = 那个回收站目录还在不在。**回退/永久删除的结果条目不翻转它**（结果由 `message` 说明）——**两级、restore / purge 四种结果现在都不翻转**；`false` 一律如实报告，不擅自清理。**原口径**「回退成功时把它置 false（表示已经不在回收站里）→ CLI 打印『状态：数据已不存在』」**已作废**：那是 `5b316b3` 修掉文件级、`8f0fd5c` 修掉桶级的误导信息（数据刚被搬回仓库）。用例 `Service.管道能执行回收站命令`（桶级 restore / purge 都断言 `present == true`）与 `Trash.文件级条目能列出并回退` / `Trash.永久删除文件级条目`（文件级同样断言）钉着这条语义 |
 | `restorable` | 能不能**单独**回退：随桶删除的文件是 `false`（第 58 节），`.original` 里没有原名的桶也是 `false`，此时带 `reason` 说明 |
 | `trash_path` | 数据的实际落点，相对数据根、正斜杠（能推出来时才给） |
 | `reason` | 只在不能回退时出现：为什么不能（随桶删除 / 缺身份记录 / 数据缺失） |
@@ -3290,7 +3290,7 @@ HTTP：GET /api/trash/<标识>（路径参数百分号解码）
 | `bucket` | 文件所属 Bucket；桶级为空 |
 | `deleted_at` | 删除时间 |
 | `bytes` / `files` | 文件：`size` / 1；桶：**这一条会递归数目录** |
-| `present` | **数据在不在磁盘上**（提交 `5b316b3` 写死语义）；`restore` / `purge` 的结果条目**不翻转它**——恢复成功后数据在仓库里，所以它是 `true`，别拿它当「还在不在回收站」用 |
+| `present` | **数据在不在磁盘上**（提交 `5b316b3` + `8f0fd5c` 写死语义）；`restore` / `purge` 的结果条目**不翻转它**（两级都是）——恢复成功后数据在仓库里，所以它是 `true`，别拿它当「还在不在回收站」用 |
 | `restorable` | 能不能单独回退；`false` 时带 `reason` |
 | `trash_path` | 相对数据根、正斜杠 |
 
@@ -7086,11 +7086,12 @@ V2
        而调用方忽略了返回值 → service.json 静默不更新。另外进程内加互斥、
        MoveFileExW 遇到 ACCESS_DENIED / SHARING_VIOLATION / LOCK_VIOLATION
        （以及 FILE_NOT_FOUND）**短暂重试** 40 次 × 5 ms（第 11 节）
-51. TrashEntry.present 的语义写死为「**数据在不在磁盘上**」（提交 `5b316b3`）：
-    回退/永久删除的**结果条目不翻转它**——恢复成功后数据在仓库里，它就是 true；
-    拿它当「还在不在回收站」会打印「状态：数据已不存在」这种误导信息。
-    结果由 message 说明。**残余不一致**：桶级 restore / purge 那两处仍置 false，
-    如实记录待统一（第 53.1、53.3 节）
+51. TrashEntry.present 的语义写死为「**数据在不在磁盘上**」（提交 `5b316b3` 文件级、
+    提交 `8f0fd5c` 补齐桶级）：回退/永久删除的**结果条目不翻转它**——恢复成功后数据在
+    仓库里，它就是 true；拿它当「还在不在回收站」会打印「状态：数据已不存在」这种
+    误导信息。结果由 message 说明。**两级、restore/purge 四种结果都不翻转**，
+    用例在 Service.管道能执行回收站命令（桶级）与 Trash.文件级条目能列出并回退 /
+    Trash.永久删除文件级条目（文件级）里各有一条 present 断言（第 53.1、53.3 节）
 ```
 
 ---
@@ -7586,7 +7587,8 @@ when it hurts」）**：
 
 **实测暴露的三处修复并入的决策（提交 `2c841c8`「fix(cli): build the precheck arguments
 as an envelope, not on the array」+ `5b316b3`「fix: stop the state file and the temp sweep
-from fighting each other」）**：
+from fighting each other」+ `8f0fd5c`「fix(trash): stop the bucket results from claiming
+the data is gone」）**：
 
 ```text
 ① CLI 崩溃：开关挂到了位置参数数组上（2c841c8）
@@ -7619,19 +7621,48 @@ from fighting each other」）**：
         （及 FILE_NOT_FOUND）短暂重试（最多 40 次 × 5 ms）
    用例：Storage.两个写者同时写同一个文件不会互相踩（8 线程 × 40 轮，零失败、
         内容必须是某一次完整写入、不留 .tmp）
-④ 回收站恢复结果里的误导字段（5b316b3）
+④ 回收站恢复结果里的误导字段（5b316b3 文件级；`8f0fd5c` 补齐桶级）
    现象：trash restore 成功后打印「状态：数据已不存在」，而数据刚被搬回仓库
-   原因：TrashService::restore() 把返回条目的 present 改成 false（本意是「已经不在
-        回收站里了」），但 present 的语义是**数据在不在磁盘上**
-   修复：恢复/永久删除**不再翻转这个字段**，结果由 message 说明；
-        语义写死在 53.1 / 53.3 的字段表里。**残余不一致**：桶级 restore / purge
-        那两处仍置 false（打印里仍会出现「状态：数据已不存在」），如实记录待统一
+   原因：TrashService::restore() / purge() 把返回条目的 present 改成 false
+        （本意是「已经不在回收站里了」），但 present 的语义是**数据在不在磁盘上**
+   修复：5b316b3 改掉文件级两处，8f0fd5c 再删掉桶级两处（`src/trash/trash.cpp`
+        的 restore / purge 里的 `done.present = false`）——**两级、restore/purge
+        四种结果都不再翻转它**，结果由 message 说明；语义写死在 53.1 / 53.3 的字段表里。
+        测试补上断言：Service.管道能执行回收站命令（桶级 restore 与 purge 各一条）、
+        Trash.文件级条目能列出并回退 / Trash.永久删除文件级条目（文件级各一条），
+        **计数仍是 144**（只加断言，没有新增用例）
 测试：142 → **144 项全绿**（2c841c8 新增 Cli.位置参数的信封形状 到 143、
   5b316b3 再新增 Storage.两个写者同时写同一个文件不会互相踩 到 144；
+  8f0fd5c 只补断言，仍是 144；
   改动：Service.启动时清理temp里的遗留临时文件 现在是「新的留着、把时间拨回
   一小时后的旧的清掉、用户手放的其它文件始终不动」）
-（`FMT 技术文档.md` 第 5.1、6.6、11.15、13.8.3、18.28、18.29 节）
+（`FMT 技术文档.md` 第 5.1、6.6、11.15、13.8.3、18.28、18.29、18.30 节）
 ```
+
+**提交 `8f0fd5c` 之后对着已安装的服务实测（已核实）**：
+
+```text
+bucket create tmp-verify
+bucket delete tmp-verify --yes
+  Bucket：tmp-verify / 当前：否 / 文件数：0 / 占用：0B
+  Bucket 已删除（移入回收站）：tmp-verify -> tmp-verify_20261008192822（之后只能整体恢复这个桶）
+trash list
+  [桶]    tmp-verify  ->  tmp-verify_20261008192822
+共 1 项（0 个文件、1 个桶）
+trash restore tmp-verify_20261008192822
+  [桶] tmp-verify
+    标识：tmp-verify_20261008192822
+    删除时间：2026-10-08T19:28:22
+  Bucket 已回退：tmp-verify          ← 没有「状态：数据已不存在」
+trash delete tmp-verify_20261008192822 --yes
+  永久删除后不可恢复：tmp-verify_20261008192822（原桶 tmp-verify，0 个文件，0B）
+  已永久删除：tmp-verify
+trash list → 共 0 项
+```
+
+顺带在真机上确认了两件之前只写在文档里的行为：**空桶删除不打扰用户**
+（`needs_confirm = false`，`--yes` 多余但无害），以及 `bucket delete` 成功后消息里
+带「**（之后只能整体恢复这个桶）**」。
 
 **已知限制（如实记录；`188e85d` / `a2b6cd1` / `0fc242b` 逐轮复核）**：
 
