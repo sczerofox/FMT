@@ -760,6 +760,11 @@ FMT_TEST(File, 粘贴路径里的不可见字符会被清掉) {
 
     const std::string wrapped =
         std::string("\xE2\x80\xAA") + fmt::path_to_utf8(picture) + "\xE2\x80\xAC";
+
+    // 前后对照：把这串字符**原样**当路径用，文件就是「不存在」——
+    // 这正是用户看到 FMT-002 的原因（屏幕上两条路径看起来一模一样）。
+    FMT_CHECK(!fmt::file_exists(fmt::path_from_utf8(wrapped)));
+
     const auto prepared = fmt::prepare_upload(*f.paths, wrapped, "", 1024 * 1024, nullptr);
     FMT_CHECK(fmt::ok(prepared));
     if (fmt::ok(prepared)) {
