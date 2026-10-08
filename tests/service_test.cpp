@@ -654,6 +654,159 @@ FMT_TEST(Service, 破坏性操作先预检再确认) {
     FMT_CHECK(runtime.handle(purge_unconfirmed).ok);
 }
 
+FMT_TEST(Service, 列表排序配置与清空回收站) {
+    fmt_test::TempDir temp("service-misc");
+    const auto root = temp / "root";
+
+    // 三个大小不同的素材，用来看排序
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(temp / "small.txt", "s")));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(temp / "medium.txt", std::string(500, 'm'))));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(temp / "large.txt", std::string(2000, 'l'))));
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    fmt::ipc::Request create;
+    create.id = 1;
+    create.op = "bucket.create";
+    create.args["argv"] = nlohmann::json::array({"工作"});
+    FMT_CHECK(runtime.handle(create).ok);
+
+    for (const char* name : {"medium.txt", "large.txt", "small.txt"}) {
+        fmt::ipc::Request upload;
+        upload.id = 2;
+        upload.op = "file.upload";
+        upload.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(temp / name)});
+        FMT_CHECK(runtime.handle(upload).ok);
+    }
+
+    // ---- file.list 排序 ----
+    const auto list_names = [&runtime](const std::string& sort) {
+        fmt::ipc::Request request;
+        request.id = 3;
+        request.op = "file.list";
+        if (!sort.empty()) {
+            request.args["sort"] = sort;
+        }
+        const fmt::ipc::Response response = runtime.handle(request);
+        std::vector<std::string> names;
+        if (response.ok) {
+            for (const nlohmann::json& item : response.data["files"]) {
+                names.push_back(item.value("file_name", std::string{}));
+            }
+        }
+        return names;
+    };
+
+    FMT_CHECK_EQ(list_names("").size(), std::size_t{3});
+    FMT_CHECK_EQ(list_names("").front(), std::string("large.txt"));   // 默认按名字
+    FMT_CHECK_EQ(list_names("size").front(), std::string("large.txt"));  // 大的在前
+    FMT_CHECK_EQ(list_names("size").back(), std::string("small.txt"));
+    FMT_CHECK_EQ(list_names("id").front(), std::string("medium.txt"));   // 入库顺序
+
+    // 乱写的排序方式要报参数错误，而不是静默按默认排
+    fmt::ipc::Request bad_sort;
+    bad_sort.id = 4;
+    bad_sort.op = "file.list";
+    bad_sort.args["sort"] = "乱写";
+    const fmt::ipc::Response bad = runtime.handle(bad_sort);
+    FMT_CHECK(!bad.ok);
+    FMT_CHECK(bad.error.code == fmt::ErrorCode::InvalidArgument);
+
+    // ---- config ----
+    fmt::ipc::Request config_list;
+    config_list.id = 5;
+    config_list.op = "config.list";
+    const fmt::ipc::Response config = runtime.handle(config_list);
+    FMT_CHECK(config.ok);
+    FMT_CHECK_EQ(config.data.value("max_upload_size", std::uintmax_t{0}),
+                 std::uintmax_t{52428800});
+
+    fmt::ipc::Request set;
+    set.id = 6;
+    set.op = "config.set";
+    set.args["argv"] = nlohmann::json::array({"max_upload_size", "2MB"});
+    const fmt::ipc::Response changed = runtime.handle(set);
+    FMT_CHECK(changed.ok);
+    FMT_CHECK_EQ(changed.data.value("max_upload_size", std::uintmax_t{0}),
+                 std::uintmax_t{2097152});
+
+    // 落盘了：直接用同一套路径规则重新读配置，也是新值
+    {
+        const fmt::PathManager paths{root};
+        const auto reloaded = fmt::load_config(paths);
+        FMT_CHECK(fmt::ok(reloaded));
+        if (fmt::ok(reloaded)) {
+            FMT_CHECK_EQ(std::get<fmt::Config>(reloaded).max_upload_size,
+                         std::uintmax_t{2097152});
+        }
+    }
+
+    // 只读项与非法值都要拒绝
+    fmt::ipc::Request readonly;
+    readonly.id = 7;
+    readonly.op = "config.set";
+    readonly.args["argv"] = nlohmann::json::array({"current_user", "someone"});
+    FMT_CHECK(!runtime.handle(readonly).ok);
+
+    fmt::ipc::Request tiny;
+    tiny.id = 8;
+    tiny.op = "config.set";
+    tiny.args["argv"] = nlohmann::json::array({"max_upload_size", "0"});
+    FMT_CHECK(!runtime.handle(tiny).ok);
+
+    // ---- trash.empty ----
+    for (const char* name : {"small.txt", "medium.txt"}) {
+        fmt::ipc::Request remove;
+        remove.id = 9;
+        remove.op = "file.delete";
+        remove.args["argv"] = nlohmann::json::array({name});
+        remove.args["force"] = true;
+        FMT_CHECK(runtime.handle(remove).ok);
+    }
+
+    fmt::ipc::Request empty_check;
+    empty_check.id = 10;
+    empty_check.op = "trash.empty";
+    empty_check.args["dry_run"] = true;
+    const fmt::ipc::Response plan = runtime.handle(empty_check);
+    FMT_CHECK(plan.ok);
+    FMT_CHECK_EQ(plan.data.value("files", std::size_t{0}), std::size_t{2});
+    FMT_CHECK(plan.data.value("needs_confirm", false));
+    FMT_CHECK(plan.data.value("message", std::string{}).find("不可恢复") != std::string::npos);
+
+    // 没确认 -> FMT-016
+    fmt::ipc::Request unconfirmed;
+    unconfirmed.id = 11;
+    unconfirmed.op = "trash.empty";
+    const fmt::ipc::Response refused = runtime.handle(unconfirmed);
+    FMT_CHECK(!refused.ok);
+    FMT_CHECK(refused.error.code == fmt::ErrorCode::ConfirmRequired);
+
+    fmt::ipc::Request forced;
+    forced.id = 12;
+    forced.op = "trash.empty";
+    forced.args["force"] = true;
+    const fmt::ipc::Response emptied = runtime.handle(forced);
+    FMT_CHECK(emptied.ok);
+    FMT_CHECK_EQ(emptied.data.value("files", std::size_t{0}), std::size_t{2});
+
+    fmt::ipc::Request after;
+    after.id = 13;
+    after.op = "trash.list";
+    const fmt::ipc::Response remaining = runtime.handle(after);
+    FMT_CHECK(remaining.ok);
+    FMT_CHECK_EQ(remaining.data["entries"].size(), std::size_t{0});
+
+    // 空回收站再清一次：成功且什么都不做（不该弹确认）
+    fmt::ipc::Request again;
+    again.id = 14;
+    again.op = "trash.empty";
+    const fmt::ipc::Response idle = runtime.handle(again);
+    FMT_CHECK(idle.ok);
+    FMT_CHECK_EQ(idle.data.value("files", std::size_t{9}), std::size_t{0});
+}
+
 FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {
     fmt_test::TempDir temp("service-ops");
     fmt::service::ServerRuntime runtime(temp / "root", temp / "state");

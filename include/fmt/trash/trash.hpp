@@ -58,6 +58,18 @@ public:
     Result<TrashCheck> check_purge(std::string_view identifier) const;
     Result<TrashEntry> purge(std::string_view identifier);
 
+    // 清空回收站：两级条目一次全永久删掉。预检给出「几项、多少字节」；
+    // 永久删除**永远**要确认（缺 force 由路由层返回 FMT-016）。
+    // 预检与执行都不是 const：它们要列两级条目，而 list() 本身要构造两个服务。
+    struct EmptyCheck {
+        std::size_t files = 0;
+        std::size_t buckets = 0;
+        std::uintmax_t bytes = 0;
+        std::string message;
+    };
+    Result<EmptyCheck> check_empty();
+    Result<EmptyCheck> empty();
+
 private:
     enum class Kind { None, File, Bucket, Ambiguous };
 

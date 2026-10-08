@@ -332,6 +332,56 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
         return data;
     }
 
+    if (operation == "trash.empty") {
+        // 永久删除整站：先把「几项、多少」说清楚，再要一次确认（缺 force → FMT-016）。
+        const auto force = args.find("force");
+        const bool forced = force != args.end() && force->is_boolean() && force->get<bool>();
+
+        if (args.value("dry_run", false) || !forced) {
+            const Result<TrashService::EmptyCheck> checked = trash.check_empty();
+            if (!ok(checked)) {
+                return *error_of(checked);
+            }
+            const TrashService::EmptyCheck& check = std::get<TrashService::EmptyCheck>(checked);
+            const bool has_content = (check.files + check.buckets) > 0;
+
+            // 空的就别让人为一个空操作再确认一次：直接当成功返回。
+            if (!has_content && !args.value("dry_run", false)) {
+                nlohmann::json empty = nlohmann::json::object();
+                empty["files"] = 0;
+                empty["buckets"] = 0;
+                empty["bytes"] = 0;
+                empty["message"] = check.message;
+                return empty;
+            }
+            if (has_content && !forced && !args.value("dry_run", false)) {
+                return make_error(ErrorCode::ConfirmRequired,
+                                  check.message + "；确认清空请加 force（CLI：--yes）");
+            }
+
+            nlohmann::json data = nlohmann::json::object();
+            data["files"] = check.files;
+            data["buckets"] = check.buckets;
+            data["bytes"] = check.bytes;
+            data["needs_confirm"] = has_content;
+            data["blocked"] = false;
+            data["message"] = check.message;
+            return data;
+        }
+
+        const Result<TrashService::EmptyCheck> emptied = trash.empty();
+        if (!ok(emptied)) {
+            return *error_of(emptied);
+        }
+        const TrashService::EmptyCheck& done = std::get<TrashService::EmptyCheck>(emptied);
+        nlohmann::json data = nlohmann::json::object();
+        data["files"] = done.files;
+        data["buckets"] = done.buckets;
+        data["bytes"] = done.bytes;
+        data["message"] = done.message;
+        return data;
+    }
+
     return make_error(ErrorCode::InvalidArgument, "未知的回收站操作：" + operation);
 }
 
@@ -346,9 +396,37 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
         if (!ok(items)) {
             return *error_of(items);
         }
+        std::vector<FileRecord> records = std::get<std::vector<FileRecord>>(items);
+
+        // 排序：默认按名字（不区分大小写，同级用 file_id 保证稳定）；
+        // size 大的在前；id 就是入库顺序（file_id 里的日期+序号天然递增）。
+        const std::string sort = args.value("sort", std::string("name"));
+        if (sort == "name") {
+            std::sort(records.begin(), records.end(),
+                      [](const FileRecord& left, const FileRecord& right) {
+                          const std::string a = to_lower(left.file_name);
+                          const std::string b = to_lower(right.file_name);
+                          return a == b ? left.file_id < right.file_id : a < b;
+                      });
+        } else if (sort == "size") {
+            std::sort(records.begin(), records.end(),
+                      [](const FileRecord& left, const FileRecord& right) {
+                          return left.size == right.size ? left.file_id < right.file_id
+                                                         : left.size > right.size;
+                      });
+        } else if (sort == "id") {
+            std::sort(records.begin(), records.end(),
+                      [](const FileRecord& left, const FileRecord& right) {
+                          return left.file_id < right.file_id;
+                      });
+        } else {
+            return make_error(ErrorCode::InvalidArgument,
+                              "排序方式只能是 name / size / id，收到：" + sort);
+        }
 
         nlohmann::json array = nlohmann::json::array();
-        for (const FileRecord& record : std::get<std::vector<FileRecord>>(items)) {
+        // 注意：这里遍历的是**排好序的** records，不是 items —— 遍历 items 会让排序白做。
+        for (const FileRecord& record : records) {
             nlohmann::json item = nlohmann::json::object();
             item["file_id"] = record.file_id;
             item["file_name"] = record.file_name;
@@ -363,6 +441,7 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
         data["files"] = std::move(array);
         data["count"] = data["files"].size();
         data["current_bucket"] = context.config.current_bucket;
+        data["sort"] = sort;
         return data;
     }
 
@@ -502,6 +581,111 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
 
 }  // namespace
 
+// 解析「大小」写法：纯字节数（"10485760"），或带单位（"10MB" / "10 MB" / "512KB" / "1GB"）。
+// 只认 KB/MB/GB 三种十进制单位——配置里给的本来就是十进制换算（1 MB = 1024 * 1024 字节）。
+Result<std::uintmax_t> parse_size_value(const std::string& text) {
+    std::string value = to_lower(trim(text));
+    if (value.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "大小不能为空");
+    }
+
+    std::uintmax_t multiplier = 1;
+    for (const auto& unit : {std::pair<std::string, std::uintmax_t>{"kb", 1024},
+                             {"mb", 1024 * 1024},
+                             {"gb", 1024 * 1024 * 1024}}) {
+        if (ends_with(value, unit.first)) {
+            multiplier = unit.second;
+            value = trim(value.substr(0, value.size() - unit.first.size()));
+            break;
+        }
+    }
+    if (value.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "大小缺少数字：" + text);
+    }
+
+    std::uintmax_t number = 0;
+    for (const char ch : value) {
+        if (ch < '0' || ch > '9') {
+            return make_error(ErrorCode::InvalidArgument,
+                              "大小只能是数字（可带 KB/MB/GB）：" + text);
+        }
+        number = number * 10 + static_cast<std::uintmax_t>(ch - '0');
+    }
+
+    constexpr std::uintmax_t kMinBytes = 1024;                 // 1 KB：再小没有意义
+    constexpr std::uintmax_t kMaxBytes = 100ull * 1024 * 1024 * 1024;  // 100 GB：兜住溢出
+    const std::uintmax_t bytes = number * multiplier;
+    if (bytes < kMinBytes) {
+        return make_error(ErrorCode::InvalidArgument, "上限太小（至少 1KB）：" + text);
+    }
+    if (number > 0 && bytes / multiplier != number) {
+        return make_error(ErrorCode::InvalidArgument, "大小超出可表示范围：" + text);
+    }
+    if (bytes > kMaxBytes) {
+        return make_error(ErrorCode::InvalidArgument, "上限过大（最多 100GB）：" + text);
+    }
+    return bytes;
+}
+
+// config.*：V1 只让改 max_upload_size，其余只读。
+// 之所以只开这一项：它是唯一需要按机器/网络情况调整的值（其他项改了也没有对应行为）。
+Result<nlohmann::json> config_command(AppContext& context, const std::string& operation,
+                                      const nlohmann::json& args) {
+    if (operation == "config.list") {
+        nlohmann::json data = nlohmann::json::object();
+        data["current_user"] = context.config.current_user;
+        data["current_bucket"] = context.config.current_bucket;
+        data["max_upload_size"] = context.config.max_upload_size;
+        data["size_unit"] = context.config.size_unit;
+        data["language"] = context.config.language;
+        data["path"] = relative_path_text(context.paths->root(), context.paths->config_file());
+        return data;
+    }
+
+    if (operation == "config.set") {
+        const Result<std::string> key = argument(args, 0, "配置项名称");
+        if (!ok(key)) {
+            return *error_of(key);
+        }
+        const Result<std::string> value = argument(args, 1, "配置值");
+        if (!ok(value)) {
+            return *error_of(value);
+        }
+
+        const std::string name = std::get<std::string>(key);
+        if (name != "max_upload_size") {
+            return make_error(ErrorCode::InvalidArgument,
+                              "V1 只能改 max_upload_size（其余只读）：" + name);
+        }
+
+        const Result<std::uintmax_t> parsed = parse_size_value(std::get<std::string>(value));
+        if (!ok(parsed)) {
+            return *error_of(parsed);
+        }
+        const std::uintmax_t bytes = std::get<std::uintmax_t>(parsed);
+
+        const std::uintmax_t previous = context.config.max_upload_size;
+        context.config.max_upload_size = bytes;
+        if (const Status saved = save_config(*context.paths, context.config); !ok(saved)) {
+            context.config.max_upload_size = previous;  // 落盘失败就回滚内存里的值
+            return *error_of(saved);
+        }
+        if (context.logger != nullptr) {
+            context.logger->info("Config", "max_upload_size：" + std::to_string(previous) + " -> " +
+                                               std::to_string(bytes));
+        }
+
+        nlohmann::json data = nlohmann::json::object();
+        data["max_upload_size"] = bytes;
+        data["previous"] = previous;
+        data["message"] = "max_upload_size 已改为 " + std::to_string(bytes) + " 字节（" +
+                          format_size(bytes) + "）";
+        return data;
+    }
+
+    return make_error(ErrorCode::InvalidArgument, "未知的配置操作：" + operation);
+}
+
 bool is_known_business(const std::string& operation) {
     for (const std::string_view prefix :
          {"bucket.", "file.", "share.", "trash.", "config.", "server."}) {
@@ -530,7 +714,11 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
         return file_command(context, operation, args);
     }
 
-    // 已经登记、还没实现的模块（share / config / server）。
+    if (starts_with(operation, "config.")) {
+        return config_command(context, operation, args);
+    }
+
+    // 已经登记、还没实现的模块（share / server）。
     return make_error(ErrorCode::ServiceOperationFailed, "操作尚未实现：" + operation);
 }
 

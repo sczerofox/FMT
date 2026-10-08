@@ -110,7 +110,8 @@ void print_command_list() {
     std::printf("  (service)  install  uninstall  start  stop  reinstall  status\n");
     std::printf("  (bucket)   create  list  get  use  delete\n");
     std::printf("  (file)     upload  list  get  delete\n");
-    std::printf("  (trash)    list  get  restore  delete\n");
+    std::printf("  (trash)    list  get  restore  delete  empty\n");
+    std::printf("  (config)   list  set\n");
     std::printf("  (help)     help [命令]\n");
     std::printf("  (version)  version                打印版本与构建日期\n");
     std::printf("  (exit)     exit  quit\n");
@@ -185,11 +186,12 @@ bool print_command_help(const std::string& topic) {
             "                           不重复入库。大小上限取 config.json 的 max_upload_size。\n"
             "                           文件名不能与文件标识同形（fmt-YYYYMMDD-N）：\n"
             "                           那会和 file_id 混淆，属保留形状（FMT-106）。\n"
-            "  list                     列出当前 Bucket 的正常文件\n"
+            "  list [--sort name|size|id]  列出当前 Bucket 的正常文件；默认按名字，\n"
+            "                           size 大的在前，id 是入库顺序\n"
             "  get <file_id|文件名>     按文件名只查正常文件；按 file_id 连回收站里的\n"
             "                           也查得到（带 is_trash 与 trash_path）\n"
-            "  delete <file_id|文件名>  软删除进回收站，file_id 不变\n"
-            "                           （文件级回收站目前只能写、还不能从 trash 查回，待阶段 7）\n"
+            "  delete <file_id|文件名>  软删除进回收站，file_id 不变；之后用\n"
+            "                           trash list / trash restore 找回来\n"
             "\n"
             "文件落在 repository/<用户>/<Bucket>/YYYY/MM/DD/ 下；上传先写 temp/，\n"
             "校验（大小上限、MD5、文件名）通过后才移动入库。\n"
@@ -206,6 +208,18 @@ bool print_command_help(const std::string& topic) {
             "  delete <share_id>   取消分享\n");
         return true;
     }
+    if (topic == "config") {
+        std::printf(
+            "config —— 配置（config/config.json）\n"
+            "  list                       看当前生效的配置\n"
+            "  set max_upload_size <大小>  改上传大小上限；大小可写 10485760，\n"
+            "                             也可写 10MB / 512KB / 1GB（1KB = 1024 字节）\n"
+            "\n"
+            "V1 只让改 max_upload_size：它是唯一需要按机器/网络情况调整的值，\n"
+            "其余项（current_user / size_unit / language）只读。\n"
+            "current_bucket 用 bucket use 切换，不走 config。\n");
+        return true;
+    }
     if (topic == "trash") {
         std::printf(
             "trash —— 回收站（两类条目：文件级 [文件] 与桶级 [桶]，都会标出来）\n"
@@ -220,6 +234,8 @@ bool print_command_help(const std::string& topic) {
             "                   交互窗口里会先说明要删什么、再问一次；\n"
             "                   一次性命令必须加 --yes，例如\n"
             "                   fmt.exe trash delete lazy-fox_20261008012233 --yes\n"
+            "  empty            **清空整个回收站，不可恢复**：两级条目一次全删。\n"
+            "                   同样先说明「几项、多少」再问一次；一次性命令加 --yes。\n"
             "\n"
             "标识可以是 file_id（文件）、回收站里的目录名（桶）或原名；\n"
             "命中多条会报候选，请用 file_id 或完整的回收站名指定。\n"
@@ -599,6 +615,20 @@ void print_business_data(const nlohmann::json& data) {
         return;
     }
 
+    // config.list：字段集固定（current_user + max_upload_size + path）。
+    // 打成标签行，比在窗口里吐一段 JSON 好读；config.set 没有 current_user，会走 message。
+    if (data.contains("max_upload_size") && data.contains("current_user")) {
+        const auto max_bytes = data.value("max_upload_size", std::uintmax_t{0});
+        std::printf("配置文件：%s\n", data.value("path", std::string{}).c_str());
+        std::printf("当前用户：%s\n", data.value("current_user", std::string{}).c_str());
+        std::printf("当前 Bucket：%s\n", data.value("current_bucket", std::string{}).c_str());
+        std::printf("上传上限：%s（%zu 字节）\n", format_size(max_bytes).c_str(),
+                    static_cast<std::size_t>(max_bytes));
+        std::printf("大小单位：%s    语言：%s\n", data.value("size_unit", std::string{}).c_str(),
+                    data.value("language", std::string{}).c_str());
+        return;
+    }
+
     // 文件列表：files: [{file_id, file_name, size}, …]
     if (const auto items = data.find("files"); items != data.end() && items->is_array()) {
         for (const nlohmann::json& item : *items) {
@@ -791,12 +821,17 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
                          const Options& options, bool interactive) {
     const std::string operation = parts[0] + "." + parts[1];
 
-    // 位置参数。--yes 是本地开关，不发给服务。
+    // 位置参数。--yes / --sort 是本地开关，不发给服务的 argv。
     nlohmann::json arguments = nlohmann::json::array();
     bool confirmed = false;
+    std::string sort_key;
     for (std::size_t i = 2; i < parts.size(); ++i) {
         if (parts[i] == "--yes" || parts[i] == "-y") {
             confirmed = true;
+            continue;
+        }
+        if (parts[i] == "--sort" && i + 1 < parts.size()) {
+            sort_key = parts[++i];
             continue;
         }
         arguments.push_back(parts[i]);
@@ -809,9 +844,10 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     }
 
     // 破坏性操作：先检查、说清楚、再确认。
-    // bucket.delete 也在内——桶里有东西时要提醒「之后只能整体恢复这个桶」。
+    // bucket.delete 也在内——桶里有东西时要提醒「之后只能整体恢复这个桶」；
+    // trash.empty 是整站永久删除，同样要确认。
     const bool destructive = (operation == "file.delete" || operation == "trash.delete" ||
-                              operation == "bucket.delete");
+                              operation == "bucket.delete" || operation == "trash.empty");
     if (destructive) {
         const ConfirmOutcome outcome =
             confirm_before_acting(operation, arguments, confirmed, session, options, interactive);
@@ -828,6 +864,9 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
 
     // 位置参数与开关走**同一个**信封构造：预检与真实请求因此不可能各错一处。
     request.args = argument_envelope(arguments, /*dry_run=*/false, confirmed || destructive);
+    if (!sort_key.empty()) {
+        request.args["sort"] = sort_key;  // file list --sort name|size|id
+    }
 
     log_info("Cli", "命令 " + operation + " 已发送（id " + std::to_string(request.id) + "）");
 

@@ -365,6 +365,85 @@ Result<TrashEntry> TrashService::restore(std::string_view identifier) {
     return done;
 }
 
+Result<TrashService::EmptyCheck> TrashService::check_empty() {
+    const Result<std::vector<TrashEntry>> entries = list();
+    if (!ok(entries)) {
+        return *error_of(entries);
+    }
+
+    EmptyCheck check;
+    for (const TrashEntry& entry : std::get<std::vector<TrashEntry>>(entries)) {
+        if (entry.type == kTypeFile) {
+            ++check.files;
+        } else {
+            ++check.buckets;
+        }
+        check.bytes += entry.bytes;
+    }
+
+    if (check.files == 0 && check.buckets == 0) {
+        check.message = "回收站已经是空的";
+        return check;
+    }
+    check.message = "永久删除回收站里的全部 " + std::to_string(check.files + check.buckets) +
+                    " 项（" + std::to_string(check.files) + " 个文件、" +
+                    std::to_string(check.buckets) + " 个桶，共 " + format_size(check.bytes) +
+                    "），不可恢复";
+    return check;
+}
+
+Result<TrashService::EmptyCheck> TrashService::empty() {
+    // 每轮重新列一遍：删掉一项之后其余条目的索引/路径都会变，用旧列表接着删会大面积失败。
+    EmptyCheck done;
+    constexpr int kMaxRounds = 10000;  // 兜底，避免「删不掉又一直重来」
+    for (int round = 0; round < kMaxRounds; ++round) {
+        const Result<std::vector<TrashEntry>> entries = list();
+        if (!ok(entries)) {
+            return *error_of(entries);
+        }
+        const std::vector<TrashEntry>& remaining = std::get<std::vector<TrashEntry>>(entries);
+        if (remaining.empty()) {
+            break;
+        }
+
+        // 先删文件级、再删桶级：桶级条目下可能挂着文件级条目的位置关系，
+        // 顺序反了容易留下「条目没了、数据还在」的孤儿。
+        const TrashEntry* target = nullptr;
+        for (const TrashEntry& entry : remaining) {
+            if (entry.type == kTypeFile) {
+                target = &entry;
+                break;
+            }
+        }
+        if (target == nullptr) {
+            target = &remaining.front();
+        }
+
+        const std::string id = target->id;
+        const std::string type = target->type;
+        const std::uintmax_t bytes = target->bytes;
+        const Result<TrashEntry> purged = purge(id);
+        if (!ok(purged)) {
+            // 单条失败不该卡死整个清空：记一行日志跳过它（真正的原因在那里）。
+            // 下一轮还会看到它，所以最坏情况是 kMaxRounds 次后停下。
+            if (logger_ != nullptr) {
+                logger_->warn("Trash", "清空回收站时跳过 " + id + "：" + error_of(purged)->message);
+            }
+            continue;
+        }
+        if (type == kTypeFile) {
+            ++done.files;
+        } else {
+            ++done.buckets;
+        }
+        done.bytes += bytes;
+    }
+
+    done.message = "已清空回收站：" + std::to_string(done.files) + " 个文件、" +
+                   std::to_string(done.buckets) + " 个桶，共释放 " + format_size(done.bytes);
+    return done;
+}
+
 Result<TrashCheck> TrashService::check_purge(std::string_view identifier) const {
     Result<Resolution> resolved = resolve(identifier);
     if (!ok(resolved)) {
