@@ -105,7 +105,7 @@ V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 �
 | 27 | **Bucket 名称统一小写（提交 `9c3d2cb`）**：`create` 先按 **ASCII 折叠**转小写再校验、再建目录（`WORK` 建成 `work`，`renamed` 为真时回 `note` 提示用户）；`use` / `get` / `delete` 用 `canonical_name()` 规范化到**磁盘上的实际名字**，所以 `current_bucket`、`file.json` 的 `bucket`、`.original` 的 `original` **只留一份拼写**。理由：Windows 目录不区分大小写，`WORK` 与 `work` 本来就是同一个目录，不统一拼写只会让记录之间各存一份、日后比对与恢复都踩坑 |
 | 28 | **`fmt-YYYYMMDD-N` 是保留形状（提交 `9c3d2cb`）**：文件名与 `file_id` 同形 → 上传拒绝 `FMT-106 FileNameLikeFileId`（退出码 2，`looks_like_file_id()`，属 `FMT-1xx` 文件名校验、与 Windows 保留设备名同类）；旧数据里已有的这种名字，`file delete` 在两个索引命中**不同**记录时报 `FMT-001` 并点名两条记录、让用户用 `file_id`——**只给 delete 加**，`file get` 的两种查询范围保持不变（只读查询最坏是给用户看 id 命中的那条；破坏性操作不能猜）。`file get` 命中回收站记录时另回 `trash_path`（相对数据根、正斜杠），仓库里找不到时不回 `path` |
 | 29 | **破坏性操作先检查、说清楚、再确认（提交 `711da4c`；缺口收尾 `6a40742`）**：`file.delete` / `trash.delete` / `bucket.delete` 在 CLI 侧先发一次**只读预检**（`args.dry_run = true` / HTTP `?dry_run=1`），把目标属于哪个 Bucket、哪两条记录撞车、永久删除会毁掉什么打印出来；交互窗口问 `y/N`、一次性命令要 `--yes`（本地开关，不进 `argv`）；**用户同意之前一个破坏性请求都不发出**。**歧义 / 同名冲突 / 随桶删除 / 数据缺失是 `blocked` 而不是 `needs_confirm`**——y/N 表达不了「删哪一个」。服务端**独立校验** `force`：永久删除、跨 Bucket 删除、非空桶删除缺 `force` → **`FMT-016 ConfirmRequired`**（退出码 2，HTTP 400；原口径「复用 `FMT-001`」作废）。跨 Bucket 成功时 `message` 与 `data.bucket` 都带归属 |
-| 30 | **回收站是一份两级视图（提交 `0fc242b`）**：`src/trash/` 的 `TrashService` **组合** `FileService` 与 `BucketService`，把文件级与桶级合成一份 `TrashEntry` 列表并做**跨命名空间的标识解析**（① 回收站目录名 → ② `file_id` → ③ 桶原名 → ④ 文件名；③④ 多条 → 候选）。权威：**文件级 = `file.json`**（`is_trash` / `trash_reason` / **`deleted_at`**），**桶级 = `trash/<user>/.original`**；**`data/trash.json` 不再写入**，只做只读兼容。`trash list` 标出 `[文件]` / `[桶]`；回退的三种硬拒绝（同名冲突 `FMT-401` / 随桶删除 `FMT-402` / 数据缺失 `FMT-002`）都是 `blocked` |
+| 30 | **回收站是一份两级视图（提交 `0fc242b`；列表计数 `18f16ca`）**：`src/trash/` 的 `TrashService` **组合** `FileService` 与 `BucketService`，把文件级与桶级合成一份 `TrashEntry` 列表并做**跨命名空间的标识解析**（① 回收站目录名 → ② `file_id` → ③ 桶原名 → ④ 文件名；③④ 多条 → 候选）。权威：**文件级 = `file.json`**（`is_trash` / `trash_reason` / **`deleted_at`**），**桶级 = `trash/<user>/.original`**；**`data/trash.json` 不再写入**，只做只读兼容。`trash list` 标出 `[文件]` / `[桶]`，桶级条目的 `files`/`bytes` 在列表里就算出来（对每个 `present` 条目遍历一次目录，代价见第 13 节）；回退的三种硬拒绝（同名冲突 `FMT-401` / 随桶删除 `FMT-402` / 数据缺失 `FMT-002`）都是 `blocked` |
 
 系统明确**禁止自动**执行：覆盖文件、修改用户文件名、选择其他 Bucket、创建恢复目标
 Bucket、绕过下载限制、删除文件、清空损坏 JSON、**删除旧数据根的数据**、**把服务宿主的
@@ -951,8 +951,11 @@ Result<TrashPurge>               purge(std::string_view identifier);        // 4
 两者的 `dry_run` 预检回 `{needs_confirm, blocked, entry, message?}`；
 **原口径的 `deleted_buckets`、顶层 `trashed` / `original` / `restored_to` / `removed_files` /
 `removed_records` 形状全部作废**（`FMT 技术文档.md` 第 12.3.2.1 节有完整表）。
-`files` 是目录里的实际文件数，`bytes` 是总字节数——**只有单条查询（`trash get` 与预检）
-遍历目录**，列表查询不做。
+`files` 是目录里的实际文件数，`bytes` 是总字节数——**提交 `18f16ca` 起 `trash list`
+也会给每个 `present` 的桶级条目遍历一次目录把它们算出来**（`trash get` 与预检同样遍历）。
+**代价（如实记录）**：`trash list` 因此不是纯索引查询（每个桶条目多遍历一次目录），
+但它是用户显式敲的命令；`BucketService::list_trashed()` 那层索引仍不遍历目录。
+原口径「只有单条查询遍历目录、列表不做」**已作废**。
 
 **`trash delete` 的三步与确认（提交 `4fee290`；`0fc242b` 起两级通用）**：
 

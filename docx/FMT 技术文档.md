@@ -2494,7 +2494,12 @@ trash_reason == "bucket"  restorable = false；数据在**桶的**回收站目�
 
 **两级条目的列表**：`list()` = `BucketService::list_trashed()` + `FileService::list_trashed()`，
 按 `deleted_at` 倒序（相同时先桶后文件、再按 `id`）；`trash list` 的响应形状见 12.3.2.1。
-**桶级的 `files` / `bytes` 在列表里是 0**（要精确值走 `trash get` 或预检，只有单条查询遍历目录）。
+**桶级条目的 `files` / `bytes` 在列表里就算出来（提交 `18f16ca`）**：对每个
+`present == true` 的桶级条目调一次 `get_trashed()`（遍历那个回收站目录）填上文件数与占用。
+**代价（如实记录）**：每个桶条目多遍历一次目录，`trash list` 因此**不是纯索引查询**
+——它是用户显式敲的命令，可以接受；`BucketService::list_trashed()` 那层索引仍不遍历目录。
+原口径「桶级的 `files`/`bytes` 在列表里是 0、精确值只在 `trash get`/预检给」**已作废**
+（那是 `0fc242b` 到 `18f16ca` 之间的实况）。
 
 **恢复流程（提交 `0fc242b`，`check_restore()` + `restore()`）**：
 
@@ -3412,8 +3417,8 @@ Bucket 已删除（移入回收站）：生活  ->  生活_20261008012233（之�
 
 fmt> trash list
   [文件]  a.txt（Bucket 工作，1.2KB）
-  [桶]    lazy-fox  ->  lazy-fox_20261008012233
-  [桶]    manual-copy  ->  manual-copy_20261008013000
+  [桶]    lazy-fox（2 个文件，1.2KB）  ->  lazy-fox_20261008012233
+  [桶]    manual-copy（1 个文件，512B）  ->  manual-copy_20261008013000
   [桶]    gone  ->  gone_20261008014000
 共 4 项（1 个文件、3 个桶）
 执行成功...
@@ -3476,7 +3481,7 @@ fmt> trash delete lazy-fox_20261008012233
 | 服务端 `data` 形状 | CLI 打印 |
 |---|---|
 | `{buckets:[{name,is_current}], count, current_bucket}` | 每行一个：当前项 `* 名称  (当前)`，其余 `  名称`；末行 `共 N 个 Bucket` |
-| `{entries:[{type,id,name,bucket,deleted_at,bytes,files,present,restorable,trash_path?,reason?}], count, files, buckets}`（提交 `0fc242b`） | 每行按 `type`：`  [文件]  <name>（Bucket <bucket>，<人类可读大小>）` 或 `  [桶]    <name>  ->  <id>`（`name` 与 `id` 相同时只印名字）；末行 `共 N 项（X 个文件、Y 个桶）`。**`deleted_buckets` 形状已作废** |
+| `{entries:[{type,id,name,bucket,deleted_at,bytes,files,present,restorable,trash_path?,reason?}], count, files, buckets}`（提交 `0fc242b`） | 每行按 `type`：`  [文件]  <name>（Bucket <bucket>，<人类可读大小>）` 或 `  [桶]    <name>（N 个文件，<人类可读大小>）  ->  <id>`（桶那一段字数只在 `files > 0` 时打，`name` 与 `id` 相同时不打 `  ->  <id>`；**提交 `18f16ca` 起桶级条目在列表里就带这两个数**）；末行 `共 N 项（X 个文件、Y 个桶）`。**`deleted_buckets` 形状已作废** |
 | `{entry:{…}}`（提交 `0fc242b`，`trash get` / `restore` / `delete`） | `print_trash_entry()`：`[文件]\|[桶] <name>` / `  标识：<id>` / 文件→`  Bucket：…` + `  大小：…`，桶→`  文件数：N`（>0）/ `  删除时间：…` / `  回收站路径：…` / `  状态：数据已不存在` / `  可回退：否（<reason>）`；`restore` / `delete` 再打一行 `message` |
 | `{bucket, is_current, path}` | `Bucket：…` / `当前：是\|否` / `路径：…`（有 `path` 才打印第三行）。**提交 `9c3d2cb` + `6a40742`**：`bucket` 与 `path` 都是**磁盘上的实际名字**（`bucket get WORK` → `Bucket：work`、`路径：repository/user/work`），命令层传的是 `canonical_name()` 的结果 |
 | `{files:[{file_id,file_name,extension,file_type,size,md5}], count, current_bucket}`（提交 `188e85d`） | 每行 `  <file_name>  <人类可读大小>`；末行 `共 N 个文件`（注意是「文件」，不是 Bucket） |
@@ -3501,7 +3506,7 @@ fmt> trash restore lazy-fox
 错误码：4
 
 fmt.exe trash delete lazy-fox_20261008012233
-该操作需要确认：请加 --yes，或在交互窗口里执行
+该操作需要确认（FMT-016）：请加 --yes，或在交互窗口里执行
 错误码：2
 
 fmt> trash delete lazy-fox_20261008012233        ← 服务端侧的兜底（任何入口都不例外）
@@ -3641,23 +3646,35 @@ fmt> file upload D:/test/fmt-20261008-0       ← 提交 9c3d2cb：与 file_id �
 **关键性质：用户确认之前，一个破坏性请求都不会发出去**（预检只读）。细节：
 
 ```text
-预检本身失败       直接报预检的错误（文件不存在 / 已在回收站 / 桶不存在），不再发执行请求
+预检本身失败       直接报预检的错误（文件不存在 / 已在回收站 / 桶不存在），不再发执行请求，
+                   **退出码用预检自己的错误码**（提交 18f16ca 起，见下表）
 --yes / -y         CLI **本地**开关：只置 args.force，**不作为位置参数发给服务端**
 交互窗口答 n        打印「已取消」，**退出码 0**（用户主动取消不是错误），不发请求
-一次性缺 --yes      stderr「该操作需要确认：请加 --yes，或在交互窗口里执行」，**退出码 2**
+一次性缺 --yes      stderr「该操作需要确认（FMT-016）：请加 --yes，或在交互窗口里执行」，
+                   **退出码 2**（提交 18f16ca 起提示语带上了 FMT-016）
 blocked 的情况      歧义（file.delete）、同名冲突 / 随桶删除 / 数据缺失（trash.restore）：
                     打印候选或原因 + stderr「这项操作不能靠确认解决，请按上面的提示指定
-                    具体对象」，**不发执行请求**；交互窗口返回 0，一次性命令返回 2
+                    具体对象」，**不发执行请求**，**退出码 2**（FMT-001）
 服务端独立校验       force 由服务端再查一遍（10.1 / 10.2.4 / 10.4）：预检被绕过
                     （别的客户端直接发）时，跨桶删除 / 非空桶删除 / 永久删除照样被
                     **FMT-016** 拦下 —— **预检负责「说清楚」，force 负责「兜底」**
 ```
 
-> **已知的小不一致（如实记录）**：一次性命令在**预检失败**时，stderr 打印的是预检的真实
-> 错误码（例如 `执行失败：FMT-002 文件不存在：x` + `错误码：3`），但**进程退出码**走的是
-> 上面那条统一分支 → `2`（`ConfirmRequired`）。交互窗口不看返回值，所以只有一次性命令
-> 会看到这个差异；脚本判断建议以 stderr 文本里的 `错误码：` 那一行为准
-> （`FMT 开发文档.md` 第 127.7 节同注）。
+**四种「不要继续」的退出码（提交 `18f16ca` 修正）**：`confirm_before_acting()` 的返回值
+从 `bool` 改成 `ConfirmOutcome{proceed, exit_code}`，调用点直接用 `outcome.exit_code`：
+
+| 情况 | 退出码 |
+|---|---|
+| 预检自身失败（文件不存在 `FMT-002`、已在回收站等） | **预检的那个错误码**（`FMT-002` → 3） |
+| 预检通信失败（`FMT-601` 等） | **通信错误的码**（8） |
+| `blocked`（歧义 / 同名冲突 / 随桶删除 / 数据缺失） | 2（`FMT-001`） |
+| 一次性命令缺 `--yes` | 2（`FMT-016`） |
+| 交互窗口里答 n（用户主动取消） | **0** |
+
+> **原口径「预检失败时 stderr 打真实错误码、进程退出码却统一走 2」已作废**
+> （那是 `711da4c` 到 `18f16ca` 之间的实况）：预检自身的错误码现在原样透出——
+> 文件不存在就是 3、通信失败就是 8，不会被「需要确认」的 2 盖掉，脚本不会误读。
+> 用例 `Service.破坏性操作先预检再确认` 覆盖这条路（18.25）。
 
 ---
 
@@ -3875,7 +3892,7 @@ HTTP   路由固定，参数可以来自请求体，也可以来自路径
 | `bucket.get` | `{bucket, is_current, path}`（`path` 相对数据根、正斜杠；**提交 `9c3d2cb`：`bucket` 是磁盘上的实际名字**） |
 | `bucket.use` | `{bucket, previous, current_bucket, message}`（**提交 `9c3d2cb`**：`bucket` 与 `current_bucket` 都是**规范化后的名字**（`use WORK` → `work`），值被改过时**增加 `note`**（「…已把 WORK 规范为 work」）；`previous` 是切换前的 `current_bucket`） |
 | `bucket.delete` | `{bucket, moved_to, trashed_name, files_affected, was_current, current_bucket, message}`；**提交 `0fc242b`**：`message` 末尾补「（之后只能整体恢复这个桶）」，且 `dry_run` 时回预检形状 `{bucket, is_current, files, bytes, has_content, needs_confirm, blocked, message?}`（有内容才 `needs_confirm`；缺 `force` 且有内容 → `FMT-016`） |
-| `trash.list` | `{entries:[{type,id,name,bucket,deleted_at,bytes,files,present,restorable,trash_path?,reason?}], count, files, buckets}`（**提交 `0fc242b` 的统一形状**；`type` 是 `"file"` / `"bucket"`，`files` / `buckets` 是两类的条数。**旧的 `deleted_buckets` 形状已作废**） |
+| `trash.list` | `{entries:[{type,id,name,bucket,deleted_at,bytes,files,present,restorable,trash_path?,reason?}], count, files, buckets}`（**提交 `0fc242b` 的统一形状**；`type` 是 `"file"` / `"bucket"`，`files` / `buckets` 是两类的条数；**提交 `18f16ca` 起桶级条目的 `files` / `bytes` 也真的算出来**——对每个 `present` 桶条目遍历一次目录，见 10.4 的代价说明。**旧的 `deleted_buckets` 形状已作废**） |
 | `trash.get` | `{entry:{…}}`（同上的 `TrashEntry` 形状；**旧的顶层 `trashed` / `original` / `path` / `files` / `bytes` 已作废**） |
 | `trash.restore` | `{entry:{…}, message}`；`message` = `文件已回退：<name>` 或 `Bucket 已回退：<name>`；`dry_run` 时回 `{needs_confirm, blocked, entry, message?}` |
 | `trash.delete` | `{entry:{…}, message}`；`message` = `已永久删除：<name>`；`dry_run` 时回 `{needs_confirm（恒真）, blocked, entry, message?}`。**旧的 `removed_files` / `removed_records` 已作废**（那些数字改由预检在动手前给出）。缺 `force` → `FMT-016`（提交 `711da4c`） |
@@ -6694,6 +6711,9 @@ Result<TrashPurge>               BucketService::purge(std::string_view identifie
                      返回 {trashed, original, deleted_at, present, path, files, bytes}
                      · path 相对数据根、正斜杠；files 是目录里的实际文件数；bytes 是总字节数
                      · **只有单条查询遍历目录**，list_trashed 不做（列表可能很长）
+  —— **该口径已被提交 18f16ca 修改**：`TrashService::list()` 现在对每个 present 的
+  桶级条目遍历一次目录填 files/bytes（10.4 有代价说明）；`BucketService::list_trashed()`
+  这层索引仍然不遍历
                      · 索引里有、目录没了 → **不报错**，present=false（如实报告，不擅自清理）
                      · 孤儿目录（目录在、索引里没记录）按目录名也能查到（original 空、present=true）
                      · 两者都没有 → FMT-400 TrashEntryNotFound（退出码 3）
@@ -6713,7 +6733,7 @@ Result<TrashPurge>               BucketService::purge(std::string_view identifie
                      CLI 交互窗口：先问「永久删除回收站条目 X ？此操作不可恢复 (y/N)」，
                      答 n（或直接回车）→ 打印「已取消」、退出码 0、**不发请求**
                      CLI 一次性命令：必须 --yes（或 -y），否则本地拒绝（**不连服务**），
-                     stderr 打印「该操作需要确认：请加 --yes，或在交互窗口里执行」，
+                     stderr 打印「该操作需要确认（FMT-016）：请加 --yes，或在交互窗口里执行」，
                      退出码 2（**提交 711da4c 起为 exit_code(ConfirmRequired)**，
                      文案也换了）；--yes/-y 是本地开关，
                      **不作为位置参数发给服务端**，只据此置 args.force = true
@@ -7348,11 +7368,13 @@ three gaps the document review found」。**136 个用例全绿**（134 + 新增
    name / bucket / deleted_at / bytes / files / present / restorable / trash_path / message。
    响应：trash.list → {entries, count, files, buckets}；get/restore/delete → {entry, message?}；
    预检 → {needs_confirm, blocked, entry, message?}。
-   **旧的 deleted_buckets 与顶层 trashed/original/files/bytes 形状已不存在**
+   **旧的 deleted_buckets 与顶层 trashed/original/files/bytes 形状已不存在**。
+   桶级条目的 files/bytes 在 list() 里对每个 present 条目遍历一次目录算出来
+   （提交 18f16ca；list 因此不是纯索引查询，见 10.4）
 
-④ trash list 标出是文件还是桶（CLI）：
+④ trash list 标出是文件还是桶（CLI；**提交 18f16ca 起桶级条目也带文件数与占用**）：
      [文件]  a.txt（Bucket 工作，1.2KB）
-     [桶]    工作  ->  工作_20261008151538
+     [桶]    工作（3 个文件，5.0KB）  ->  工作_20261008151538
    共 2 项（1 个文件、1 个桶）
 
 ⑤ 标识解析（TrashService::resolve()，不猜）：① 桶的回收站目录名（精确）→ ② file_id
@@ -7393,6 +7415,38 @@ three gaps the document review found」。**136 个用例全绿**（134 + 新增
    Service.管道能执行回收站命令         （entries/entry 统一形状：type / id / name）
    Server.Bucket路由与状态码            （entries / entry 新形状 + ?dry_run=1）
    Server.File路由与上传                （?dry_run=1 零副作用）
+```
+
+---
+
+### 18.26 文档复核引出的两处修正（commit `18f16ca`）
+
+`18f16ca`「fix(cli): report the precheck's own exit code, and count files in the list」
+修的是**文档与代码不一致的两处**（140 个用例仍全绿）：
+
+```text
+① 预检失败时的退出码（10.4 / 11.15 / 开发文档第 127.7 节）
+   原实况：一次性命令的预检失败时，stderr 打真实错误码（FMT-002 → 3），
+           **进程退出码却统一走 2**（「需要确认」的码），脚本会误读
+   现在：confirm_before_acting() 返回 ConfirmOutcome{proceed, exit_code}，
+         调用点直接用 outcome.exit_code —— 预检的错误码原样透出
+     预检自身失败（FMT-002 / 已在回收站等） → 预检的那个错误码（FMT-002 → 3）
+     预检通信失败（FMT-601 等）             → 通信错误的码（8）
+     blocked（歧义 / 同名冲突 / 随桶删除 / 数据缺失） → 2（FMT-001）
+     一次性命令缺 --yes                     → 2（FMT-016）
+     交互窗口答 n（用户主动取消）            → 0
+   顺带：缺 --yes 的提示语改成
+     「该操作需要确认（FMT-016）：请加 --yes，或在交互窗口里执行」
+   用例 Service.破坏性操作先预检再确认 覆盖（18.25 的同一套用例，断言更新）
+
+② trash list 里桶级条目的 files / bytes（10.4 / 12.3.2.1 / 11.14）
+   原实况：列表里恒为 0（那是 0fc242b 的 `to_entry()` 没填），
+          与「用户批准的格式」不符
+   现在：TrashService::list() 对每个 present 的桶级条目调一次 get_trashed()
+         遍历目录，把文件数与占用填进条目；CLI 那一行变成
+         「  [桶]    工作（3 个文件，5.0KB）  ->  工作_20261008151538」
+   代价（保留说明）：每个桶条目多遍历一次目录，trash list 因此不是纯索引查询
+         —— 显式命令，可以接受；BucketService::list_trashed() 那层索引仍不遍历
 ```
 
 ---
