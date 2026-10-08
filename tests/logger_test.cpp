@@ -6,6 +6,7 @@
 #include <sstream>
 #include <string>
 
+#include "fmt/storage/storage.hpp"
 #include "fmt_test.hpp"
 #include "temp_dir.hpp"
 
@@ -119,4 +120,53 @@ FMT_TEST(Logger, 静默日志器不做事) {
     logger->warn("Main", "没有输出");
     logger->error("Main", "没有输出");
     FMT_CHECK(true);  // 只要不崩溃即可
+}
+
+FMT_TEST(Logger, 超过上限会轮转出一代) {
+    fmt_test::TempDir temp("logger-rotate");
+    fmt::Logger::Options options = quiet_options();
+    options.max_log_bytes = 1024;  // 小到写几十行就会超
+
+    auto logger = fmt::Logger::open(temp.path(), options);
+    FMT_CHECK(fmt::ok(logger));
+    if (!fmt::ok(logger)) {
+        return;
+    }
+
+    // 每 kRotationCheckInterval 行检查一次大小，所以写够多行必然轮转过
+    for (int i = 0; i < 400; ++i) {
+        std::get<std::unique_ptr<fmt::Logger>>(logger)
+            ->info("Test", "日志轮转测试行 " + std::to_string(i));
+    }
+
+    // 上一代在 fmt.log.1 里；当前文件是轮转之后重开的
+    FMT_CHECK(fmt::file_exists(temp.path() / "fmt.log.1"));
+    std::error_code code;
+    const std::uintmax_t current = std::filesystem::file_size(temp.path() / "fmt.log", code);
+    const std::uintmax_t previous = std::filesystem::file_size(temp.path() / "fmt.log.1", code);
+    FMT_CHECK(!code);
+    FMT_CHECK(previous > 0);
+    FMT_CHECK(current > 0);
+    // 只留一代，且两代加起来不超过「上限 + 一次检查间隔的量」太多
+    FMT_CHECK(previous + current < 400 * 64);  // 远小于全部写入量，说明真的轮转过
+    // 轮转发生时会在新文件里留一行说明，用户翻日志能看到断点
+    FMT_CHECK(read_text(temp.path() / "fmt.log").find("轮转") != std::string::npos);
+}
+
+FMT_TEST(Logger, 上限为零时不轮转) {
+    fmt_test::TempDir temp("logger-norotate");
+    fmt::Logger::Options options = quiet_options();
+    options.max_log_bytes = 0;  // 明确要求不轮转
+
+    auto logger = fmt::Logger::open(temp.path(), options);
+    FMT_CHECK(fmt::ok(logger));
+    if (!fmt::ok(logger)) {
+        return;
+    }
+    for (int i = 0; i < 200; ++i) {
+        std::get<std::unique_ptr<fmt::Logger>>(logger)->info("Test", "不轮转测试行 " + std::to_string(i));
+    }
+    FMT_CHECK(!fmt::file_exists(temp.path() / "fmt.log.1"));
+    // 全部行都在同一个文件里
+    FMT_CHECK_EQ(read_lines(temp.path() / "fmt.log").size(), std::size_t{200});
 }
