@@ -202,7 +202,17 @@ Result<std::vector<TrashEntry>> TrashService::list() {
         return *error_of(listed);
     }
     for (const TrashBucket& candidate : std::get<std::vector<TrashBucket>>(listed)) {
-        entries.push_back(to_entry(candidate));
+        TrashEntry entry = to_entry(candidate);
+        // 列表里就把「几个文件、多大」算出来：用户批准的格式里带这一项。
+        // 代价是每个桶条目遍历一次目录——trash list 是显式命令，可以接受。
+        if (entry.present) {
+            const Result<TrashBucketDetail> detail = buckets.get_trashed(candidate.trashed_name);
+            if (ok(detail)) {
+                entry.files = std::get<TrashBucketDetail>(detail).file_count;
+                entry.bytes = std::get<TrashBucketDetail>(detail).byte_count;
+            }
+        }
+        entries.push_back(std::move(entry));
     }
 
     FileService files(paths_, config_, logger_);
