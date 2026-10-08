@@ -256,8 +256,15 @@ CLI 在双击时还会**先对自己所在数据根做一次体检与补齐**（
         并写一行 WARN 说明原因与改用后的路径。
         提权副本在写入结果文件前也会确保目录存在——它自己有权限，
         所以调用方数据根只读时它仍然能建出来。
-清理    Service 启动时删除 temp/ 下以 fmt- 开头的遗留文件（上次异常退出留下的提权结果等），
-        用户手放进去的其它文件一律不动；删除数量记一行 INFO。
+清理    Service 启动时删除 temp/ 下**十分钟以前**的、以 fmt- 开头的遗留文件
+        （上次异常退出留下的提权结果等），用户手放进去的其它文件一律不动；
+        删除数量记一行 INFO。
+        **为什么按年龄过滤（提交 `5b316b3`）**：提权副本回传结果的临时文件也叫
+        `fmt-elev-<pid>.json(.tmp)`，而 `service install` 会在同一次操作里**启动服务**
+        ——服务启动就来清 temp/。原来只看前缀 `fmt-`，于是把父进程**正在收**的结果文件
+        一起删掉，父进程只好报「FMT-602 提权副本没有返回结果」：服务其实已经装好并启动，
+        **用户看到的是假失败**（实测日志见第 126 节）。正在回传的结果文件寿命只有几十毫秒，
+        所以按年龄放过新的、只清旧的；读不到时间戳的文件也不动。
 ```
 
 服务自身状态不属于业务数据，单独存放，不放进任何数据根：
@@ -483,7 +490,35 @@ config.json
 config.json.tmp
 ```
 
-只有临时文件写入成功并验证通过后，才替换正式配置。
+只有临时文件写入成功并验证通过后，才替换正式文件。
+
+**临时文件名必须唯一（提交 `5b316b3`，`src/storage/storage.cpp`）**：
+
+```text
+临时名    <目标>.<pid>.<序号>.tmp（原来是固定的 <目标>.tmp）
+为什么    **同一个目标会有两个写者**：`service install` 会在启动服务之后由安装器写
+          service.json（记 host_path / installed_at），而服务启动时也写它。
+          固定名 `<目标>.tmp` 时，先完成的一方把它 rename 走，另一方紧接着做
+          **读回校验**就找不到自己的临时文件 → 报「无法打开文件 …tmp」；
+          更糟的是安装器那处是 `(void)save_state(updated);`（**忽略了返回值**），
+          于是 service.json 静默地一直不更新（实测时间戳停在 18:19，重装多次也不变）。
+          带 pid + 序号之后，两个写者各写各的，rename 是「后完成者胜」，
+          正常结果就是最后那份内容
+进程内    对原子写加互斥（同一进程里的多个线程不必去抢替换那一步）
+替换重试  MoveFileExW 带 MOVEFILE_REPLACE_EXISTING 时，若遇到
+          ERROR_ACCESS_DENIED / ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION
+          （还有 ERROR_FILE_NOT_FOUND），**短暂重试**（最多 40 次 × 5 ms）——
+          这类失败是短暂的，不该当成永久错误报给用户；其它错误码立即失败
+用例      Storage.两个写者同时写同一个文件不会互相踩（8 线程 × 40 轮写同一个文件，
+          零失败、内容必须是某一次**完整**写入、且不留 .tmp）
+```
+
+例如：
+
+```text
+config.json
+config.json.2296.7.tmp        ← 进程 2296 的第 7 次原子写
+```
 
 ---
 
@@ -3159,7 +3194,7 @@ HTTP：GET /api/trash
 | `deleted_at` | 删除时间（本地时间 ISO 8601）：文件取 `file.json` 的 `deleted_at`（老数据从 `trash.json` 补），桶取 `.original` |
 | `bytes` | 文件 = `size`；桶级 = 目录占用总字节数（**提交 `18f16ca` 起列表里就算出来**，见下面的代价说明） |
 | `files` | 文件 = 1；桶级 = 目录里的实际文件数（同上） |
-| `present` | 数据在不在：文件 = `.files/` 下的数据是否还在；桶 = 目录是否还在。`false` 一律如实报告，不擅自清理 |
+| `present` | **数据在不在磁盘上**（提交 `5b316b3` 写死语义）：文件 = `.files/` 下那个文件还在不在，桶 = 那个回收站目录还在不在。**回退/永久删除的结果不翻转它**（结果由 `message` 说明）；`false` 一律如实报告，不擅自清理。**原口径**「回退成功时把它置 false（表示已经不在回收站里）→ CLI 打印『状态：数据已不存在』」**已作废**：那正是提交 `5b316b3` 修掉的误导信息（数据刚被搬回仓库）。**残余不一致**：桶级的 `restore` / `purge` 结果条目目前仍把它置 `false`（桶级那两处代码没跟着改），所以 `trash restore <桶>` 的打印里仍会出现「状态：数据已不存在」——如实记录，待统一 |
 | `restorable` | 能不能**单独**回退：随桶删除的文件是 `false`（第 58 节），`.original` 里没有原名的桶也是 `false`，此时带 `reason` 说明 |
 | `trash_path` | 数据的实际落点，相对数据根、正斜杠（能推出来时才给） |
 | `reason` | 只在不能回退时出现：为什么不能（随桶删除 / 缺身份记录 / 数据缺失） |
@@ -3255,7 +3290,7 @@ HTTP：GET /api/trash/<标识>（路径参数百分号解码）
 | `bucket` | 文件所属 Bucket；桶级为空 |
 | `deleted_at` | 删除时间 |
 | `bytes` / `files` | 文件：`size` / 1；桶：**这一条会递归数目录** |
-| `present` | 数据在不在 |
+| `present` | **数据在不在磁盘上**（提交 `5b316b3` 写死语义）；`restore` / `purge` 的结果条目**不翻转它**——恢复成功后数据在仓库里，所以它是 `true`，别拿它当「还在不在回收站」用 |
 | `restorable` | 能不能单独回退；`false` 时带 `reason` |
 | `trash_path` | 相对数据根、正斜杠 |
 
@@ -6475,7 +6510,9 @@ HTTP 作用于**当前数据根**，默认只监听 `127.0.0.1:4122`；CLI 不�
 | **标识与名字同时命中时报歧义**（提交 `9c3d2cb`，只服务 `file delete`） | `File.标识与名字同时命中时报歧义`：手工造旧数据（一个文件 `file_id = fmt-20261008-0`、另一个文件 `file_name = fmt-20261008-0`）后 `remove("fmt-20261008-0")` 必须返回 `FMT-001`，消息里同时出现「歧义」与另一条的 `file_id`（`fmt-20261008-1`）；不歧义的名字照常走 | ✅ |
 | **删除预检会把情况说清楚**（提交 `711da4c`） | `File.删除预检会把情况说清楚`：同桶时 `other_bucket` / `ambiguous` 都为假、`message` 为空（**CLI 不打扰用户**）；切到另一个桶后 `other_bucket` 为真、`message` 里同时出现两个桶名；预检**不改数据**（文件仍在仓库里） | ✅ |
 | **`file get` 大写 `file_id` 也查得到**（提交 `6a40742`） | `File.列表与查询` 追加断言：把 `file_id` 全大写后 `get_by_id()` 仍命中（标识比较一律 `iequals`，9.4） | ✅ |
-| **粘贴路径里的不可见字符会被清掉**（提交 `a9af276`，**复刻用户报的场景**） | `File.粘贴路径里的不可见字符会被清掉`：中文目录 `头像/` 下的文件 + `U+202A` / `U+202C` 包裹路径 → 上传预检成功；Explorer 引号包裹 → 成功；仍然找不到时消息里出现 `U+202A` 与 `U+202C`；名字里的不可见字符被 `validate_file_name()` 拒绝（`FMT-101`）。**配套用例**：`tests/string_test.cpp` 的 `String.清理粘贴带进来的路径污染`（`U+202A`/`U+202C`、成对与不成对引号、首尾空白、`U+00A0`、中文路径不受影响、`invisible_characters()` 的去重与码位名），见第 33.2、25 节 | ✅ |
+| **粘贴路径里的不可见字符会被清掉**（提交 `a9af276`，**复刻用户报的场景**） | `File.粘贴路径里的不可见字符会被清掉`：中文目录 `头像/` 下的文件 + `U+202A` / `U+202C` 包裹路径 → 上传预检成功；Explorer 引号包裹 → 成功；仍然找不到时消息里出现 `U+202A` 与 `U+202C`；名字里的不可见字符被 `validate_file_name()` 拒绝（`FMT-101`）。**配套用例**：`tests/string_test.cpp` 的 `String.清理粘贴带进来的路径污染`（`U+202A`/`U+202C`、成对与不成对引号、首尾空白、`U+00A0`、中文路径不受影响、`invisible_characters()` 的去重与码位名），见第 33.1.1、25 节 | ✅ |
+| **位置参数的信封形状**（提交 `2c841c8`，**复刻 CLI 崩溃**） | `Cli.位置参数的信封形状`（`tests/cli_test.cpp`）：旧写法（在位置参数**数组**上用字符串下标挂 `dry_run`）必须抛 `type_error.305`；`argument_envelope()` 产出的必须是**带 `argv` 且开关同级**的对象（第 127.7 节）。**这条钉的是机制本身**——测试不再自己拼形状，避免「测试全绿、CLI 一敲就崩」 | ✅ |
+| **两个写者同时原子写同一个文件**（提交 `5b316b3`） | `Storage.两个写者同时写同一个文件不会互相踩`：8 线程 × 40 轮写同一个文件，断言零失败、内容必须是某一次**完整**写入、且**不留 `.tmp`**（第 11 节） | ✅ |
 | HTTP 下载入库 | `File.从HTTP下载入库`（本机起一个 httplib 服务端当地源） | ✅ |
 | 端到端（管道） | `Service.管道能上传与操作文件`（upload → list → get×2 → 去重被拒 → delete → get 仍可查到；**【9c3d2cb】再追加**：删除后 `file get` 命中回收站记录时 `data.trash_path` 以 `trash/user/.files/` 开头，见第 42 节） | ✅ |
 | 端到端（HTTP） | `Server.File路由与上传`（**【6a40742】追加**：`file_name = fmt-20261008-0` → 400 + `FMT-106`；**【0fc242b】追加**：`DELETE ?dry_run=1` 只读、零副作用） | ✅ |
@@ -7032,6 +7069,28 @@ V2
     清掉之后仍找不到 → FMT-002，消息**点名**被清掉的码位（如 U+202A、U+202C）；
     只去了引号/空白时另有一句说明。**名字里不允许**这些字符：
     validate_file_name → FMT-101、validate_bucket_name → FMT-202（第 25、33.1.1 节）
+49. 请求形状必须由**同一个构造函数**产出（提交 `2c841c8`）：
+    cli::argument_envelope(positional, dry_run, force) 一处产出「位置参数放 argv、
+    开关放同级」的信封，预检与真实请求都用它；测试**不许自己拼形状**
+    （旧写法在数组上挂 dry_run 会抛 type_error.305 → 未捕获即 abort()，
+     用户敲 file delete a7.jpg 弹出的 Debug Error 就是它）。
+    用例 Cli.位置参数的信封形状 钉住机制本身（第 127.7 节）
+50. 进程间共写的两处纪律（提交 `5b316b3`）：
+    ① temp/ 的启动清理**只清十分钟以前**的 fmt-* 文件——提权结果文件的临时文件
+       也叫 fmt-elev-<pid>.json(.tmp)，`service install` 会在同一次操作里启动服务，
+       一律清掉会让父进程报「FMT-602 提权副本没有返回结果」（**服务其实装好了**，
+       用户看到的是假失败）；正在回传的结果寿命只有几十毫秒（第 5、126 节）
+    ② 原子写的临时名必须**每个进程、每次调用都不同**：<目标>.<pid>.<序号>.tmp。
+       固定 <目标>.tmp 时两个写者（安装器与服务启动都写 service.json）会互相踩：
+       先完成的一方把 .tmp rename 走，另一方读回校验时报「无法打开文件」，
+       而调用方忽略了返回值 → service.json 静默不更新。另外进程内加互斥、
+       MoveFileExW 遇到 ACCESS_DENIED / SHARING_VIOLATION / LOCK_VIOLATION
+       （以及 FILE_NOT_FOUND）**短暂重试** 40 次 × 5 ms（第 11 节）
+51. TrashEntry.present 的语义写死为「**数据在不在磁盘上**」（提交 `5b316b3`）：
+    回退/永久删除的**结果条目不翻转它**——恢复成功后数据在仓库里，它就是 true；
+    拿它当「还在不在回收站」会打印「状态：数据已不存在」这种误导信息。
+    结果由 message 说明。**残余不一致**：桶级 restore / purge 那两处仍置 false，
+    如实记录待统一（第 53.1、53.3 节）
 ```
 
 ---
@@ -7525,6 +7584,55 @@ when it hurts」）**：
 （`FMT 技术文档.md` 第 9.1、9.3、10.2、11.14、12.3.2.1、18.27 节）
 ```
 
+**实测暴露的三处修复并入的决策（提交 `2c841c8`「fix(cli): build the precheck arguments
+as an envelope, not on the array」+ `5b316b3`「fix: stop the state file and the temp sweep
+from fighting each other」）**：
+
+```text
+① CLI 崩溃：开关挂到了位置参数数组上（2c841c8）
+   现象：fmt> file delete a7.jpg → 「Debug Error! abort() has been called」
+   原因：check.args = arguments; check.args["dry_run"] = true;
+        arguments 是位置参数**数组**，nlohmann 对数组用字符串下标抛 type_error.305，
+        没人接 → abort()。服务端期望的是开关与 argv **同级**：
+        {"argv":["a7.jpg"], "dry_run":true}
+   修复：新增 fmt::cli::argument_envelope(positional, dry_run, force)（cli.hpp / cli.cpp），
+        **预检与真实请求都用它**，两者因此不可能各错一处
+   教训：单元测试原来**自己照着服务端期望的形状拼请求**，CLI 拼的是另一种形状——
+        测试全绿、CLI 一敲就崩。规则定成「形状必须由同一个构造函数产出，
+        测试不许自己拼」；用例 Cli.位置参数的信封形状 直接钉住机制
+        （旧写法必须抛 type_error.305、新写法必须是带 argv 且开关同级的对象）
+② 提权结果文件被 temp 清理误删 → 假失败 FMT-602（5b316b3）
+   实测：提权副本报「执行成功」，紧接着「结果文件写入失败：无法打开
+        …temp\fmt-elev-2296.json.tmp」，同时 [Service] 清理了 temp/ 里 1 个文件，
+        最后 CLI 报「FMT-602 提权副本没有返回结果」——**服务其实装好并启动了**
+   原因：service install 会在同一次操作里启动服务，而服务启动时清理 temp/ 里所有
+        fmt-* 文件；提权结果文件的临时文件正好叫 fmt-elev-<pid>.json(.tmp)
+   修复：clean_temp_directory() **只清十分钟以前**的（结果文件寿命只有几十毫秒），
+        读不到时间戳的也不动（第 5、126 节）
+③ 原子写的临时文件重名 → service.json 静默不更新（5b316b3）
+   原因：write_text_file_atomic() 固定用 <目标>.tmp，而同一个目标有两个写者
+        （安装器在启动服务后写 service.json，服务启动时也写它）；先完成的一方把
+        .tmp rename 走，另一方读回校验时报「无法打开文件 …tmp」；安装器那处是
+        (void)save_state(updated)（忽略返回值）→ service.json 时间戳一直停在旧值
+   修复：临时名带 pid + 序号（<目标>.<pid>.<n>.tmp）、进程内对原子写加互斥、
+        MoveFileExW 对 ACCESS_DENIED / SHARING_VIOLATION / LOCK_VIOLATION
+        （及 FILE_NOT_FOUND）短暂重试（最多 40 次 × 5 ms）
+   用例：Storage.两个写者同时写同一个文件不会互相踩（8 线程 × 40 轮，零失败、
+        内容必须是某一次完整写入、不留 .tmp）
+④ 回收站恢复结果里的误导字段（5b316b3）
+   现象：trash restore 成功后打印「状态：数据已不存在」，而数据刚被搬回仓库
+   原因：TrashService::restore() 把返回条目的 present 改成 false（本意是「已经不在
+        回收站里了」），但 present 的语义是**数据在不在磁盘上**
+   修复：恢复/永久删除**不再翻转这个字段**，结果由 message 说明；
+        语义写死在 53.1 / 53.3 的字段表里。**残余不一致**：桶级 restore / purge
+        那两处仍置 false（打印里仍会出现「状态：数据已不存在」），如实记录待统一
+测试：142 → **144 项全绿**（2c841c8 新增 Cli.位置参数的信封形状 到 143、
+  5b316b3 再新增 Storage.两个写者同时写同一个文件不会互相踩 到 144；
+  改动：Service.启动时清理temp里的遗留临时文件 现在是「新的留着、把时间拨回
+  一小时后的旧的清掉、用户手放的其它文件始终不动」）
+（`FMT 技术文档.md` 第 5.1、6.6、11.15、13.8.3、18.28、18.29 节）
+```
+
 **已知限制（如实记录；`188e85d` / `a2b6cd1` / `0fc242b` 逐轮复核）**：
 
 ```text
@@ -7568,8 +7676,9 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 > 「删除桶不提醒」「`src/trash/` 不存在」（分别见第 17.1、52、53、30、4 节）。
 >
 > **测试计数走过的台阶**：118（`188e85d`）→ 124（`a2b6cd1`）→ 126（`0ad9efc`）→
-> 129（`5bf2c1f`）→ 134（`9c3d2cb`）→ **142（`a9af276`）**；中间 136 是 `711da4c`、
-> 140 是 `0fc242b` 这一步。第 109、112、125 节已按 142 更新。
+> 129（`5bf2c1f`）→ 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→
+> 142（`a9af276`）→ **144（`5b316b3`）**（143 是 `2c841c8` 这一步）。
+> 第 109、112、125 节已按 144 更新。
 
 后续开发过程中，如果发现：
 
@@ -7675,6 +7784,23 @@ operation ∈ install | uninstall | start | stop | reinstall
 | `ShellExecuteExW` 其它失败 | 其它 `GetLastError()` | `FMT-602` / **8** |
 | 提权副本卡住 | `WAIT_TIMEOUT`（60 秒） | `FMT-602` / **8** |
 | 结果文件不存在（子进程崩了） | 读文件失败 | `FMT-602` / **8**，「提权副本没有返回结果」 |
+| **结果文件被 temp 清理误删**（提交 `5b316b3` 已修） | 提权副本报「执行成功」，父进程却读不到结果 | `FMT-602` / **8**——**假失败**，见下 |
+
+> **`FMT-602` 的一个已修成因（提交 `5b316b3`，照着实测日志记）**：
+
+```text
+[Elevated] 提权副本执行成功：install（错误码 0）
+[Elevated] 结果文件写入失败：无法打开文件：D:\...\temp\fmt-elev-2296.json.tmp
+[Service]  清理 temp/ 中 1 个遗留临时文件
+[Cli]      service install 提权失败：FMT-602 提权副本没有返回结果（退出码 1）
+```
+
+> **服务其实装好并启动了，用户看到的却是失败。** 原因：`service install` 会在同一次操作里
+> **启动服务**，而服务启动时清理 `temp/` 里所有 `fmt-*` 文件——提权副本回传结果的临时文件
+> 正好叫 `fmt-elev-<pid>.json(.tmp)`，**也被清掉了**。
+> **修复**（`src/service/runtime.cpp` 的 `clean_temp_directory()`）：**只清十分钟以前**的
+> （正在回传的结果文件寿命只有几十毫秒），读不到时间戳的也不动。
+> 详见第 5 节与 `FMT 技术文档.md` 第 13.8.3 节。
 
 `runas` 启动的控制台程序会**另开一个控制台窗口**，所以提权副本必须：
 
@@ -8289,6 +8415,41 @@ fmt> bucket create 工作‪                    ← 名字里带 U+202A：**不�
 ```
 
 **关键性质：用户确认之前，一个破坏性请求都不会发出去**（预检是只读的）。
+
+**预检与真实请求的参数形状由同一个构造函数产出（提交 `2c841c8`）**：
+
+```cpp
+// include/fmt/cli/cli.hpp（提交 2c841c8）
+// 一条业务命令的**参数信封**：位置参数放 args.argv，开关（dry_run / force）放**同级**字段。
+nlohmann::json argument_envelope(const nlohmann::json& positional,
+                                 bool dry_run = false, bool force = false);
+
+// 预检：argument_envelope(arguments, /*dry_run=*/true)  → {"argv":["a7.jpg"],"dry_run":true}
+// 真实请求：argument_envelope(arguments, false, confirmed || destructive)
+//                                                    → {"argv":["a7.jpg"],"force":true}
+```
+
+**用户实测的崩溃（照实记录）**：敲 `file delete a7.jpg` 弹出
+**「Debug Error! abort() has been called」**。原因是确认流程里把开关挂到了位置参数
+**数组**上：
+
+```cpp
+check.args = arguments;          // arguments 是位置参数**数组** ["a7.jpg"]
+check.args["dry_run"] = true;    // nlohmann 对数组用字符串下标 → 抛 type_error.305
+```
+
+异常没人接 → `abort()`（Debug 版就弹那个框）。**服务端期望的形状是开关与 `argv` 同级**：
+`{"argv":["a7.jpg"], "dry_run":true}`。
+
+> **工程教训（值得单独记住）**：原来的单元测试**自己照着服务端期望的形状拼请求**，
+> 而 CLI 拼的是另一种形状——**测试全绿，CLI 一敲就崩**。测试复制了「契约」，
+> 却没有共用「产出契约的那段代码」，于是两边的形状各自漂移、谁也没钉住谁。
+> 所以规则是：**形状必须由同一个构造函数产出，测试不许自己拼**。
+> 新增用例 `Cli.位置参数的信封形状` 直接钉住机制本身：旧写法必须抛
+> `type_error.305`，新写法必须是**带 `argv` 且开关同级**的对象。
+> 四份文档里凡出现「预检请求 `args.dry_run`」的地方，样例本身就是同级写法
+> （`{"argv":[…],"dry_run":true}`）。
+
 几条要说准的细节：
 
 ```text

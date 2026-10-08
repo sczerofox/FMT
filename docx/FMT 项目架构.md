@@ -71,7 +71,7 @@ V1 用 **JSON + 文件系统**满足需求，不使用数据库、Redis、MQ、�
 
 ## 2. 关键设计决策
 
-V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～31** 项是
+V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～32** 项是
 `arch-restart` 分支新增的**重构冻结项**，逐条对应 `FMT 重构设计.md` 第 2 节的决策索引：
 
 | # | 规则 |
@@ -108,6 +108,8 @@ V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 �
 | 30 | **回收站是一份两级视图（提交 `0fc242b`；列表计数 `18f16ca`）**：`src/trash/` 的 `TrashService` **组合** `FileService` 与 `BucketService`，把文件级与桶级合成一份 `TrashEntry` 列表并做**跨命名空间的标识解析**（① 回收站目录名 → ② `file_id` → ③ 桶原名 → ④ 文件名；③④ 多条 → 候选）。权威：**文件级 = `file.json`**（`is_trash` / `trash_reason` / **`deleted_at`**），**桶级 = `trash/<user>/.original`**；**`data/trash.json` 不再写入**，只做只读兼容。`trash list` 标出 `[文件]` / `[桶]`，桶级条目的 `files`/`bytes` 在列表里就算出来（对每个 `present` 条目遍历一次目录，代价见第 13 节）；回退的三种硬拒绝（同名冲突 `FMT-401` / 随桶删除 `FMT-402` / 数据缺失 `FMT-002`）都是 `blocked` |
 
 | 31 | **粘贴路径的污染要清掉、不可见字符不许进名字（提交 `a9af276`）**：`clean_user_path()` 清掉不可见格式字符（`U+00A0` / `U+00AD` / `U+200B`–`U+200F` / `U+202A`–`U+202E` / `U+2060`–`U+2064` / `U+2066`–`U+2069` / `U+FEFF`）与**成对**引号、首尾空白，中文不受影响；**一处收口**在 `service/commands.cpp` 的 `argument()`（所有位置参数的唯一入口，CLI 与 HTTP 共用），`prepare_upload()` 再清一次来源与显式文件名。清掉后仍找不到 → `FMT-002` 并**点名码位**；**名字里不允许**这些字符：`validate_file_name()` → `FMT-101`、`validate_bucket_name()` → `FMT-202`（理由：屏幕上看不出来、用户没法重敲一遍）。用户实测：`C:\...\头像\asdva.jpg` 被 `U+202A`/`U+202C` 包住 → 「文件不存在」，现在能正常上传 |
+
+| 32 | **请求形状由同一个构造函数产出；进程间共写的两处纪律（提交 `2c841c8` + `5b316b3`，用户实测踩出来的）**：① `fmt::cli::argument_envelope(positional, dry_run, force)` 是「位置参数放 `argv`、开关放同级」的唯一产出点，预检与真实请求共用——原来把 `dry_run` 挂到位置参数**数组**上，nlohmann 抛 `type_error.305` 未捕获即 `abort()`（`file delete a7.jpg` 弹出的 Debug Error）；**测试不许自己拼形状**（旧测试照着服务端契约拼，所以全绿却挡不住崩溃）。② temp/ 的启动清理**只清十分钟以前**的 `fmt-*`：提权结果文件也叫 `fmt-elev-<pid>.json(.tmp)`，`service install` 会在同一次操作里启动服务，一律清掉会让父进程报「FMT-602 提权副本没有返回结果」——**服务其实装好了**（假失败）。③ 原子写的临时名必须唯一（`<目标>.<pid>.<序号>.tmp`）+ 进程内互斥 + 替换遇共享冲突短暂重试：固定 `<目标>.tmp` 时安装器与服务启动同时写 `service.json` 会互相踩，加上调用方忽略返回值 → `service.json` 静默不更新。④ `TrashEntry.present` 语义写死为「数据在不在磁盘上」，回退/删除的结果**不翻转它**（原来恢复成功后打印「状态：数据已不存在」）。见第 4.2、4.5、8 节与 `FMT 技术文档.md` 第 6.6、10.4、11.15、13.8.3、18.28、18.29 节 |
 
 系统明确**禁止自动**执行：覆盖文件、修改用户文件名、选择其他 Bucket、创建恢复目标
 Bucket、绕过下载限制、删除文件、清空损坏 JSON、**删除旧数据根的数据**、**把服务宿主的
@@ -233,7 +235,12 @@ CLI 启动
   `FMT 技术文档.md` 第 4.4.1 节）。
 - 默认 JSON（`config/config.json`、`config/server.json`、`data/file.json`、`data/share.json`、
   `data/trash.json`、`data/user.json`）只在缺失时写入；关键 JSON 一律先写 `.tmp` 再原子替换，
-  避免异常退出写出半文件。
+  避免异常退出写出半文件。**临时名必须每个进程、每次调用都不同**
+  （`<目标>.<pid>.<序号>.tmp`，提交 `5b316b3`）：同一个目标会有两个写者（`service install`
+  时安装器与服务启动都写 `service.json`），固定 `<目标>.tmp` 会互相踩——先完成的一方把它
+  rename 走，另一方读回校验时报「无法打开文件」，而调用方忽略返回值 →
+  `service.json` 静默不更新；另外进程内对原子写加互斥、替换遇
+  `ACCESS_DENIED` / `SHARING_VIOLATION` / `LOCK_VIOLATION` 短暂重试（40 × 5 ms）。
 - **已存在的 JSON 会被真正读一遍**（解析 + 版本检查）来确认完整性；读不出来或版本不受支持的，
   **只报告、绝不重置**——沿用第 2 节第 13 项「JSON 损坏不能静默重置」。日志记一行
   `[Cli] 数据根损坏（未自动修复）：data/file.json`，同时把异常送到 stderr。
@@ -272,8 +279,13 @@ CLI 曾经的两处「例外」（写日志用的 `log/` 与执行提权命令�
           就退回系统临时目录 %TEMP%，并写一行 WARN 说明原因与改用后的路径。
           提权副本在写入结果文件前也会确保目录存在——它自己有权限，
           所以调用方数据根只读时它仍然能建出来
-清理      Service 启动时删除 temp/ 下以 fmt- 开头的遗留文件（上次异常退出留下的提权结果等），
-          用户手放进去的其它文件一律不动；删除数量记一行 INFO（第 4.6 节 ServiceMain 序列）
+清理      Service 启动时删除 temp/ 下**十分钟以前**的、以 fmt- 开头的遗留文件
+          （上次异常退出留下的提权结果等），用户手放进去的其它文件一律不动；
+          删除数量记一行 INFO（第 4.6 节 ServiceMain 序列）。
+          **按年龄过滤的理由（提交 `5b316b3`）**：提权结果文件的临时文件也叫
+          `fmt-elev-<pid>.json(.tmp)`，而 `service install` 会在同一次操作里启动服务——
+          一律清掉会把父进程正在收的结果文件删掉，父进程报「FMT-602 提权副本没有返回结果」，
+          **服务其实装好了**（假失败，见第 4.5 节）。结果文件寿命只有几十毫秒
 ```
 
 `temp/` 跟着 exe 走：它在数据根下，用户一眼能找到、随时可清。它按定义就是**可清空**的目录，
@@ -529,6 +541,7 @@ CLI 形态
 | `ShellExecuteExW` 其它失败 | `FMT-602` | 8 |
 | 提权副本等待超时（60 秒）、SCM 操作失败 | `FMT-602` | 8 |
 | 结果文件不存在（提权副本崩了） | `FMT-602` | 8 |
+| **结果文件被 temp 清理误删**（提交 `5b316b3` 已修：清理只清十分钟以前的） | `FMT-602` | 8（**假失败**：提权副本报成功、服务其实已装好，父进程却读不到结果——见第 4.2 节与 `FMT 技术文档.md` 第 13.8.3 节） |
 | 未提权提示（打印「需要管理员权限」） | `FMT-603` | 5 |
 
 `FMT-603` 只在**最终无法提权、命令以失败告终**时作为退出码；正常提权流程里它只是提示行，
@@ -568,7 +581,9 @@ RegisterServiceCtrlHandlerExW
   → SetServiceStatus(SERVICE_START_PENDING[, dwCheckPoint])
   → 读 %ProgramData%\FMT\service.json，确定数据根
   → 初始化存储与业务服务（幂等建目录 + 默认 JSON，含 temp/；与服务/CLI 共用的 ensure_root）
-  → 清理 <数据根>/temp 下以 fmt- 开头的遗留文件（用户手放的其它文件不动），删除数量记一行 INFO
+  → 清理 <数据根>/temp 下**十分钟以前**的、以 fmt- 开头的遗留文件
+    （用户手放的其它文件不动；提交 5b316b3 起按年龄过滤，否则会把 service install
+      正在等的提权结果文件删掉 → 假失败 FMT-602），删除数量记一行 INFO
   → 起 HTTP 线程
   → SetServiceStatus(SERVICE_RUNNING, ACCEPT_STOP | ACCEPT_SHUTDOWN)
   → 等停止事件
@@ -958,6 +973,11 @@ Result<TrashPurge>               purge(std::string_view identifier);        // 4
 **代价（如实记录）**：`trash list` 因此不是纯索引查询（每个桶条目多遍历一次目录），
 但它是用户显式敲的命令；`BucketService::list_trashed()` 那层索引仍不遍历目录。
 原口径「只有单条查询遍历目录、列表不做」**已作废**。
+
+**`present` 的语义 = 「数据在不在磁盘上」（提交 `5b316b3`）**：`restore` / `purge` 的**结果条目
+不翻转它**——恢复成功后数据在仓库里，它就是 `true`；拿它当「还在不在回收站」用会打印出
+「状态：数据已不存在」这种误导信息（实测报上来的就是这条）。结果一律由 `message` 说明。
+**残余不一致**：桶级 `restore` / `purge` 两处仍置 `false`，如实记录待统一。
 
 **`trash delete` 的三步与确认（提交 `4fee290`；`0fc242b` 起两级通用）**：
 
@@ -1669,7 +1689,7 @@ before a bucket goes」；
 | `common/hash`（**提交 `188e85d`**）：`Md5`（Windows CNG / bcrypt 增量接口）+ `md5_hex()`；`bcrypt.lib` 在 `src/common/CMakeLists.txt` 链接 | `include/fmt/common/hash.hpp`、`src/common/hash.cpp` |
 | `core`：`PathManager`（`trash_file` 落点 `trash/<user>/.files/<bucket>/YYYY/MM/DD/`，提交 `4fee290`） | `src/core/` |
 | `common/http_client`（**提交 `a2b6cd1`**）：`is_remote_url()` + `http_download()`——WinHTTP + Schannel 的流式 GET（跟随重定向、连接/发送/接收超时、`Accept-Encoding: identity`、只有 2xx 交给 sink、sink 返回 false 即中止、证书失败给准提示）；`src/common/CMakeLists.txt` 链 `winhttp`，`src/file/CMakeLists.txt` 不再链 cpp-httplib | `include/fmt/common/http_client.hpp`、`src/common/http_client.cpp` |
-| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**142 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
+| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**144 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`），提交 `2c841c8` 增到 143（`Cli.位置参数的信封形状`），提交 `5b316b3` 增到 144（`Storage.两个写者同时写同一个文件不会互相踩`，并把 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
 | vendored 第三方库 | `third_party/nlohmann/json.hpp`、`third_party/cpp-httplib/httplib.h`（**只服务 HTTP 服务端**；URL 下载走系统 `winhttp`） |
 | 版本号的单一来源（CMake 生成头） | `cmake/version.hpp.in` |
 | 构建辅助脚本 | `tools/build.ps1` |

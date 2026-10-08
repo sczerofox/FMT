@@ -89,7 +89,7 @@ share 清理（第 10 节）。
 | 25 | **`fmt-YYYYMMDD-N` 是保留形状（提交 `9c3d2cb`）**：文件名与 `file_id` 同形会被 `validate_file_name()` 拒绝（新错误码 `FMT-106 FileNameLikeFileId`，退出码 2，判定函数 `looks_like_file_id()`），理由与 Windows 保留设备名同类——定位是「先按 `file_id` 查、查不到再按名字查」，同名会遮住名字这一路。旧数据里已经存在的这种名字，`file delete` 在两个索引命中**不同**记录时报 `FMT-001`，消息里点名两条记录并让用户直接用 `file_id`；**只给 delete 加**（`locate_record()` 只被 `remove()` 用），`file get` 的两种查询范围保持不变（只读查询最坏是把 id 命中的那条给用户看，破坏性操作不能猜）。`file get` 对回收站里的记录另返回 `trash_path`（相对数据根、正斜杠），仓库里找不到时**不返回** `path` |
 | 26 | **先检查 → 说清楚冲突的具体对象 → 再确认（提交 `711da4c`；缺口收尾 `6a40742`）**：`file.delete` / `trash.delete` / `bucket.delete` 三类破坏性 op 支持 **`args.dry_run = true`**（HTTP `?dry_run=1`，由 `src/server/server.cpp` 的 `delete_args()` 解析，同时保留 `?force=1` 与请求体 `{"force":true}`）。服务端返回**只读预检**：`file.delete` → `FileDeleteCheck`（`ambiguous` / `other_bucket` / `blocked` / `needs_confirm` / `current_bucket` / `file_id` / `file_name` / `bucket` / `path` / `candidates[]` / `message`）；`trash.delete` → `TrashCheck`（`needs_confirm` **恒为 true** + 条目 + 消息）；`bucket.delete` → `BucketDeleteCheck`（有内容才 `needs_confirm`）。CLI 的 `confirm_before_acting()` / `print_precheck()`：**连服务 → 发预检（零副作用）→ 打印情况 → 交互问 `确认执行？(y/N)` / 一次性要 `--yes` → 同意后才带 `force` 发真实请求**；用户在确认之前**一个破坏性请求都不会发出去**。**歧义（名字与 `file_id` 撞在两条记录上）是 `blocked` 而不是 `needs_confirm`**——y 无法表达「删哪一个」，只能让用户改用 `file_id`。**新错误码 `FMT-016 ConfirmRequired`**（退出码 2，HTTP 400）：缺 `force` 的永久删除 / 跨 Bucket 删除 / 非空桶删除返回它，**不再复用 `FMT-001`**。服务端**独立校验**：预检被绕过也拦得住（**预检负责「说清楚」，force 负责「兜底」**）。顺带：跨 Bucket 成功时 `message` 带 `（Bucket：<桶>）`、`data` 增加 `bucket` 字段 |
 | 27 | **回收站是一份两级视图（提交 `0fc242b`）**：新建 `include/fmt/trash/trash.hpp` + `src/trash/trash.cpp` 的 `TrashService`，**组合** `FileService`（文件级）与 `BucketService`（桶级），合并成统一 `TrashEntry`（`type` / `id` / `name` / `bucket` / `deleted_at` / `bytes` / `files` / `present` / `restorable` / `trash_path` / `message`）并做**跨命名空间标识解析**（① 回收站目录名 → ② `file_id` → ③ 桶原名 → ④ 文件名；③④ 多条 → 候选）。**权威来源**：文件级 = `file.json`（新增 `deleted_at` 字段），桶级 = `trash/<user>/.original`；**`data/trash.json` 不再写入**（只读兼容老记录，回退/永久删除时顺手清掉）。`trash.list` → `{entries, count, files, buckets}`、`get`/`restore`/`delete` → `{entry, message?}`、预检 → `{needs_confirm, blocked, entry, message?}`，**旧的 `deleted_buckets` 与顶层 `trashed`/`original`/`files`/`bytes` 形状作废**。`trash list` 必须标出 `[文件]` / `[桶]`。回退的三种硬拒绝（同名冲突 `FMT-401`、随桶删除 `FMT-402`、数据缺失 `FMT-002`）都是 `blocked`；`bucket.delete` 也新增预检（有内容时提醒「之后只能整体恢复这个桶」） |
-| 28 | **粘贴路径的污染要清掉、不可见字符不许进名字（提交 `a9af276`）**：`clean_user_path()` 清掉不可见格式字符（`U+00A0` / `U+00AD` / `U+200B`–`U+200F` / `U+202A`–`U+202E` / `U+2060`–`U+2064` / `U+2066`–`U+2069` / `U+FEFF`）与**成对**引号（Explorer「复制路径」）、首尾空白，中文不受影响；`invisible_characters()` 按顺序去重给出码位名。**一处收口**：`service/commands.cpp` 的 `argument()` 是所有位置参数的唯一读取入口（CLI 与 HTTP 共用），`prepare_upload()` 再清一次来源与显式文件名（纵深防御）。清掉后本地路径仍不存在 → `FMT-002` 且**点名码位**（如 `U+202A`、`U+202C`）；**名字里不允许**它们：`validate_file_name()` → `FMT-101`、`validate_bucket_name()` → `FMT-202`。用户实测：`C:\...\头像\asdva.jpg` 被 `U+202A`/`U+202C` 包住 → 报「文件不存在」（文件其实在），现在能正常上传 |
+| 29 | **请求形状由同一个构造函数产出；进程间共写的两处纪律（提交 `2c841c8` + `5b316b3`，用户实测踩出来的）**：① `fmt::cli::argument_envelope(positional, dry_run, force)` 是「位置参数放 `argv`、开关放同级」的唯一产出点，**预检与真实请求共用**——原来把 `dry_run` 挂在位置参数**数组**上，nlohmann 抛 `type_error.305`，未捕获即 `abort()`（`file delete a7.jpg` 弹出的 Debug Error）；**测试不许自己拼形状**（旧测试照着服务端契约拼，所以全绿却挡不住这次崩溃）。② temp/ 的启动清理**只清十分钟以前**的 `fmt-*`：提权结果文件也叫 `fmt-elev-<pid>.json(.tmp)`，`service install` 在同一次操作里启动服务，一律清掉会让父进程报「FMT-602 提权副本没有返回结果」——**服务其实装好了**（假失败）。③ 原子写的临时名必须唯一（`<目标>.<pid>.<序号>.tmp`）+ 进程内互斥 + 替换遇共享冲突短暂重试（40 × 5 ms）：固定 `<目标>.tmp` 时安装器与服务启动同时写 `service.json` 会互相踩，加上调用方 `(void)save_state(...)` 忽略返回值 → `service.json` 静默不更新。④ `TrashEntry.present` 语义写死为「**数据在不在磁盘上**」，回退/删除的**结果条目不翻转它**（原来恢复成功后打印「状态：数据已不存在」；桶级两处残余，待统一）。见第 4.2、4.4 节 |
 
 
 ---
@@ -416,7 +416,9 @@ CLI 启动
          CLI    ：双击时，对自己 exe 所在的数据根执行（在打开日志器之前，所以 log/ 也由它建）
 共同规则 只补缺失
          六个目录缺则建，已存在一律不动（不删除、不覆盖、不改名）
-         默认 JSON 缺则写（关键 JSON 先写 .tmp 再原子替换）
+         默认 JSON 缺则写（关键 JSON 先写 .tmp 再原子替换；
+         提交 5b316b3 起临时名带 pid + 序号：<目标>.<pid>.<n>.tmp——固定名会让
+         两个写者互相踩，见第 9 节）
          已有的 JSON 会被真正读一遍（解析 + 版本检查）确认完整性
          读不出来或版本不受支持 → 只报告、绝不重置（沿用「JSON 损坏不能静默重置」）
          都不碰业务数据内容：不写 data/*.json 的内容、不删文件、不改名
@@ -543,7 +545,9 @@ RegisterServiceCtrlHandlerExW
   → SetServiceStatus(START_PENDING[, dwCheckPoint])
   → 读取 %ProgramData%\FMT\service.json，确定数据根
   → 初始化存储与业务服务（幂等建目录含 temp/ + 默认 JSON；与服务/CLI 共用的 ensure_root）
-  → 清理 temp/ 下以 fmt- 开头的遗留文件（用户手放的其它文件不动），删除数量记一行 INFO
+  → 清理 temp/ 下**十分钟以前**的、以 fmt- 开头的遗留文件（用户手放的其它文件不动），
+    删除数量记一行 INFO（提交 5b316b3：一律清会把 service install 正在等的提权结果
+    文件删掉 → 假失败 FMT-602，见第 9 节）
   → 起 HTTP 线程
   → SetServiceStatus(RUNNING, ACCEPT_STOP | ACCEPT_SHUTDOWN)
   → 等停止事件
@@ -666,6 +670,7 @@ CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位�
 | `service status` 成功（含「已安装但已停止」） | — | 0 |
 | SCM 操作失败 / 提权等待超时（60 秒） | `FMT-602 ServiceOperationFailed` | 8 |
 | `ShellExecuteExW` 其它失败 / 结果文件不存在（提权副本崩了） | `FMT-602 ServiceOperationFailed` | 8 |
+| **提权结果文件被 temp 清理误删**（提交 `5b316b3` 已修：启动清理只清十分钟以前的 `fmt-*`） | `FMT-602 ServiceOperationFailed`（「提权副本没有返回结果」）——**假失败**：提权副本报成功、服务其实已装好并启动，父进程却读不到结果文件，因为 `service install` 会在同一次操作里启动服务，而服务启动时把 `fmt-elev-<pid>.json(.tmp)` 一起清掉了 | 8 |
 | 需要管理员权限（打印「需要管理员权限」，或 `ShellExecuteExW` 失败且 `ERROR_ACCESS_DENIED` 5） | `FMT-603 AdminRequired` | 5 |
 | 用户在 UAC 点「否」（`ERROR_CANCELLED` 1223） | `FMT-004 PermissionDenied` | 5 |
 | **需要显式确认的操作缺 `force`**——永久删除（两级 `trash delete`）、跨 Bucket 的 `file delete`、非空桶的 `bucket delete`（提交 `711da4c`） | **`FMT-016 ConfirmRequired`**（默认消息「该操作需要显式确认（force）」；具体消息说明要确认什么，例如「永久删除不可恢复，需要确认（force = true）」「<预检消息>；确认删除请加 force（CLI：--yes）」；**HTTP 400**） | 2 |
@@ -741,6 +746,7 @@ CLI 会额外写一行 WARN 指明服务当前数据根与服务侧日志的位�
 | 29 | 破坏性操作（删文件、永久删除、删桶）要么直接执行、要么只问一句 `y/N`；跨 Bucket 按名字删除会**静默**删到别的桶；缺确认复用 `FMT-001`，脚本分不清「参数错」与「忘了确认」 | **提交 `711da4c`**：三类 op 都先发**只读预检**（`args.dry_run` / `?dry_run=1`），把「属于哪个桶、哪两条记录撞车、要永久删掉什么」原样打印，再问 `确认执行？(y/N)`（一次性命令要 `--yes`）；**用户同意前不发任何破坏性请求**；歧义 / 同名冲突 / 随桶删除 / 数据缺失算 `blocked`（y/N 解决不了，让用户改用 `file_id`）；新错误码 **`FMT-016 ConfirmRequired`**（退出码 2，HTTP 400），服务端仍独立校验 `force` | 「说清楚」和「兜底」是两件事：预检让用户知道自己在删什么，`force` 保证绕过预检的客户端也删不掉跨桶的东西。`FMT-016` 独立编号让脚本能区分「参数写错」与「忘了确认」 |
 | 30 | 回收站只有桶级能读（`deleted_buckets`），文件级「写得进、读不出」；权威散在 `trash.json`（第二份副本）与 `.original` 两处 | **提交 `0fc242b`**：新建 `src/trash/` 的 `TrashService`，把两级合成统一 `TrashEntry` 列表 + 跨命名空间标识解析；**权威改为「文件级 = `file.json`（含 `deleted_at`）、桶级 = `.original`」**，`data/trash.json` 不再写入（只读兼容）；`trash.list` 回 `{entries, count, files, buckets}` 并标出 `[文件]` / `[桶]`；回退的三种硬拒绝（`FMT-401` / `FMT-402` / `FMT-002`）都是 `blocked`；`bucket.delete` 也有预检（非空桶提醒「只能整体恢复这个桶」，缺 `force` → `FMT-016`） | 文件级条目本来就已经在 `file.json` 里有全部信息，再维护一份 `trash.json` 只会制造两个可能不一致的真相；两级合成一份视图，用户才不必先猜「这个名字是文件还是桶」 |
 | 31 | 路径参数**按原样**使用（用户从聊天窗口/网页/终端复制的路径会夹进 `U+202A` 这类**看不见**的格式字符，Explorer「复制路径」还会套一对引号）——屏幕上路径完全正常，`exists()` 却说不存在；名字里也一样会混进这些字符 | **提交 `a9af276`**：`clean_user_path()` 清掉不可见格式字符（`U+00A0` / `U+00AD` / `U+200B`–`U+200F` / `U+202A`–`U+202E` / `U+2060`–`U+2064` / `U+2066`–`U+2069` / `U+FEFF`）与**成对**引号、首尾空白；**一处收口**在 `argument()`（所有位置参数的唯一入口，CLI 与 HTTP 共用），`prepare_upload()` 再清一次来源与显式文件名；清掉后仍找不到 → `FMT-002` 且**点名码位**；**名字里不允许**这些字符（`FMT-101` / `FMT-202`） | 这类字符**屏幕上看不见**，用户会坚持「路径明明是对的」——原样使用等于把一个无法自查的失败扔给用户；清掉路径里的（粘贴必然产生）、拒掉名字里的（名字要长期存下来、还要被重敲一遍），才是可诊断的行为 |
+| 32 | 请求的 `args` 由调用方**各自拼**（CLI 把 `dry_run` 直接挂在位置参数**数组**上）；单元测试也**自己照着服务端契约拼**；temp/ 启动清理「见 `fmt-` 就清」；原子写的临时名固定 `<目标>.tmp`；`TrashEntry.present` 被当成「还在不在回收站」用 | **提交 `2c841c8` + `5b316b3`**：① 新增 `cli::argument_envelope(positional, dry_run, force)`，**预检与真实请求共用**（nlohmann 对数组用字符串下标会抛 `type_error.305`，未捕获即 `abort()`——`file delete a7.jpg` 的 Debug Error 就是它）；**测试不许自己拼形状**，用例 `Cli.位置参数的信封形状` 钉住机制。② temp/ 启动清理**只清十分钟以前**的 `fmt-*`（提权结果文件也叫 `fmt-elev-<pid>.json(.tmp)`，`service install` 会启动服务 → 一律清就报假失败 `FMT-602`）。③ 原子写临时名 `<目标>.<pid>.<序号>.tmp` + 进程内互斥 + 替换遇共享冲突重试 40 × 5 ms（两个写者同时写 `service.json` 会互相踩，加上调用方忽略返回值 → 状态文件静默不更新）。④ `present` 语义写死为「数据在不在磁盘上」，回退/删除的结果**不翻转它**（原来恢复成功后打印「状态：数据已不存在」） | 这四条都是**用户在自己机器上重装服务、跑真命令**才暴露的：单测自己拼契约就挡不住 CLI 崩溃；两个进程写同一个临时名会互相踩，而「忽略返回值」把失败变成了静默的旧数据；把 `present` 当「回收站里还有没有」用会打印与事实相反的结论。**共同点：能被自证的形状/状态，就不要让两个地方各写一份** |
 
 ---
 
