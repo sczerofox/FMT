@@ -1800,6 +1800,22 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 
 **阶段 4 之后从暂定转为已冻结的三条**：
 
+- **HTTP 兜底路由的三条口径（提交 `4ddb515`，2026-10-09 真机实测后定）**：已知模块
+  （`bucket` / `file` / `trash` / `share` / `config` / `server` / `preview`）下没有这个接口 →
+  **`501 + FMT-602`**「接口尚未实现：<path>」；完全打错的 `/api/...` →
+  **`404 + 新错误码 FMT-017 RouteNotFound`**「没有这个接口」；已知路由但业务找不到对象 →
+  `404 + FMT-002`。**原口径「兜底硬编码 500 + FMT-602 操作尚未实现」已作废**——
+  500 等于告诉调用方「服务器坏了」（实测 `GET /api/nosuch` 就是这样）。
+  `FMT-602` 的映射也从「落 `default: 500`」改成**显式 501**
+  （`FMT 技术文档.md` 第 12.3、12.5、18.31 节）。
+- **⚠ 待决缺口（真机实测，2026-10-09，未修）：`server.json` 的 `enabled` 没人打开。**
+  `ServerConfig::enabled` 默认 `false`，而 `src/` 里**没有任何代码**把它置为 `true`
+  （安装流程不碰 `config/server.json`，CLI 也没有命令能开），所以服务装好、在跑，
+  `127.0.0.1:4122` **根本不监听**——浏览器入口打不开（CLI 不受影响，它走管道）。
+  手动改成 `true` 并重启服务后 HTTP 入口**完全正常**，问题只在「没人开这个开关」。
+  **待用户决策**：① 安装流程按文档置 `true`，还是 ② 加一条 CLI 命令（如 `config http on`）。
+  **在定下来之前不要写成已实现**（第 4.4 节、`FMT 技术文档.md` 第 5.2、12.1、19.1 节）。
+
 - **Bucket 级 Trash 元数据结构**：**权威是 `trash/<user>/.original`**，形状
   `{"version":1,"buckets":[{"trashed","original","deleted_at"}]}`；回收站目录名一律带删除
   时间戳（同秒冲突加 `_2`）；**`data/trash.json` 不再记桶级条目**（旧的 `type:"bucket"` 作废），
@@ -1906,6 +1922,7 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 | FMT-014 | `PathEscape` | 路径穿越 | 2 |
 | FMT-015 | `ConsistencyError` | 数据一致性异常 | 6 |
 | FMT-016 | `ConfirmRequired` | 该操作需要显式确认（`force`）——**提交 `711da4c` 追加**：永久删除（两级 `trash delete`）、跨 Bucket 的 `file delete`、非空桶的 `bucket delete` 缺 `force` 时返回它；HTTP 400；**不再复用 `FMT-001`** | 2 |
+| FMT-017 | `RouteNotFound` | **没有这个接口**——**提交 `4ddb515` 追加**：HTTP 兜底路由遇到完全打错的 `/api/...` 路径时返回它（HTTP 404），默认消息「没有这个接口」。**只由 HTTP 兜底路由产生**——管道入口没有「路由」概念（op 名写错走业务层错误）。**已知模块下没有这个接口是另一回事**：`501 + FMT-602`（见下表 FMT-602 行） | 3 |
 
 **文件名校验（阶段 5 前，`common/validation`）**
 
@@ -1991,7 +2008,7 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 |---|---|---|---|
 | FMT-600 | `ServiceAlreadyInstalled` | Service 已存在 | 8 |
 | FMT-601 | `ServiceNotInstalled` | Service 不存在（`service status` 在未安装时也用它） | 8 |
-| FMT-602 | `ServiceOperationFailed` | Service 操作失败 | 8 |
+| FMT-602 | `ServiceOperationFailed` | Service 操作失败。**提交 `4ddb515` 起它也是 HTTP 501 的专属码**：兜底路由遇到「已知模块下没有这个接口」时返回 `501 + FMT-602`「接口尚未实现：<path>」（share 整组属于这一类）——原来落 `default: 500`，把「还没做」说成了「服务器坏了」。提权侧它还有「结果文件不存在」等含义（见提权章） | 8 |
 | FMT-603 | `AdminRequired` | 需要管理员权限 | 5 |
 | FMT-604 | `NoCurrentUser` | 未设置当前用户 | 7 |
 | FMT-700 | `HttpRequestInvalid` | HTTP 请求参数错误 | 2 |

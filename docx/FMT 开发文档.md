@@ -1678,6 +1678,8 @@ current_bucket = ""
    以及用户自己删过的文件（trash_reason="file"）一律不动
    （file.json 缺失时视为 0 个文件，不报错）
 7. 若 was_current：current_bucket 置空并保存；**不自动切换到别的 Bucket**
+   ——真机核实（2026-10-09）：置空之后下一条要当前桶的命令会报
+   **`FMT-305 未设置当前 Bucket`**（退出码 3，例如 `file list`）
 8. 返回 BucketRemoval{moved_to, trashed_name, files_affected, was_current}——调用方据此
    如实回报；`message` 末尾补一句「（之后只能整体恢复这个桶）」（提交 0fc242b）。
    管道与 HTTP 的 data 字段见 `FMT 技术文档.md` 第 12.3.2 节
@@ -3518,12 +3520,26 @@ HTTP：POST /api/trash/<名字>/restore（路径参数百分号解码）
 9. 返回 TrashBucket{trashed_name, original_name, deleted_at, directory_present=true}
 ```
 
-响应 `data`（与源码一致）：
+> **恢复桶**不会**自动把它设回当前 Bucket（真机核实，2026-10-09）**：删掉的如果是当前桶，
+> `current_bucket` 已经被置空（第 30 节），`trash restore` 只把目录搬回 `repository/`，
+> **不碰 `current_bucket`**——用户还要自己敲一次 `bucket use <原名>`。
+> 在此之前任何需要当前桶的命令（如 `file list`）会报 **`FMT-305 未设置当前 Bucket`**
+> （退出码 3）。这是设计（不替用户选桶），不是缺陷。
+
+响应 `data`（与源码一致；**提交 `0fc242b` 起统一成 `{entry, message}`**）：
 
 ```json
-{ "trashed": "lazy-fox_20261008012233", "original": "lazy-fox",
-  "restored_to": "repository/user/lazy-fox", "message": "Bucket 已回退：lazy-fox" }
+{ "entry": { "type": "bucket", "id": "lazy-fox_20261008012233", "name": "lazy-fox",
+             "deleted_at": "2026-10-08T01:22:33", "present": true, "restorable": true,
+             "trash_path": "trash/user/lazy-fox_20261008012233" },
+  "message": "Bucket 已回退：lazy-fox" }
 ```
+
+> 上面的 `{trashed, original, restored_to, message}` 是 `4fee290` 时的旧形状，**已作废**
+> （第 53.1、53.3 节与 `FMT 技术文档.md` 第 12.3.2.1 节有完整表）。
+> 真机核实（2026-10-09）：回退成功时打印是
+> 「`[桶] tmp-verify` / 标识 / 删除时间 / **`Bucket 已回退：tmp-verify`**」——
+> **没有**「状态：数据已不存在」（`present` 不翻转，提交 `8f0fd5c`）。
 
 ## 56.2 「部分恢复」属于文件级（**提交 `0fc242b` 已落地**）
 
@@ -4860,6 +4876,16 @@ enabled?
 127.0.0.1:4122
 ```
 
+> **⚠ 待决缺口（真机实测，2026-10-09）：`enabled` 没有任何代码去打开。**
+> `ServerConfig::enabled` 默认 `false`，而**全仓库没有代码把它置为 `true`**
+> （`git grep 'enabled = true'` 在 `src/` 零命中；安装流程不碰 `config/server.json`；
+> CLI 也没有命令能开）——所以服务装好、在跑，`127.0.0.1:4122` **根本不监听**，
+> 浏览器入口打不开（CLI 不受影响，它走管道）。把 `enabled` 手动改成 `true` 并重启服务后
+> HTTP 入口**完全正常**，问题只在「没人开这个开关」。
+> **待用户决策**：① 安装流程按文档把 `enabled` 置为 `true`，还是 ② 加一条 CLI 命令
+> （如 `config http on`）。**在定下来之前不要写成已实现**——详见 `FMT 技术文档.md`
+> 第 5.2、12.1、19.1 节（那里记着完整实测与两个可选做法）。
+
 ---
 
 # 79. HTTP Host
@@ -4963,7 +4989,22 @@ CLI 不实现 Preview。
 500 Internal Server Error
 ```
 
-内部错误。
+内部错误（**服务器自己坏了**）。
+
+```text
+501 Not Implemented
+```
+
+**接口尚未实现**（提交 `4ddb515`）：服务端认得这个模块，但还没有这个接口
+（`share` 整组属于这一类）。**别用 500 表达这件事**——500 等于告诉调用方「服务器坏了」。
+
+```text
+404 Not Found（新增一种含义，提交 4ddb515）
+```
+
+**没有这个接口**（完全打错的 `/api/...` 路径，如 `/api/nosuch`）→ **404 + `FMT-017
+RouteNotFound`**（退出码 3）。原来兜底路由硬编码 `500`，把「没这个接口」说成了
+「服务器坏了」（实测：`GET /api/nosuch` → `500 + FMT-602 操作尚未实现：/api/nosuch`）。
 
 ---
 
@@ -4974,9 +5015,26 @@ CLI 不实现 Preview。
 |---|---|---|
 | 400 | `FMT-001` **`FMT-016`** `FMT-012` `FMT-014` `FMT-100` `FMT-101` `FMT-102` `FMT-103` `FMT-104` **`FMT-106`** `FMT-202` `FMT-300` `FMT-303` `FMT-700` `FMT-701` | 参数／名称／路径／URL／**待确认** 类错误 |
 | 403 | `FMT-004` `FMT-501` `FMT-502` `FMT-503` | 权限不足与分享不可用 |
-| 404 | `FMT-002` `FMT-200` `FMT-400` `FMT-500` `FMT-305` `FMT-402` | 对象不存在（含未设置当前 Bucket、原 Bucket 已永久删除） |
+| 404 | `FMT-002` `FMT-200` `FMT-400` `FMT-500` `FMT-305` `FMT-402` **`FMT-017`** | 对象不存在（含未设置当前 Bucket、原 Bucket 已永久删除）、**没有这个接口** |
 | 409 | `FMT-003` `FMT-105` `FMT-201` `FMT-203` `FMT-304` `FMT-401` | 冲突（已存在、重名、仍被引用） |
-| 500 | 其余（JSON／配置／存储／IO 等） | 内部错误 |
+| 500 | 其余（JSON／配置／存储／IO 等） | 内部错误（服务器自己坏了） |
+| **501** | **`FMT-602 ServiceOperationFailed`** | **接口尚未实现**（提交 `4ddb515` 起显式登记；原来是落 `default: 500`） |
+
+**兜底路由的三条口径（提交 `4ddb515`）**：
+
+```text
+① 已知模块下没有这个接口   /api/bucket | /api/file | /api/trash | /api/share |
+                          /api/config | /api/server | /api/preview 之下没命中的路径
+                          → **501 + FMT-602**，「接口尚未实现：<path>」（share 整组属这类）
+② 完全打错的 /api/... 路径  → **404 + FMT-017 RouteNotFound**，「没有这个接口：<path>」
+③ 已知路由、业务找不到对象  → 404 + FMT-002（不变，例如 GET /api/file/nope.bin）
+```
+
+> **`FMT-017 RouteNotFound`（提交 `4ddb515`，退出码 3）**：属 `FMT-0xx` 通用一组，
+> 默认消息「没有这个接口」。它**只由 HTTP 兜底路由产生**——管道入口没有「路由」概念
+> （op 名写错是业务层的另一回事，走 `FMT-001` / `FMT-602`）。
+> **原口径「未知 /api 路径一律 500」已作废**；`FMT-602` 也从「落 `default: 500`」
+> 改成**显式 501**。
 
 **提交 `9c3d2cb` 新增的 `FMT-106 FileNameLikeFileId` 属 400 一类**（参数／名称类，
 退出码 2；第 25 节）。它是 `FMT-1xx` 文件名校验组里的第七个，与 `FMT-103`
@@ -7092,6 +7150,18 @@ V2
     误导信息。结果由 message 说明。**两级、restore/purge 四种结果都不翻转**，
     用例在 Service.管道能执行回收站命令（桶级）与 Trash.文件级条目能列出并回退 /
     Trash.永久删除文件级条目（文件级）里各有一条 present 断言（第 53.1、53.3 节）
+52. HTTP 兜底路由要分清「没这个接口」与「服务器坏了」（提交 `4ddb515`）：
+    已知模块下没有这个接口 → **501 + FMT-602**（「接口尚未实现：<path>」，share 属这类）；
+    完全打错的 /api/... → **404 + 新错误码 FMT-017 RouteNotFound**（「没有这个接口」，
+    退出码 3，只由 HTTP 兜底路由产生）；已知路由但业务找不到对象 → 404 + FMT-002。
+    原口径「兜底硬编码 500 + FMT-602 操作尚未实现」已作废——500 等于说服务器坏了。
+    FMT-602 的映射也从「落 default 500」改成显式 501（第 82 节）
+53. **待决缺口（真机实测，2026-10-09）：`server.json` 的 `enabled` 没人打开**——
+    `ServerConfig::enabled` 默认 false，`src/` 里没有任何代码置 true，安装流程不碰它，
+    CLI 也没有命令能开，所以装好的服务在 `127.0.0.1:4122` 不监听（CLI 不受影响，走管道）。
+    手动置 true 并重启后 HTTP 完全正常。**未定**：让安装流程置 true，还是加 CLI 命令
+    （如 `config http on`）。**在用户拍板前不许写成已实现**（第 78 节、
+    `FMT 技术文档.md` 第 5.2、12.1、19.1 节）
 ```
 
 ---
@@ -7556,6 +7626,39 @@ and count files in the list」，140 项仍全绿）**：
    代价是每个桶条目多遍历一次目录，trash list 因此不是纯索引查询（显式命令，可接受）
 （`FMT 技术文档.md` 第 10.4、11.14、12.3.2.1、18.26 节）
 ```
+
+**全功能真机测试暴露的一修一缺口（提交 `4ddb515`「fix(server): answer unknown routes
+with 404, unimplemented ones with 501」，2026-10-09 对已安装服务跑了 68 项检查）**：
+
+```text
+① 已修：未知 / 未实现的 /api 路径原来一律 500
+   实测 GET /api/nosuch → 500 + FMT-602「操作尚未实现：/api/nosuch」；
+   原因是兜底路由 Get(R"(/api/.*)") 里**硬编码 response.status = 500**
+   现在：已知模块但没这个接口 → 501 + FMT-602「接口尚未实现：<path>」；
+        完全打错的 /api/... → 404 + **新错误码 FMT-017 RouteNotFound**（退出码 3）；
+        已知路由、业务找不到对象 → 404 + FMT-002（不变）
+   新错误码只由 HTTP 兜底路由产生（管道没有「路由」概念）；FMT-602 的映射
+   从「落 default 500」改成**显式 501**（第 82 节）
+   144 项用例仍全绿（只改实现与既有用例，没有新增用例）
+
+② 真缺口（**未修，等用户决策**）：HTTP 入口实际上永远打不开
+   服务装好、在跑，但 127.0.0.1:4122 没有监听——ServerConfig::enabled 默认 false，
+   而全仓库没有代码把它置为 true（安装流程不碰 config/server.json，CLI 也没有命令能开）；
+   技术文档 5.2 里那句「Service 场景下由安装流程置为 true」**没实现**
+   手动把 enabled 改成 true、重启服务后，HTTP 入口完全正常（真实端口上全通）
+   待决：① 安装流程按文档置 true，还是 ② 加一条 CLI 命令（如 config http on）——先不写结论
+   （第 78 节、`FMT 技术文档.md` 第 5.2、12.1、19.1、18.31 节）
+
+③ 68 项检查里**通过**的部分（含 HTTP、上传、回收站、跨桶确认等）整理成一张表，
+   放在 `FMT 技术文档.md` 第 18.31 节「真机测试通过的部分」——那里是这次最完整的
+   端到端记录（对已安装服务实测，2026-10-09）
+```
+
+> **真机顺带确认的两点行为**（第一次真机确认，已写进对应小节）：
+> ① 删除**当前** Bucket 后 `current_bucket` 被置空，之后 `file list` 报
+> **`FMT-305 未设置当前 Bucket`**（退出码 3）；`trash restore` 把桶恢复回来**不会**自动设回
+> 当前桶，需要再敲一次 `bucket use`（第 30、56.1 节）。
+> ② `FMT-301 DownloadFailed` 的退出码是 **1**（与附录 A / 实现一致，已核对）。
 
 **粘贴污染并入的决策（提交 `a9af276`「fix(upload): strip what paste adds, and name it
 when it hurts」）**：
@@ -8564,11 +8667,14 @@ blocked 的情况     歧义（file.delete）、同名冲突 / 随桶删除 / �
 
 ```cpp
 enum class ErrorCode {
-    // FMT-001 ~ FMT-016：通用、JSON、路径（FMT-016 ConfirmRequired 提交 711da4c 追加：
+    // FMT-001 ~ FMT-017：通用、JSON、路径（FMT-016 ConfirmRequired 提交 711da4c 追加：
     //   该操作需要显式确认（force），退出码 2，HTTP 400——永久删除 / 跨 Bucket 删除 /
-    //   非空桶删除缺 force 时用它，不再复用 FMT-001）
+    //   非空桶删除缺 force 时用它，不再复用 FMT-001；
+    //   FMT-017 RouteNotFound 提交 4ddb515 追加：没有这个接口，退出码 3，HTTP 404——
+    //   只由 HTTP 兜底路由产生，管道入口没有「路由」概念）
     InvalidArgument,
     ConfirmRequired,
+    RouteNotFound,
     FileNotFound,
     // ... 见架构文档附录 A 完整清单
 

@@ -853,7 +853,7 @@ JSON（`.tmp` 原子替换，见 4.4.2）；CLI 不写入任何配置文件的�
 
 | 字段 | 说明 |
 |---|---|
-| `enabled` | 是否启用 HTTP。默认 `false`，Service 场景下由安装流程置为 `true` |
+| `enabled` | 是否启用 HTTP。**默认 `false`**；**原口径「Service 场景下由安装流程置为 `true`」是文档跑了在实现前面——全仓库没有任何代码把它置为 `true`（`grep 'enabled = true'` 在 `src/` 里零命中，只有 `tests/config_test.cpp` 里为了测试写过一次），安装流程不碰 `config/server.json`，CLI 也没有命令能开。这是**待决缺口**，见 12.1 与 19.1** |
 | `host` | 监听地址，`0.0.0.0` 允许局域网访问 |
 | `port` | 监听端口，默认 4122 |
 
@@ -3917,6 +3917,23 @@ src/common/
 默认 `127.0.0.1:4122`。绑定失败（端口占用）→ 记录 ERROR 日志，
 Service 模式下不中断其他功能。
 
+> **⚠ 待决缺口：`enabled` 没有任何代码去打开（真机实测，2026-10-09）**
+>
+> ```text
+> 实测     服务装好、正在跑，但 127.0.0.1:4122 **没有监听**
+> 原因     ① ServerConfig::enabled 默认 false（include/fmt/config/config.hpp）
+>          ② 全仓库没有代码把它置为 true（git grep 'enabled = true' 在 src/ 零命中；
+>             安装流程不碰 config/server.json；CLI 也没有命令能开）
+>          ③ 5.2 里那句「Service 场景下由安装流程置为 true」**没实现**
+> 手动验证 把 config/server.json 的 enabled 改成 true、重启服务后，HTTP 入口**完全正常**
+>          （ping / status / bucket / file / trash 全部可用）——问题只在「没人开这个开关」
+> 后果     安装完的服务在浏览器侧等于没有入口；CLI 不受影响（走管道）
+> ```
+>
+> **还没有结论**（等用户定）：是让**安装流程**按 5.2 的原文把 `enabled` 置为 `true`，
+> 还是加一条 **CLI 命令**（例如 `config http on` / `config set enabled true`）来开。
+> 见 5.2、19.1。**在定下来之前，任何文档都不要把它写成已实现。**
+
 > **端口占用不再是致命问题。** 旧的 CLI 依赖 4122，端口被占时整条命令链路失效；
 > 现在 CLI 走管道（13.9），HTTP 只服务浏览器，起不来只是「浏览器访问不了」。
 > 服务必须继续工作，并在日志里写明端口与原因。
@@ -3986,6 +4003,19 @@ HTTP 状态码（12.5）与简短文本。CLI 不访问它们，只把链接打�
 | POST | `/api/trash/<标识>/restore` | `trash restore <标识>`（**两级，`0fc242b` 起文件级也可**，路径参数百分号解码；`?dry_run=1` 预检） |
 | GET | `/api/trash/<标识>` | `trash get <标识>`（**两级**，提交 `4fee290` 起桶级、`0fc242b` 起文件级） |
 | DELETE | `/api/trash/<标识>` | `trash delete <标识>`（**永久删除，两级**；需 `?force=1`（或 `force=true`，大小写不敏感）或请求体 `{"force":true}`，否则 `400 + **FMT-016**`（提交 `711da4c` 起，原来记的是 `FMT-001`）；`?dry_run=1` 只预检） |
+
+**兜底路由（提交 `4ddb515`，路由表的最后一层）**：
+
+| 方法 | 路径 | 情况 | 响应 |
+|---|---|---|---|
+| GET | `/api/.*`（兜底，上面都没命中） | 路径在**已知模块**下但没这个接口（`/api/share/x`、`/api/file/list` 这类） | **501 + `FMT-602`**，消息「接口尚未实现：<path>」 |
+| GET | `/api/.*`（兜底） | **完全打错**的 `/api/...` 路径（如 `/api/nosuch`） | **404 + 新错误码 `FMT-017 RouteNotFound`**，消息「没有这个接口：<path>」 |
+| 任意 | 已知路由 | 路由存在、业务上找不到对象（`GET /api/file/nope.bin`） | 404 + `FMT-002`（不变） |
+
+> **原口径「兜底一律 `response.status = 500` + `FMT-602 操作尚未实现`」已作废**（提交 `4ddb515`）：
+> 500 等于告诉调用方「服务器坏了」，而真相是「没这个接口」。实测就是
+> `GET /api/nosuch` → `500 + FMT-602 操作尚未实现：/api/nosuch`。
+> 详见 12.5 的三条口径与 `FMT-017` 的说明。
 
 > **阶段 4 已落地的路由共九条**：`/api/bucket` 五条 + `/api/trash` 四条
 > （`GET /api/trash`、`POST /api/trash/<标识>/restore` 见 commit c2d545d，
@@ -4206,10 +4236,11 @@ V1 只实现图片，其他类型待后续扩展。
 | 204 | 成功但无响应体（**不得带 body**） |
 | 400 | 参数错误 |
 | 403 | 分享过期 / 次数耗尽 / 文件不可用 |
-| 404 | 资源不存在 |
+| 404 | 资源不存在（含**没有这个接口**） |
 | 405 | 非 GET 方法 |
 | 409 | 资源冲突 |
 | 500 | 内部错误 |
+| **501** | **接口尚未实现**（提交 `4ddb515`）——见下面的兜底路由 |
 
 删除类操作无返回内容时用 204，且必须保证 204 **不带响应体**。
 
@@ -4219,19 +4250,21 @@ V1 只实现图片，其他类型待后续扩展。
 |---|---|
 | 400 | `FMT-001` **`FMT-016`** `FMT-012` `FMT-014` `FMT-100` `FMT-101` `FMT-102` `FMT-103` `FMT-104` **`FMT-106`** `FMT-202` `FMT-300` `FMT-303` `FMT-700` `FMT-701` |
 | 403 | `FMT-004` `FMT-501` `FMT-502` `FMT-503` |
-| 404 | `FMT-002` `FMT-200` `FMT-400` `FMT-500` `FMT-305` `FMT-402` |
+| 404 | `FMT-002` `FMT-200` `FMT-400` `FMT-500` `FMT-305` `FMT-402` **`FMT-017`** |
 | 409 | `FMT-003` `FMT-105` `FMT-201` `FMT-203` `FMT-304` `FMT-401` |
 | 500 | 其余（JSON / 配置 / 存储 / IO 等） |
+| **501** | **`FMT-602 ServiceOperationFailed`**（提交 `4ddb515` 起：它表示「接口尚未实现」，原来是落 `default: 500`） |
 
 ```text
 400  InvalidArgument ConfirmRequired PathTooLong PathEscape FileName* BucketNameInvalid
      UrlInvalid SizeLimitExceeded HttpRequestInvalid PreviewUnsupported
 403  PermissionDenied ShareExpired ShareDownloadLimitReached ShareFileUnavailable
 404  FileNotFound BucketNotFound TrashEntryNotFound ShareNotFound
-     NoCurrentBucket RestoreBucketMissing
+     NoCurrentBucket RestoreBucketMissing RouteNotFound
 409  FileAlreadyExists FileNameConflict BucketAlreadyExists BucketInUse
      Md5Duplicate RestoreConflict
 500  default（JsonParseError / JsonWriteError / ConfigError / StorageError / IoError …）
+501  ServiceOperationFailed（「接口尚未实现」；提交 4ddb515 起显式登记）
 ```
 
 映射实现在 `src/server/server.cpp` 的 `http_status_for(ErrorCode)`：一个 `switch` +
@@ -4240,8 +4273,31 @@ V1 只实现图片，其他类型待后续扩展。
 CLI 只看信封里的 `FMT-NNN`）。
 
 映射的语义分组：`400` 参数/名称/路径/URL 类（用户改一下就能过）、`403` 权限与分享不可用、
-`404` 对象不存在（含「没选当前 Bucket」`FMT-305`、「原 Bucket 已永久删除」`FMT-402`）、
-`409` 冲突（已存在、重名、仍被引用）、`500` 其余（多半是数据根坏了，用户改不了）。
+`404` 对象不存在（含「没选当前 Bucket」`FMT-305`、「原 Bucket 已永久删除」`FMT-402`、
+**「没有这个接口」`FMT-017`**）、`409` 冲突（已存在、重名、仍被引用）、
+`500` 其余（多半是数据根坏了，用户改不了）、**`501` 功能还没做**。
+
+**兜底路由：没有的路由不该报「服务器坏了」（提交 `4ddb515`）**：
+
+```text
+原来      `Get(R"(/api/.*)")` 兜底里**硬编码 response.status = 500**，
+          消息「操作尚未实现：<path>」——调用方看到 500 只会以为服务器坏了
+实测      GET /api/nosuch → HTTP 500 + FMT-602 操作尚未实现：/api/nosuch
+现在      ① 路径落在**已知模块**下但没有这个接口（/api/bucket | /api/file | /api/trash |
+             /api/share | /api/config | /api/server | /api/preview）→ **501 + FMT-602**，
+             消息「接口尚未实现：<path>」（share 整组属于这一类）
+          ② 完全打错的 /api/... 路径 → **404 + 新错误码 FMT-017 RouteNotFound**，
+             消息「没有这个接口：<path>」
+          ③ 已知路由但业务上找不到对象（如 GET /api/file/nope.bin）→ 404 + FMT-002（不变）
+```
+
+> **`FMT-017 RouteNotFound`（提交 `4ddb515`，退出码 3）**：只由 **HTTP 兜底路由**产生——
+> 管道入口没有「路由」概念（op 名写错是另一回事）。它属 `FMT-0xx` 通用一组，
+> 默认消息「没有这个接口」。
+>
+> **`FMT-602` 的映射也一并改了**：从「落 `default: 500`」改成**显式 501**——
+> 「服务端还没实现这个接口」是 501，而 500 是在说服务器内部坏了。用例
+> `Server.Bucket路由与状态码` / `Server.File路由与上传` 附近覆盖了这三类响应。
 
 > **`FMT-106 FileNameLikeFileId` 已登记为 400（提交 `6a40742`）**：`http_status_for()` 的
 > 400 那组 `case` 里已有 `case ErrorCode::FileNameLikeFileId:`，所以
@@ -7844,6 +7900,46 @@ trash list → 共 0 项
 
 ---
 
+### 18.31 全功能真机测试：兜底路由的 404/501 + 一个待决缺口（commit `4ddb515`）
+
+**2026-10-09 对已安装的服务**跑了 68 项检查（用户提供素材目录），暴露出**一个已修问题 +
+一个真缺口**。`4ddb515`「fix(server): answer unknown routes with 404, unimplemented ones
+with 501」，**144 个用例全绿**（只改实现与既有用例，没有新增用例）。
+
+```text
+① 已修：未知 / 未实现的 /api 路径原来一律 500（12.3、12.5）
+   实测     GET /api/nosuch → HTTP 500 + FMT-602「操作尚未实现：/api/nosuch」
+   原因     兜底路由 `Get(R"(/api/.*)")` 里**硬编码 response.status = 500**
+   现在     已知模块（bucket/file/trash/share/config/server/preview）下没有这个接口
+            → **501 + FMT-602**「接口尚未实现：<path>」（share 整组属这一类）
+            完全打错的 /api/... → **404 + 新错误码 FMT-017 RouteNotFound**「没有这个接口」
+            已知路由但业务找不到对象（GET /api/file/nope.bin）→ 404 + FMT-002（不变）
+           `FMT-602` 的映射也从「落 default 500」改成**显式 501**
+   新错误码 FMT-017 RouteNotFound（FMT-0xx 通用一组，退出码 3）**只由 HTTP 兜底路由产生**
+            ——管道入口没有「路由」概念
+
+② 真缺口（**未修，待用户决策**）：HTTP 入口实际上永远打不开（5.2、12.1、19.1）
+   实测     服务装好、在跑，但 127.0.0.1:4122 **没有监听**
+   原因     ServerConfig::enabled 默认 false，而全仓库没有代码把它置为 true
+            （安装流程不碰 config/server.json，CLI 也没有命令能开）；
+            5.2 里那句「Service 场景下由安装流程置为 true」**没实现**
+   手动验证 改成 true 并重启服务后，HTTP 入口完全正常（下表那些 HTTP 检查就是这么跑通的）
+   待决     ① 安装流程按文档置 true，还是 ② 加一条 CLI 命令（如 config http on）——先不写结论
+```
+
+**真机测试通过的部分（2026-10-09，对已安装服务实测；用户提供素材目录）**：
+
+| 类别 | 已核实 |
+|---|---|
+| Bucket | `create PROBE` → 提示转小写 `probe` ✓；重名 `FMT-201` ✓；中文桶名 ✓；`list` / `get` / `use` 大小写不敏感 ✓；`use` 不存在 `FMT-200` ✓；名字非法（`a:b` / `.` / `CON`）`FMT-202` ✓；**删空桶不打扰用户** ✓；删非空桶提醒「只能整体恢复这个桶」并要 `force`（`FMT-016`）✓ |
+| 上传 | 本地路径（含中文目录）✓；显式中文名 ✓；同内容 `FMT-304` ✓；同名 `FMT-105` ✓；`fmt-YYYYMMDD-N` 形状 `FMT-106` ✓；`CON.txt` `FMT-103` ✓；路径不存在 `FMT-002` ✓；名字含分隔符 `FMT-102` ✓；**HTTPS 真实下载成功**（github raw）✓；URL 推不出名 `FMT-100` ✓；域名解析失败 `FMT-301`（带「域名解析失败」）✓；`ftp://` `FMT-300` ✓；超 50MB `FMT-303` ✓；**不可见字符包裹的路径自动清掉并上传成功** ✓ |
+| 查询 / 删除 | `file get` 按名 / 按 id ✓；不存在 `FMT-002` ✓；缺参 `FMT-001` ✓；同桶删除不问 ✓；重复删除提示「已经在回收站里：<file_id>」✓；跨桶删除无 `--yes` → `FMT-016` 且**确实没删** ✓，带 `--yes` → 成功且消息带「（Bucket：probe）」✓ |
+| 回收站 | `list` 标出 `[文件]` / `[桶]`（含桶的文件数与占用）✓；`get` 按 `file_id` / 按名字 ✓；不存在 `FMT-400`（带「随桶删除请用 trash list 找桶」提示）✓；回退 ✓；同名冲突 `FMT-401` ✓；永久删除缺 `--yes` → `FMT-016` ✓、带 `--yes` ✓；随桶删除的文件单独回退 → `FMT-402`（带桶名与「`trash restore <桶的回收站名>`」提示）✓；整体恢复桶 ✓ |
+| HTTP（`enabled` 手动打开后） | `GET /api/ping`、`/api/status`（含 `channel` / `pid` / `root` / `version`）、`/api/bucket`、`/api/file` ✓；`POST /api/file`（`{"path":…}`）✓、缺 `path` → 400 ✓；`POST /api/bucket`（含小写规范化 + `note`）✓、重名 → 409 ✓；`DELETE /api/file?dry_run=1` ✓、跨桶无 `force` → 400 + `FMT-016` ✓、带 `force=1` → 200 ✓；`GET /api/trash` ✓；`POST /api/trash/<名>/restore` ✓ |
+| 行为确认 | ① 删除**当前** Bucket 后 `current_bucket` 被置空，之后 `file list` 报 `FMT-305 未设置当前 Bucket`（退出码 3）；`trash restore` 把桶恢复回来**不会**自动设回当前桶，需要 `bucket use`（设计如此，见 10.1、开发文档第 30/61 节）。② `FMT-301 DownloadFailed` 的退出码是 **1**（附录 A 与实现一致） |
+
+---
+
 ## 19. 待决事项
 
 ### 19.1 本次重构引入的待决事项
@@ -7870,6 +7966,7 @@ trash list → 共 0 项
 | `version` 字段与兼容 | `service.json` 沿用「未知版本直接拒绝」的策略，还是允许忽略未知字段待定 |
 | 双击引导「等待落定」的具体时长 | **已定稿，从待决清单移出**：不写死时长，改为**按 SCM 的 `dwWaitHint` 自适应**——每轮查询把 `dwWaitHint` 夹在 100 ms – 2000 ms 之间作为下次间隔，兜底上限 30 秒，状态一旦不是等待类就立即结束（13.4.3）。理由是写死 8 秒在慢机器上会把「还在启动」误判成「启动失败」，白弹一次解决不了问题的 UAC 重装。判定用的错误码集合也已冻结（13.2.3）。「仍没起」时是否再多试一次 `reinstall` 仍待实测后定 |
 | `service status` 输出是否要机器可读格式 | **已定稿，从待决清单移出**：**V1 不做 `--json`，也不预留参数名**。机器可读通道是**命令退出码**（`0` 成功；未安装 `FMT-601` → `8`；查询失败 → `8`），人类可读通道是那几行文本（11.6、13.4.1）。需要结构化字段（如 `wait_hint_ms`）时再加 |
+| **`server.json` 的 `enabled` 由谁打开（真机实测暴露的缺口，2026-10-09，尚未修）** | **实况**：`ServerConfig::enabled` 默认 `false`，而**全仓库没有任何代码把它置为 `true`**（`git grep 'enabled = true'` 在 `src/` 零命中；唯一一次是 `tests/config_test.cpp`），安装流程不碰 `config/server.json`，CLI 也没有命令能开 → 装好的服务在 `127.0.0.1:4122` **根本不监听**，浏览器入口打不开（CLI 不受影响，它走管道）。手动把 `enabled` 改成 `true` 并重启服务后，HTTP 入口**完全正常**（ping / status / bucket / file / trash 全通）。**可选做法（未定，等用户拍）**：① 让安装流程按 5.2 的原文把 `enabled` 置为 `true`（实现那句一直没落地的话）；② 加一条 CLI 命令（如 `config http on` / `config set enabled true`）显式打开。**注意**：`config.*` 整组本身也还没实现（`FMT-602`），所以做法 ② 会把 `config` 组的一部分提前。见 5.2、12.1 |
 
 ### 19.2 上一次实现遗留的待决事项（仍然有效）
 
