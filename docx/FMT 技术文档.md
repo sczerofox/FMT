@@ -1442,11 +1442,21 @@ Windows 非法字符： \ / : * ? " < > |
 Windows 保留名称：CON PRN AUX NUL COM1..COM9 LPT1..LPT9
    —— 含带扩展名的形式，如 CON.txt
 与 file_id 同形的保留形状：fmt-YYYYMMDD-N（提交 9c3d2cb → FMT-106，见 9.3）
+不可见格式字符：U+00A0 / U+00AD / U+200B–U+200F / U+202A–U+202E /
+   U+2060–U+2064 / U+2066–U+2069 / U+FEFF（提交 a9af276 → 文件名 FMT-101、
+   Bucket 名 FMT-202，见 9.3 与 9.5）
 Windows 保留字符结尾：文件名以空格或 . 结尾
 超长文件名（超过 255 字符，或完整路径超过 260 字符）
 ```
 
 **超长直接拒绝，不允许程序自动截断。**
+
+> **为什么连不可见字符也要拒（提交 `a9af276`）**：从聊天窗口、网页、终端复制一段文本
+> 时常常夹进方向格式字符（`U+202A` 这类），屏幕上看不出来；如果进了名字，用户
+> **没法把它重新敲一遍**，按名查找、排序、日志也全对不上。所以名字里出现它们一律拒绝
+> （`validate_file_name()` → `FMT-101`、`validate_bucket_name()` → `FMT-202`），
+> 消息里点名码位。**注意区分**：**路径参数**里的这类字符会被 `clean_user_path()`
+> 清掉（9.5），照常能用；只有**名字**是不许带的。
 
 ### 9.2 文件名唯一性
 
@@ -1536,6 +1546,9 @@ Status validate_file_name(std::string_view name);
 2. ≤ kMaxNameBytes（255 字节；中文一个字 3 字节，所以名字不能靠「字数」估）
 3. 不含路径分隔符 / 与 \，且不是 "." 或 ".."
 4. 不含控制字符（< 0x20 与 0x7F）与 < > : " | ? *（文件名把两者都归 FMT-101）
+4.5 **（提交 a9af276）不含不可见格式字符**（invisible_characters() 非空即拒）：
+   文件名 → FMT-101 FileNameInvalidChar、Bucket 名 → FMT-202 BucketNameInvalid，
+   消息点名码位（「请把名字重敲一遍」）；判定在非法字符之后、保留设备名之前
 5. 不是 Windows 保留设备名（9.1 的名单，主干比对、大小写不敏感）
 6. **（提交 9c3d2cb，只对文件名）不是与 file_id 同形的保留形状** fmt-YYYYMMDD-N
    —— 判定在保留设备名**之后**，命中 → FMT-106 FileNameLikeFileId
@@ -1572,6 +1585,7 @@ Status validate_file_name(std::string_view name);
 | 含路径分隔符 / 是 `.` 或 `..` | `FMT-102` | `FMT-202` |
 | Windows 保留设备名 | `FMT-103` | `FMT-202` |
 | 超过 255 字节 | `FMT-104` | `FMT-202` |
+| **含不可见格式字符**（提交 `a9af276`） | `FMT-101`（消息点名码位） | `FMT-202`（消息点名码位） |
 | 与 `file_id` 同形（`fmt-YYYYMMDD-N`，提交 `9c3d2cb`） | `FMT-106`（退出码 2） | —（Bucket 名不受限） |
 
 `FMT-105`（重名）不在本表内——它回答的是「这个名字是否已存在」，属业务规则（9.2）。
@@ -1658,6 +1672,59 @@ bucket list()           is_current = iequals(info.name, config_.current_bucket)
         .original 的 original、file.json 里按桶名匹配的记录）；create 不走它，
         而是在建目录前先 to_lower()
 ```
+
+---
+
+### 9.5 粘贴污染：`clean_user_path()` / `invisible_characters()`（提交 `a9af276`）
+
+**用户报的现象**：`fmt> file upload ‪C:\...\Pictures\pet-food-store\头像\asdva.jpg`
+→ `FMT-002 本地文件不存在`，可文件**确实存在**（130184 字节）。原因是路径首尾各夹了
+一个**不可见的方向格式字符**：开头 `U+202A`（LEFT-TO-RIGHT EMBEDDING）、结尾
+`U+202C`（POP DIRECTIONAL FORMATTING）——从聊天窗口、网页、终端复制路径时常见，
+**屏幕上完全看不出来**。CLI 走 `wmain`，中文路径本身没问题；是这两个字符被当成了
+路径的一部分，`exists()` 因此说不存在。
+
+```cpp
+// include/fmt/common/string.hpp / src/common/string.cpp（提交 a9af276）
+// 清掉粘贴污染：不可见格式字符 + **成对**引号（Explorer「复制路径」给路径套一对引号）
+std::string clean_user_path(std::string_view text);
+// 文本里出现的不可见字符，按顺序去重，形如 {"U+202A", "U+202C"}——报错时点出码位用
+std::vector<std::string> invisible_characters(std::string_view text);
+```
+
+```text
+清掉的码位   U+00A0（不换行空格）、U+00AD、U+200B–U+200F、U+202A–U+202E、
+             U+2060–U+2064、U+2066–U+2069、U+FEFF
+另外         去掉首尾空白；`"` / `'` / `“”` **成对**才去掉
+             （不成对不动，免得改掉名字里真的带引号的情况）
+不动         中文等多字节序列（合法 UTF-8 原样保留）
+```
+
+**两处调用（一处收口 + 一处纵深防御）**：
+
+```text
+① src/service/commands.cpp 的 argument()  —— **所有**位置参数读取的唯一入口，
+   CLI 与 HTTP 共用（12.3.2.1）：粘贴污染在这里就被清掉，这是「一处收口」
+② src/file/file.cpp 的 prepare_upload()  —— 上传**来源**与**显式文件名**再清一次；
+   将来有人绕过 argument() 直接调它也不受影响（纵深防御）
+```
+
+**名字里不允许**（9.1、9.3）：`validate_file_name()` → `FMT-101`、
+`validate_bucket_name()` → `FMT-202`，消息点名码位。理由：名字要长期存下来、
+还要被用户再敲一遍，屏幕上看不出来的字符没法重敲，按名查找 / 排序 / 日志也全对不上。
+
+**清掉后仍找不到的报错口径**（10.2.3、11.14 也有样例）：`prepare_upload()` 在本地路径
+存在性检查失败时，用 `invisible_characters(raw_source)` 把**原始输入**里的码位点名：
+
+```text
+有不可见字符    FMT-002：「本地文件不存在：<清理后的路径>（你粘贴的路径里有不可见字符
+                U+202A、U+202C，它会让路径对不上；已自动清掉，请检查路径是否还有别的问题）」
+只去了引号/空白 「本地文件不存在：<清理后的路径>（已去掉粘贴带进来的引号或空白）」
+什么都没清      原来那句「本地文件不存在：<路径>」
+```
+
+用例：`String.清理粘贴带进来的路径污染`、`File.粘贴路径里的不可见字符会被清掉`
+（后者**复刻用户场景**：中文目录 `头像/` + `U+202A`/`U+202C` 包裹 → 上传预检成功）。
 
 ---
 
@@ -2169,6 +2236,19 @@ endif()
 ```
 
 ### 10.2.3 临时文件、失败与回滚
+
+**进函数先清粘贴污染（提交 `a9af276`）**：`prepare_upload(paths, raw_source, raw_name, …)`
+开头就把两个入参过 `clean_user_path()`（9.5），再往下用——
+
+```cpp
+const std::string source = clean_user_path(raw_source);
+const std::string name = clean_user_path(raw_name);
+```
+
+位置参数在 `argument()` 那层已经清过一次（12.3.2.1），这里是**纵深防御**：
+将来有人绕过 `argument()` 直接调 `prepare_upload()` 也不会踩到 `U+202A` 这类不可见字符。
+**清掉后本地路径仍然不存在**时，用 `invisible_characters(raw_source)` 把原始输入里的
+码位点名进 `FMT-002` 的消息（9.5 有三种消息形态；11.14 有 CLI 样例）。
 
 **临时文件位置**（**已改口径**）：
 
@@ -3611,6 +3691,22 @@ fmt> file upload D:/test2/报告.txt 报告.txt
 执行失败：FMT-105 同名文件已存在：报告.txt（换一个文件名再上传）
 错误码：4
 
+fmt> file upload ‪C:\Users\lenovo\Pictures\pet-food-store\头像\asdva.jpg
+                 ↑ 首尾是不可见的 U+202A / U+202C（聊天窗口/网页复制粘贴带进来的）
+执行失败：FMT-002 本地文件不存在：C:\Users\lenovo\Pictures\pet-food-store\头像\asdva.jpg
+（你粘贴的路径里有不可见字符 U+202A、U+202C，它会让路径对不上；已自动清掉，
+请检查路径是否还有别的问题）
+错误码：3
+
+fmt> file upload "C:\图片\头像\asdva.jpg"   ← Explorer「复制路径」的一对引号，已清掉
+文件已入库：asdva.jpg（fmt-20261008-4）
+执行成功...
+错误码：0
+
+fmt> bucket create 工作‪                   ← 名字里带 U+202A：不允许进名字
+执行失败：FMT-202 Bucket 名称里有不可见字符（U+202A），请把名字重敲一遍
+错误码：2
+
 fmt> file upload D:/test/fmt-20261008-0       ← 提交 9c3d2cb：与 file_id 同形，属保留形状
 执行失败：FMT-106 文件名不能与文件标识同形（fmt-YYYYMMDD-N）：fmt-20261008-0（会与 file_id 混淆，请换一个名字）
 错误码：2
@@ -3866,6 +3962,12 @@ HTTP   路由固定，参数可以来自请求体，也可以来自路径
   `args.argv` 交给同一份业务实现——HTTP 侧不存在「第二种参数格式」。
 - 请求体**两种写法都接受**：与管道一致的 `{"argv":[...]}`，或更好写的 `{"name":"工作"}`；
   两者最终都变成 `args.argv`。都不是 → `FMT-001`。
+- **位置参数读取的唯一入口是 `service/commands.cpp` 的 `argument()`**（提交 `a9af276`）：
+  它负责取 `args.argv` 的第 N 项并**先过一遍 `clean_user_path()`**——清掉粘贴带进来的
+  不可见格式字符与成对引号（9.5）。CLI 与 HTTP 共用这一个函数，所以**一处收口**：
+  两条入口的粘贴污染在同一处被清掉，业务代码拿到的已经是干净参数。
+  唯一的例外是 `file.upload`，它由运行体的两段式路径处理，`prepare_upload()` 里再清一次
+  （来源与显式文件名）。
 - `url_decode` 的规则：`%XX` 还原为字节（UTF-8 多字节序列因此自然还原）、非法转义原样保留、
   `+` **不**当空格（路径参数不是表单）。ASCII 不受影响，所以「不解码也能用」的错觉只在
   纯英文名字下成立。
@@ -5887,18 +5989,20 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 > `fmt_test.cpp`，`FMT_TEST(suite, 名称)` / `FMT_CHECK_EQ` 宏，**零第三方依赖、可完全离线构建**，
 > 断言失败继续跑下一个用例），并在 `tests/CMakeLists.txt` 里用 `add_test(NAME fmt_tests …)`
 > 接进 CTest——所以「不写自动化测试」这条**只对 Catch2 那种形态成立**：不引外部框架，
-> 但模块行为仍有单元测试兜底。当前 **140 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
+> 但模块行为仍有单元测试兜底。当前 **142 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
 `HttpClient.*` + 提交 `0ad9efc` 新增 2 条 `File.*` + 提交 `5bf2c1f` 新增 2 条 `File.*`
-与 1 条 `Bucket.*` + **提交 `9c3d2cb` 新增 5 条** + **提交 `0fc242b` 新增 4 条**：
+与 1 条 `Bucket.*` + **提交 `9c3d2cb` 新增 5 条** + **提交 `0fc242b` 新增 4 条** +
+**提交 `a9af276` 新增 2 条**：
 `Trash.文件级条目能列出并回退`、`Trash.回退遇同名冲突要拦住`、
-`Trash.随桶删除的文件不能单独回退`、`Trash.永久删除文件级条目`
+`Trash.随桶删除的文件不能单独回退`、`Trash.永久删除文件级条目`、
+`String.清理粘贴带进来的路径污染`、`File.粘贴路径里的不可见字符会被清掉`
 （另有既有用例追加断言：`File.列表与查询` 的大写 file_id、`File.软删除进回收站` 改断言
 `file.json` 且断言 `trash.json` 保持空、`Service.管道能执行Bucket命令`、
 `Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、
 `Server.Bucket路由与状态码`、`Server.File路由与上传`；
-见 17.2.1 与 18.19、18.21、18.22、18.23、18.24、18.25），
+见 17.2.1 与 18.19、18.21、18.22、18.23、18.24、18.25、18.27），
 桶级回收站的用例见 18.17。**计数走过的台阶：118 → 124 → 126 → 129（`5bf2c1f`）
-→ 134（`9c3d2cb`）→ 140（`0fc242b`）**。
+→ 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→ 142（`a9af276`）**。
 > 端到端实测仍然是「真的对了」的最终判据（17.4 的硬标准不变）。
 >
 > **运行器的两条可观测性设计（提交 `a2b6cd1`，逐行照源码）**：
@@ -7451,6 +7555,56 @@ three gaps the document review found」。**136 个用例全绿**（134 + 新增
 
 ---
 
+### 18.27 用户报的「文件明明存在却说不存在」：粘贴污染（commit `a9af276`）
+
+`a9af276`「fix(upload): strip what paste adds, and name it when it hurts」。
+**142 个用例全绿**（140 + 新增 2 条）。
+
+```text
+用户报的原始现象（照实记录）：
+  fmt> file upload ‪C:\Users\lenovo\Pictures\pet-food-store\头像\asdva.jpg
+  执行失败：FMT-002 本地文件不存在：‪C:\...\头像\asdva.jpg
+  错误码：3
+文件确实存在（130184 字节）。原因是路径首尾各夹了一个**不可见的格式字符**：
+开头 U+202A（LEFT-TO-RIGHT EMBEDDING）、结尾 U+202C（POP DIRECTIONAL FORMATTING）
+——从聊天窗口、网页、终端复制路径时常见，屏幕上完全看不出来。
+CLI 用的是 wmain（宽字符），中文路径本身没问题；是这两个字符被当成了路径的一部分。
+
+① 新函数（include/fmt/common/string.hpp / src/common/string.cpp）：
+   clean_user_path(text)          清掉不可见格式字符 + **成对**引号 + 首尾空白
+   invisible_characters(text)     按出现顺序去重返回码位名（{"U+202A","U+202C"}）
+   清掉的码位：U+00A0、U+00AD、U+200B–U+200F、U+202A–U+202E、U+2060–U+2064、
+   U+2066–U+2069、U+FEFF；引号 `"` / `'` / `“”` **成对**才去（不成对不动，
+   免得改掉名字里真的带引号的情况）；中文等多字节序列原样保留
+
+② 生效位置（一处收口 + 一处纵深防御）：
+   service/commands.cpp 的 argument()  —— **所有**位置参数读取的唯一入口，
+   CLI 与 HTTP 共用（12.3.2.1）；
+   file/file.cpp 的 prepare_upload()  —— 上传来源与显式文件名再清一次（10.2.3）
+
+③ 报错口径（9.5、10.2.3）：清掉后仍找不到 → FMT-002，消息点名码位；只去了引号/空白
+   → 「（已去掉粘贴带进来的引号或空白）」；什么都没清 → 原来那句
+
+④ 名字规则：不可见字符**不允许**进名字——validate_file_name() → FMT-101、
+   validate_bucket_name() → FMT-202（9.1、9.3）。理由：名字要长期存下来、
+   还要被用户再敲一遍，屏幕上看不出来的字符没法重敲
+
+⑤ 新增用例（140 → **142**）
+   String.清理粘贴带进来的路径污染   U+202A/U+202C、成对与不成对引号、首尾空白、
+                                   U+00A0、中文路径不受影响、invisible_characters()
+                                   的去重与码位名
+   File.粘贴路径里的不可见字符会被清掉  **复刻用户场景**：中文目录 头像/ 下的文件 +
+                                   U+202A/U+202C 包裹 → 上传预检成功；Explorer 引号
+                                   包裹 → 成功；仍然找不到时消息里出现 U+202A 与
+                                   U+202C；名字里的不可见字符被 validate_file_name 拒绝
+```
+
+**自查（本轮新增的口径）**：不能再写「上传路径按原样使用」——路径会被 `clean_user_path()`
+清过（`argument()` 一处收口，`prepare_upload()` 再清一次）；而 `FMT-101`（文件名）与
+`FMT-202`（Bucket 名）的适用条件里要写上「含不可见格式字符」。
+
+---
+
 ## 19. 待决事项
 
 ### 19.1 本次重构引入的待决事项
@@ -7494,12 +7648,15 @@ three gaps the document review found」。**136 个用例全绿**（134 + 新增
 | 旧 `paths::` 自由函数 | 仍保留 `executable_path` / `root` 等自由函数供启动阶段使用，与 `PathManager` 并存；后续可考虑收敛，但 `root()` 必须保留（它要先于 PathManager 存在） |
 | `text::join` 的使用纪律 | 凡是用用户输入拼接路径，必须经 `common/text`。这条纪律目前靠代码审查保证，没有编译期强制 |
 | `AppContext` 的指针持有纪律 | `paths` 与 `logger` 都必须 `unique_ptr` 持有，因为业务服务保存它们的引用。这条约束靠注释说明，没有编译期强制——改动 `AppContext` 成员时容易踩回去 |
-| 自动化回归测试 | **口径已变**：本分支阶段 2 起有了一套**自研最小运行器**（`tests/fmt_test.hpp`，`FMT_TEST` / `FMT_CHECK_EQ`，零第三方依赖、可离线构建，`add_test(NAME fmt_tests …)` 接进 CTest），当前 **140 个用例、全绿**（上一轮 118 个，
+| 自动化回归测试 | **口径已变**：本分支阶段 2 起有了一套**自研最小运行器**（`tests/fmt_test.hpp`，`FMT_TEST` / `FMT_CHECK_EQ`，零第三方依赖、可离线构建，`add_test(NAME fmt_tests …)` 接进 CTest），当前 **142 个用例、全绿**（上一轮 118 个，
 提交 `a2b6cd1` 又新增 6 条 `HttpClient.*`，见 17.2、17.2.1、18.18、18.19、18.20；
 提交 `0ad9efc` 再新增 2 条 `File.*`，见 18.21；提交 `5bf2c1f` 再新增 2 条 `File.*`
 与 1 条 `Bucket.*`，见 18.22；提交 `9c3d2cb` 再新增 5 条，见 18.23；
 提交 `711da4c` + `6a40742` 再新增 2 条并把若干既有用例改成新形状，见 18.24；
-提交 `0fc242b` 再新增 4 条 `Trash.*`，见 18.25）。**仍然没有的**是「上传 →
+提交 `0fc242b` 再新增 4 条 `Trash.*`，见 18.25；提交 `18f16ca` 只修代码、
+不新增用例（140 不变），见 18.26；提交 `a9af276` 再新增 2 条
+（`String.清理粘贴带进来的路径污染`、`File.粘贴路径里的不可见字符会被清掉`），见 18.27）。
+**仍然没有的**是「上传 →
 列表 → 下载 → 分享」这条**跨模块链路**的自动化：它依旧靠端到端实测，若后续要补自动化，优先补这一段，而不是再堆各模块的孤立用例（提交 `188e85d` 补上了管道与 HTTP 两条
 「上传 → 列表 → 查询 → 软删除」的端到端用例，但**没有**覆盖下载与分享） |
 

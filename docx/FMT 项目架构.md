@@ -71,7 +71,7 @@ V1 用 **JSON + 文件系统**满足需求，不使用数据库、Redis、MQ、�
 
 ## 2. 关键设计决策
 
-V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～30** 项是
+V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～31** 项是
 `arch-restart` 分支新增的**重构冻结项**，逐条对应 `FMT 重构设计.md` 第 2 节的决策索引：
 
 | # | 规则 |
@@ -106,6 +106,8 @@ V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 �
 | 28 | **`fmt-YYYYMMDD-N` 是保留形状（提交 `9c3d2cb`）**：文件名与 `file_id` 同形 → 上传拒绝 `FMT-106 FileNameLikeFileId`（退出码 2，`looks_like_file_id()`，属 `FMT-1xx` 文件名校验、与 Windows 保留设备名同类）；旧数据里已有的这种名字，`file delete` 在两个索引命中**不同**记录时报 `FMT-001` 并点名两条记录、让用户用 `file_id`——**只给 delete 加**，`file get` 的两种查询范围保持不变（只读查询最坏是给用户看 id 命中的那条；破坏性操作不能猜）。`file get` 命中回收站记录时另回 `trash_path`（相对数据根、正斜杠），仓库里找不到时不回 `path` |
 | 29 | **破坏性操作先检查、说清楚、再确认（提交 `711da4c`；缺口收尾 `6a40742`）**：`file.delete` / `trash.delete` / `bucket.delete` 在 CLI 侧先发一次**只读预检**（`args.dry_run = true` / HTTP `?dry_run=1`），把目标属于哪个 Bucket、哪两条记录撞车、永久删除会毁掉什么打印出来；交互窗口问 `y/N`、一次性命令要 `--yes`（本地开关，不进 `argv`）；**用户同意之前一个破坏性请求都不发出**。**歧义 / 同名冲突 / 随桶删除 / 数据缺失是 `blocked` 而不是 `needs_confirm`**——y/N 表达不了「删哪一个」。服务端**独立校验** `force`：永久删除、跨 Bucket 删除、非空桶删除缺 `force` → **`FMT-016 ConfirmRequired`**（退出码 2，HTTP 400；原口径「复用 `FMT-001`」作废）。跨 Bucket 成功时 `message` 与 `data.bucket` 都带归属 |
 | 30 | **回收站是一份两级视图（提交 `0fc242b`；列表计数 `18f16ca`）**：`src/trash/` 的 `TrashService` **组合** `FileService` 与 `BucketService`，把文件级与桶级合成一份 `TrashEntry` 列表并做**跨命名空间的标识解析**（① 回收站目录名 → ② `file_id` → ③ 桶原名 → ④ 文件名；③④ 多条 → 候选）。权威：**文件级 = `file.json`**（`is_trash` / `trash_reason` / **`deleted_at`**），**桶级 = `trash/<user>/.original`**；**`data/trash.json` 不再写入**，只做只读兼容。`trash list` 标出 `[文件]` / `[桶]`，桶级条目的 `files`/`bytes` 在列表里就算出来（对每个 `present` 条目遍历一次目录，代价见第 13 节）；回退的三种硬拒绝（同名冲突 `FMT-401` / 随桶删除 `FMT-402` / 数据缺失 `FMT-002`）都是 `blocked` |
+
+| 31 | **粘贴路径的污染要清掉、不可见字符不许进名字（提交 `a9af276`）**：`clean_user_path()` 清掉不可见格式字符（`U+00A0` / `U+00AD` / `U+200B`–`U+200F` / `U+202A`–`U+202E` / `U+2060`–`U+2064` / `U+2066`–`U+2069` / `U+FEFF`）与**成对**引号、首尾空白，中文不受影响；**一处收口**在 `service/commands.cpp` 的 `argument()`（所有位置参数的唯一入口，CLI 与 HTTP 共用），`prepare_upload()` 再清一次来源与显式文件名。清掉后仍找不到 → `FMT-002` 并**点名码位**；**名字里不允许**这些字符：`validate_file_name()` → `FMT-101`、`validate_bucket_name()` → `FMT-202`（理由：屏幕上看不出来、用户没法重敲一遍）。用户实测：`C:\...\头像\asdva.jpg` 被 `U+202A`/`U+202C` 包住 → 「文件不存在」，现在能正常上传 |
 
 系统明确**禁止自动**执行：覆盖文件、修改用户文件名、选择其他 Bucket、创建恢复目标
 Bucket、绕过下载限制、删除文件、清空损坏 JSON、**删除旧数据根的数据**、**把服务宿主的
@@ -1667,7 +1669,7 @@ before a bucket goes」；
 | `common/hash`（**提交 `188e85d`**）：`Md5`（Windows CNG / bcrypt 增量接口）+ `md5_hex()`；`bcrypt.lib` 在 `src/common/CMakeLists.txt` 链接 | `include/fmt/common/hash.hpp`、`src/common/hash.cpp` |
 | `core`：`PathManager`（`trash_file` 落点 `trash/<user>/.files/<bucket>/YYYY/MM/DD/`，提交 `4fee290`） | `src/core/` |
 | `common/http_client`（**提交 `a2b6cd1`**）：`is_remote_url()` + `http_download()`——WinHTTP + Schannel 的流式 GET（跟随重定向、连接/发送/接收超时、`Accept-Encoding: identity`、只有 2xx 交给 sink、sink 返回 false 即中止、证书失败给准提示）；`src/common/CMakeLists.txt` 链 `winhttp`，`src/file/CMakeLists.txt` 不再链 cpp-httplib | `include/fmt/common/http_client.hpp`、`src/common/http_client.cpp` |
-| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**140 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
+| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**142 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
 | vendored 第三方库 | `third_party/nlohmann/json.hpp`、`third_party/cpp-httplib/httplib.h`（**只服务 HTTP 服务端**；URL 下载走系统 `winhttp`） |
 | 版本号的单一来源（CMake 生成头） | `cmake/version.hpp.in` |
 | 构建辅助脚本 | `tools/build.ps1` |
@@ -1862,7 +1864,7 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 | 编号 | ErrorCode | 含义 | 退出码 |
 |---|---|---|---|
 | FMT-001 | `InvalidArgument` | 参数错误 | 2 |
-| FMT-002 | `FileNotFound` | 文件不存在 | 3 |
+| FMT-002 | `FileNotFound` | 文件不存在（**提交 `a9af276`**：上传时本地路径找不到、而原始输入里带不可见格式字符时，消息**点名码位**——「…有不可见字符 U+202A、U+202C，它会让路径对不上；已自动清掉，请检查路径是否还有别的问题」；只去掉引号/空白时另有一句说明） | 3 |
 | FMT-003 | `FileAlreadyExists` | 文件已存在 | 4 |
 | FMT-004 | `PermissionDenied` | 权限不足 | 5 |
 | FMT-005 | `IoError` | 磁盘/IO 错误 | 1 |
@@ -1888,7 +1890,7 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 | 编号 | ErrorCode | 含义 | 退出码 |
 |---|---|---|---|
 | FMT-100 | `FileNameEmpty` | 文件名为空 | 2 |
-| FMT-101 | `FileNameInvalidChar` | 含 Windows 非法字符 | 2 |
+| FMT-101 | `FileNameInvalidChar` | 含 Windows 非法字符 / 以点或空格结尾 / **含不可见格式字符**（`U+00A0` / `U+200B`–`U+200F` / `U+202A`–`U+202E` / `U+2060`–`U+2064` / `U+2066`–`U+2069` / `U+FEFF` 等，**提交 `a9af276`**，消息点名码位） | 2 |
 | FMT-102 | `FileNameSeparator` | 含路径分隔符 | 2 |
 | FMT-103 | `FileNameReserved` | Windows 保留设备名 | 2 |
 | FMT-104 | `FileNameTooLong` | 文件名超长 | 2 |
@@ -1901,7 +1903,7 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 |---|---|---|---|
 | FMT-200 | `BucketNotFound` | Bucket 不存在 | 3 |
 | FMT-201 | `BucketAlreadyExists` | Bucket 已存在 | 4 |
-| FMT-202 | `BucketNameInvalid` | Bucket 名称非法 | 2 |
+| FMT-202 | `BucketNameInvalid` | Bucket 名称非法（含**不可见格式字符**，**提交 `a9af276`**，消息点名码位） | 2 |
 | FMT-203 | `BucketInUse` | Bucket 仍被引用，不能删除 | 4 |
 
 > **阶段 4 的实现口径**：`bucket delete` 目前**不会**返回 `FMT-203`——V1 允许删除仍有文件的

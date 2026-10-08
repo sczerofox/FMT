@@ -1212,7 +1212,8 @@ Status validate_file_name(std::string_view name);       // 失败按原因分工
 ```
 
 两类名称共用同一套规则：非空、≤ 255 字节、不含路径分隔符（`/` 与 `\`）、不是 `.` 或 `..`、
-不含控制字符（`< 0x20` 与 `0x7F`）、不含 `< > : " | ? *`、不是 Windows 保留设备名、
+不含控制字符（`< 0x20` 与 `0x7F`）、不含 `< > : " | ? *`、
+**不含不可见格式字符（提交 `a9af276`，见下）**、不是 Windows 保留设备名、
 不以点或空格结尾。中文等 UTF-8 名称合法（UTF-8 多字节序列的字节都 ≥ 0x80，不受控制字符
 与非法字符规则影响）。
 
@@ -1226,12 +1227,33 @@ Status validate_file_name(std::string_view name);       // 失败按原因分工
 | Windows 保留设备名 | `FMT-103 FileNameReserved` | `FMT-202 BucketNameInvalid` |
 | 超长（> 255 字节） | `FMT-104 FileNameTooLong` | `FMT-202 BucketNameInvalid` |
 | 以点或空格结尾 | `FMT-101 FileNameInvalidChar` | `FMT-202 BucketNameInvalid` |
+| **含不可见格式字符**（`U+00A0` / `U+200B`–`U+200F` / `U+202A`–`U+202E` / `U+2060`–`U+2064` / `U+2066`–`U+2069` / `U+FEFF` 等，**提交 `a9af276`**） | `FMT-101 FileNameInvalidChar` | `FMT-202 BucketNameInvalid`（消息里点名码位，见第 33 节） |
 | 与 `file_id` 同形（`fmt-YYYYMMDD-N`，**提交 `9c3d2cb`**） | `FMT-106 FileNameLikeFileId`（退出码 2） | —（Bucket 名不受限） |
 
 文件名分成 `FMT-100～104`（外加提交 `9c3d2cb` 的 `FMT-106`）是为了让上传失败时能直接
 告诉用户「哪里不对」；Bucket 名
 只有 `FMT-202` 一个错误码（`FMT-203 BucketInUse` 留给「仍被引用」这种业务冲突，
 不是名称校验）。两者的区别只是**错误码粒度**，判定规则完全一致。
+
+**不可见格式字符不进名字（提交 `a9af276`）**：`validate_file_name()` 里
+（非法字符之后、保留设备名之前）与 `validate_bucket_name()` 里（非法字符之后、
+保留设备名之前）各加一道检查，命中就拒：
+
+```text
+清理函数    bool 判定用 common/string 的 invisible_characters(text)
+            （按出现顺序**去重**返回码位名，形如 {"U+202A", "U+202C"}）
+文件名      FMT-101 FileNameInvalidChar
+            「文件名里有不可见字符（U+202A、U+202C），请把名字重敲一遍」
+Bucket 名   FMT-202 BucketNameInvalid
+            「Bucket 名称里有不可见字符（…），请把名字重敲一遍」
+为什么      这种名字屏幕上看不出来、**用户没法重新敲一遍**，按名查找、排序、日志
+            也全对不上；而且复制粘贴会一路带着它
+```
+
+> **注意与「清理」的分工**：位置参数与上传来源会被 `clean_user_path()` **清掉**
+> 这些字符（第 33 节），所以正常的粘贴路径照常能用；但只要它们**留在名字里**
+> （文件名 / Bucket 名），就是上面这两条错误——名字是要长期存下来、还要被用户
+> 再敲一遍的东西，不能容忍看不见的字符。
 
 **`FMT-106 FileNameLikeFileId`（提交 `9c3d2cb`，属 `FMT-1xx` 文件名校验一组）**：
 判定放在**「Windows 保留设备名」之后**（`validate_file_name()` 里的顺序是
@@ -1843,11 +1865,15 @@ Result<FileRecord> FileService::commit_upload(PreparedUpload& prepared);
 
 ```text
 第一段（锁外，第 34、35 节）
+0.  粘贴污染清理（提交 a9af276，第 33.1.1 节）：来源与显式文件名先过 clean_user_path()
+    ——去掉不可见格式字符与**成对**引号；`argument()` 那层已经清过一次
 1.  缺少来源 → FMT-300 UrlInvalid
 2.  文件名：用参数给的，或从来源推断；推断为空 → FMT-100
-3.  文件名合法性校验（第 25 节，FMT-100～104 + 提交 9c3d2cb 的 FMT-106）
+3.  文件名合法性校验（第 25 节，FMT-100～104 + 提交 9c3d2cb 的 FMT-106 +
+    提交 a9af276 的「不可见字符 → FMT-101」）
 4.  来源分支：http:// 与 https:// 都交网络下载（`common/http_client` 的 WinHTTP 客户端）；
-    含 "://" 但不是 http/https → FMT-300；本地路径不存在 → FMT-002 FileNotFound（第 33 节）
+    含 "://" 但不是 http/https → FMT-300；本地路径不存在 → FMT-002 FileNotFound（第 33 节；
+    清掉过不可见字符时消息会点名码位）
 5.  创建 <数据根>/temp/fmt-upload-<随机>-<序号>.tmp
 6.  流式写入（64 KiB 一块），边写边算 MD5、边判大小上限（超限即中止，不留半成品）
 7.  完整性检查：服务器给了 Content-Length 就必须对上（对不上 → FMT-301 DownloadFailed）；
@@ -1888,7 +1914,67 @@ ftp:// 等其它  ❌ 不支持 → FMT-300 UrlInvalid（「只支持 http:// �
 http:// 或 https://        -> 走网络下载（is_remote_url()）
 含 "://" 但不是 http/https  -> FMT-300 UrlInvalid（"只支持 http:// 与 https:// 的来源"）
 其余                       -> 本地路径，存在性检查不过报 FMT-002 FileNotFound
+                              （清过不可见字符时消息点名码位，见 33.1.1）
 ```
+
+## 33.1.1 粘贴路径的污染：清掉、并在报错时点名（提交 `a9af276`）
+
+**用户报的原始现象**（照实记录）：
+
+```text
+fmt> file upload ‪C:\Users\lenovo\Pictures\pet-food-store\头像\asdva.jpg
+执行失败：FMT-002 本地文件不存在：‪C:\Users\lenovo\Pictures\pet-food-store\头像\asdva.jpg
+错误码：3
+```
+
+文件**确实存在**（130184 字节）。原因是路径首尾各夹了一个**不可见的方向格式字符**：
+开头 `U+202A`（LEFT-TO-RIGHT EMBEDDING）、结尾 `U+202C`（POP DIRECTIONAL FORMATTING）
+——从聊天窗口、网页、终端复制路径时常见，**屏幕上完全看不出来**。
+CLI 走 `wmain`，中文路径本身没问题；就是这两个字符被当成了路径的一部分。
+
+**清理函数（`include/fmt/common/string.hpp` / `src/common/string.cpp`）**：
+
+```cpp
+// 清掉粘贴污染：不可见格式字符 + **成对**引号（Explorer「复制路径」会给路径套一对引号）
+std::string clean_user_path(std::string_view text);
+// 文本里出现的不可见字符，按顺序去重，形如 {"U+202A", "U+202C"}——报错时点出码位用
+std::vector<std::string> invisible_characters(std::string_view text);
+```
+
+```text
+清掉的码位   U+00A0（不换行空格）、U+00AD、U+200B–U+200F、U+202A–U+202E、
+             U+2060–U+2064、U+2066–U+2069、U+FEFF
+另外         去掉首尾空白；`"` / `'` / `“”` **成对**才去掉
+             （不成对不动，免得改掉名字里真的带引号的情况）
+不动         中文等多字节序列（合法 UTF-8 原样保留）
+```
+
+**在哪里生效（一处收口 + 一处纵深防御）**：
+
+```text
+① src/service/commands.cpp 的 argument()   —— **所有**位置参数读取的唯一入口，
+   CLI 与 HTTP 共用；粘贴污染在这里就被清掉（一处收口）
+② src/file/file.cpp 的 prepare_upload()   —— 上传**来源**与**显式文件名**再清一次，
+   即便将来有人绕过 argument() 直接调它也不受影响（纵深防御）
+```
+
+**清掉之后仍然找不到时的报错（点名码位，第 35 节与第 127.6 节也有样例）**：
+
+```text
+执行失败：FMT-002 本地文件不存在：C:\...\asdva.jpg（你粘贴的路径里有不可见字符
+U+202A、U+202C，它会让路径对不上；已自动清掉，请检查路径是否还有别的问题）
+
+只去掉首尾空白或引号、没有不可见字符时：
+执行失败：FMT-002 本地文件不存在：<清理后的路径>（已去掉粘贴带进来的引号或空白）
+
+什么都没清掉时：还是原来那句「本地文件不存在：<路径>」
+```
+
+> **名字里的不可见字符不允许**（提交 `a9af276`）：`validate_file_name()` →
+> `FMT-101 FileNameInvalidChar`、`validate_bucket_name()` → `FMT-202 BucketNameInvalid`
+> （第 25 节有完整说明）。理由：名字要长期存下来、还要被用户再敲一遍，
+> 屏幕上看不出来的字符没法重敲，按名查找、排序、日志也全对不上。
+> **别写成「上传路径按原样使用」**——路径会被清，名字会被拒，两者不同。
 
 > **写给排错的人（重要）**：`ftp://` 之类报的是 **`FMT-300`，不是 `FMT-002`**。
 > 实现里专门先判 `source.find("://") != std::string::npos`，就是为了不让用户
@@ -2124,6 +2210,22 @@ commit_upload()    从它接手那一刻起（开头就 TempGuard guard{prepared
 
 用例 `File.暂存失败会清理临时文件` 直接断言：本地文件不存在、**协议不支持的来源**、
 超过大小上限三种失败之后，`temp/` 里的常规文件数必须是 **0**（不留垃圾）。
+
+**本地路径找不到时的报错要能自我诊断（提交 `a9af276`）**：`prepare_upload()` 清掉粘贴污染
+（不可见格式字符 / 成对引号）之后**仍然**找不到时，消息会**点名被清掉的码位**：
+
+```text
+有不可见字符  FMT-002 FileNotFound（退出码 3）：
+              「本地文件不存在：<清理后的路径>（你粘贴的路径里有不可见字符 U+202A、U+202C，
+                它会让路径对不上；已自动清掉，请检查路径是否还有别的问题）」
+只去掉引号/空白  「本地文件不存在：<清理后的路径>（已去掉粘贴带进来的引号或空白）」
+什么都没清      「本地文件不存在：<路径>」（原来那句）
+```
+
+用例 `File.粘贴路径里的不可见字符会被清掉` 复刻用户场景：中文目录 `头像/` 下的文件
++ `U+202A` / `U+202C` 包裹 → 上传成功；Explorer 引号包裹 → 成功；仍然找不到时消息里
+出现 `U+202A` 与 `U+202C`；名字里的不可见字符被 `validate_file_name()` 拒绝
+（第 33.1.1、25 节）。
 
 > **口径更正（提交 `a2b6cd1`）**：这条用例中间那一段原来用的是 `https://…`，现在改成了
 > `ftp://example.com/a.bin`——因为 **https 已经是合法来源**，不再能当「不支持」的例子。
@@ -6373,6 +6475,7 @@ HTTP 作用于**当前数据根**，默认只监听 `127.0.0.1:4122`；CLI 不�
 | **标识与名字同时命中时报歧义**（提交 `9c3d2cb`，只服务 `file delete`） | `File.标识与名字同时命中时报歧义`：手工造旧数据（一个文件 `file_id = fmt-20261008-0`、另一个文件 `file_name = fmt-20261008-0`）后 `remove("fmt-20261008-0")` 必须返回 `FMT-001`，消息里同时出现「歧义」与另一条的 `file_id`（`fmt-20261008-1`）；不歧义的名字照常走 | ✅ |
 | **删除预检会把情况说清楚**（提交 `711da4c`） | `File.删除预检会把情况说清楚`：同桶时 `other_bucket` / `ambiguous` 都为假、`message` 为空（**CLI 不打扰用户**）；切到另一个桶后 `other_bucket` 为真、`message` 里同时出现两个桶名；预检**不改数据**（文件仍在仓库里） | ✅ |
 | **`file get` 大写 `file_id` 也查得到**（提交 `6a40742`） | `File.列表与查询` 追加断言：把 `file_id` 全大写后 `get_by_id()` 仍命中（标识比较一律 `iequals`，9.4） | ✅ |
+| **粘贴路径里的不可见字符会被清掉**（提交 `a9af276`，**复刻用户报的场景**） | `File.粘贴路径里的不可见字符会被清掉`：中文目录 `头像/` 下的文件 + `U+202A` / `U+202C` 包裹路径 → 上传预检成功；Explorer 引号包裹 → 成功；仍然找不到时消息里出现 `U+202A` 与 `U+202C`；名字里的不可见字符被 `validate_file_name()` 拒绝（`FMT-101`）。**配套用例**：`tests/string_test.cpp` 的 `String.清理粘贴带进来的路径污染`（`U+202A`/`U+202C`、成对与不成对引号、首尾空白、`U+00A0`、中文路径不受影响、`invisible_characters()` 的去重与码位名），见第 33.2、25 节 | ✅ |
 | HTTP 下载入库 | `File.从HTTP下载入库`（本机起一个 httplib 服务端当地源） | ✅ |
 | 端到端（管道） | `Service.管道能上传与操作文件`（upload → list → get×2 → 去重被拒 → delete → get 仍可查到；**【9c3d2cb】再追加**：删除后 `file get` 命中回收站记录时 `data.trash_path` 以 `trash/user/.files/` 开头，见第 42 节） | ✅ |
 | 端到端（HTTP） | `Server.File路由与上传`（**【6a40742】追加**：`file_name = fmt-20261008-0` → 400 + `FMT-106`；**【0fc242b】追加**：`DELETE ?dry_run=1` 只读、零副作用） | ✅ |
@@ -6918,7 +7021,17 @@ V2
     权威：文件级 = file.json（is_trash / trash_reason / deleted_at），
     桶级 = trash/<user>/.original；**data/trash.json 不再写入**（只读兼容）。
     trash list 标出 [文件] / [桶]；回退的三种硬拒绝（FMT-401 / FMT-402 / FMT-002）
-    都是 blocked（第 52～55、59 节）
+    都是 blocked（第 52～55、59 节）。
+    提交 18f16ca：桶级条目的 files/bytes 在列表里就对每个 present 条目遍历一次目录算出来
+    （trash list 因此不是纯索引查询）；「不要继续」的退出码按预检自身错误码原样透出
+48. 粘贴污染要清掉、不可见字符不许进名字（提交 `a9af276`）：
+    位置参数在 argument() 一处收口过 clean_user_path()（CLI 与 HTTP 共用），
+    上传来源与显式文件名在 prepare_upload() 再清一次；清掉的是不可见格式字符
+    （U+00A0 / U+00AD / U+200B–U+200F / U+202A–U+202E / U+2060–U+2064 /
+     U+2066–U+2069 / U+FEFF）与**成对**引号（`"` / `'` / `“”`），首尾空白也去。
+    清掉之后仍找不到 → FMT-002，消息**点名**被清掉的码位（如 U+202A、U+202C）；
+    只去了引号/空白时另有一句说明。**名字里不允许**这些字符：
+    validate_file_name → FMT-101、validate_bucket_name → FMT-202（第 25、33.1.1 节）
 ```
 
 ---
@@ -7384,6 +7497,34 @@ and count files in the list」，140 项仍全绿）**：
 （`FMT 技术文档.md` 第 10.4、11.14、12.3.2.1、18.26 节）
 ```
 
+**粘贴污染并入的决策（提交 `a9af276`「fix(upload): strip what paste adds, and name it
+when it hurts」）**：
+
+```text
+用户报的现象：fmt> file upload ‪C:\...\头像\asdva.jpg → FMT-002 本地文件不存在，
+而文件确实存在（130184 字节）。原因是路径首尾各夹了一个不可见的格式字符：
+开头 U+202A（LEFT-TO-RIGHT EMBEDDING）、结尾 U+202C（POP DIRECTIONAL FORMATTING）
+——从聊天窗口、网页、终端复制路径时常见，屏幕上完全看不出来。
+
+① 清理函数（include/fmt/common/string.hpp / src/common/string.cpp）：
+   clean_user_path(text)          清掉不可见格式字符 + **成对**引号 + 首尾空白
+   invisible_characters(text)     按出现顺序去重返回码位名（{"U+202A","U+202C"}）
+   清掉的码位：U+00A0、U+00AD、U+200B–U+200F、U+202A–U+202E、U+2060–U+2064、
+   U+2066–U+2069、U+FEFF；引号 `"` / `'` / `“”` **成对**才去（不成对不动）
+② 生效位置（一处收口 + 一处纵深防御）：
+   src/service/commands.cpp 的 argument()  —— **所有**位置参数读取的唯一入口，
+   CLI 与 HTTP 共用；prepare_upload() 再清一次来源与显式文件名
+③ 报错口径：清掉后仍找不到 → FMT-002，消息点名码位：「本地文件不存在：<清理后>
+   （你粘贴的路径里有不可见字符 U+202A、U+202C，它会让路径对不上；已自动清掉，
+   请检查路径是否还有别的问题）」；只去了引号/空白 → 「（已去掉粘贴带进来的引号或空白）」
+④ 名字规则：不可见字符**不允许**进名字——validate_file_name() → FMT-101、
+   validate_bucket_name() → FMT-202。理由：屏幕上看不出来、没法重新敲一遍，
+   按名查找/排序/日志也全对不上
+测试：140 → **142 项全绿**。新增 String.清理粘贴带进来的路径污染、
+  File.粘贴路径里的不可见字符会被清掉（复刻用户场景：中文目录 + U+202A/U+202C 包裹）
+（`FMT 技术文档.md` 第 9.1、9.3、10.2、11.14、12.3.2.1、18.27 节）
+```
+
 **已知限制（如实记录；`188e85d` / `a2b6cd1` / `0fc242b` 逐轮复核）**：
 
 ```text
@@ -7427,8 +7568,8 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 > 「删除桶不提醒」「`src/trash/` 不存在」（分别见第 17.1、52、53、30、4 节）。
 >
 > **测试计数走过的台阶**：118（`188e85d`）→ 124（`a2b6cd1`）→ 126（`0ad9efc`）→
-> 129（`5bf2c1f`）→ 134（`9c3d2cb`）→ **140（`0fc242b`）**；中间 136 是 `711da4c`
-> 这一步。第 109、112、125 节已按 140 更新。
+> 129（`5bf2c1f`）→ 134（`9c3d2cb`）→ **142（`a9af276`）**；中间 136 是 `711da4c`、
+> 140 是 `0fc242b` 这一步。第 109、112、125 节已按 142 更新。
 
 后续开发过程中，如果发现：
 
@@ -8053,6 +8194,22 @@ fmt> file upload D:/test/报告.txt
 fmt> file upload D:/test2/报告.txt 报告.txt
 执行失败：FMT-105 同名文件已存在：报告.txt（换一个文件名再上传）
 错误码：4
+
+fmt> file upload ‪C:\Users\lenovo\Pictures\pet-food-store\头像\asdva.jpg
+                 ↑ 首尾是不可见的 U+202A / U+202C（从聊天窗口/网页复制粘贴带进来的）
+执行失败：FMT-002 本地文件不存在：C:\Users\lenovo\Pictures\pet-food-store\头像\asdva.jpg
+（你粘贴的路径里有不可见字符 U+202A、U+202C，它会让路径对不上；已自动清掉，
+请检查路径是否还有别的问题）
+错误码：3
+
+fmt> file upload "C:\图片\头像\asdva.jpg"        ← Explorer「复制路径」的一对引号
+文件已入库：asdva.jpg（fmt-20261008-4）         ← 成对引号已清掉，正常入库
+执行成功...
+错误码：0
+
+fmt> bucket create 工作‪                    ← 名字里带 U+202A：**不允许**进名字
+执行失败：FMT-202 Bucket 名称里有不可见字符（U+202A），请把名字重敲一遍
+错误码：2
 ```
 
 > 三个跟实现对齐的细节：`file list` 的**末行是「共 N 个文件」**（不是「Bucket」）；
@@ -8205,6 +8362,7 @@ blocked 的情况     歧义（file.delete）、同名冲突 / 随桶删除 / �
 | `file get` 的回收站字段（提交 `9c3d2cb`） | 命中回收站记录时在 `is_trash` / `trash_reason` 之外**增加** `trash_path`（相对数据根、正斜杠）；仓库里没有该文件时**不返回** `path`（设计如此），CLI 多打一行「回收站路径：…」。按 `file_id` 查是全局含回收站、按文件名只查当前用户的正常文件，见第 42 节 |
 | `iequals()` 的实现约束（提交 `9c3d2cb`） | **只折叠 ASCII**：`>= 0x80` 的字节原样比较，不交给 `std::tolower`（`setlocale` 一被调用就会改坏 UTF-8 名字）。「凡按名字/标识定位一律不区分大小写」这条口径靠它兑现。**提交 `6a40742` 补齐**：`FileService::get_by_id()` 也改用 `iequals`，标识比较两处一致，见第 42 节 |
 | 破坏性操作先检查再确认（提交 `711da4c`；缺口收尾 `6a40742`） | `file.delete` / `trash.delete` / `bucket.delete` 支持 `args.dry_run = true`（HTTP `?dry_run=1`）的**只读预检**；CLI 先打印情况（目标属于哪个桶、两条歧义候选、永久删除会毁掉什么）、再问 `确认执行？(y/N)`（一次性命令要 `--yes`），**用户同意前不发任何破坏性请求**；歧义 / 同名冲突 / 随桶删除 / 数据缺失是 `blocked`（y/N 解决不了，改用 `file_id`）。需要显式确认的操作缺 `force` → **`FMT-016 ConfirmRequired`**（退出码 2、HTTP 400，不再复用 `FMT-001`）；服务端仍独立校验 `force`。**提交 `18f16ca` 起「不要继续」的退出码**：预检自身的错误码原样透出（`FMT-002` → 3、通信失败 → 8）、`blocked` 与缺 `--yes` 是 2、用户取消是 0；缺 `--yes` 的提示语也带上了 `FMT-016`。见第 43、59、60、82、127.7 节 |
+| 粘贴污染清理与不可见字符（提交 `a9af276`） | `clean_user_path()` 清掉不可见格式字符（`U+00A0` / `U+00AD` / `U+200B`–`U+200F` / `U+202A`–`U+202E` / `U+2060`–`U+2064` / `U+2066`–`U+2069` / `U+FEFF`）与**成对**引号、首尾空白；在 `argument()`（所有位置参数的唯一入口，CLI 与 HTTP 共用）一处收口，`prepare_upload()` 再清一次来源与显式文件名。清掉后仍找不到 → `FMT-002` 且**点名码位**（`U+202A`、`U+202C`…）；**名字里不允许**这些字符：`validate_file_name()` → `FMT-101`、`validate_bucket_name()` → `FMT-202`。见第 25、33.2、35 节 |
 | 回收站是一份两级视图（提交 `0fc242b`；列表计数 `18f16ca`） | 新建 `src/trash/` 的 `TrashService`：组合 `FileService`（文件级，权威 = `file.json`，含 `deleted_at`）与 `BucketService`（桶级，权威 = `trash/<user>/.original`），合并 `TrashEntry` 列表 + 跨命名空间标识解析；**`data/trash.json` 不再写入**（只读兼容）。`trash.list` → `{entries, count, files, buckets}` 并标出 `[文件]` / `[桶]`；**桶级条目的 `files`/`bytes` 在列表里就对每个 `present` 条目遍历一次目录算出来**（代价：`trash list` 不是纯索引查询，显式命令可接受）；`get` / `restore` / `delete` → `{entry, message?}`；回退的三种硬拒绝（`FMT-401` / `FMT-402` / `FMT-002`）都是 `blocked`；`bucket.delete` 也有预检（非空桶提醒「只能整体恢复这个桶」，缺 `force` → `FMT-016`），见第 30、52～55、59 节 |
 
 ## 附录 A.1 错误码枚举
