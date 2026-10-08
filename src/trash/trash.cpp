@@ -343,7 +343,9 @@ Result<TrashEntry> TrashService::restore(std::string_view identifier) {
             return *error_of(restored);
         }
         TrashEntry done = std::get<TrashEntry>(entry);
-        done.present = false;
+        // **不要**把 present 改成 false：它表示「数据还在不在」，
+        // 而这里的数据刚刚被搬回仓库、确实还在。回退/删除的结果由 message 说明，
+        // 把它当「已经不在回收站里」用会打印出「状态：数据已不存在」这种误导信息。
         done.restorable = true;
         done.message.clear();
         return done;
@@ -432,7 +434,6 @@ Result<TrashEntry> TrashService::purge(std::string_view identifier) {
             return *error_of(purged);
         }
         TrashEntry done = std::get<TrashEntry>(entry);
-        done.present = false;
         done.message.clear();
         return done;
     }

@@ -387,12 +387,27 @@ FMT_TEST(Service, 启动时清理temp里的遗留临时文件) {
     const auto mine = root / "temp" / fmt::path_from_utf8("用户自己的文件.txt");
     FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(mine, "别删我")));
 
-    fmt::service::ServerRuntime runtime(root, temp / "state");
-    FMT_CHECK(fmt::ok(runtime.start()));
+    // ① **刚写下的** `fmt-` 文件必须留着：提权副本正在回传的结果文件也叫这个名字，
+    //    而 install 会在同一次操作里启动服务、服务启动就来清 temp/。
+    //    以前不分青红皂白地删，父进程只好报 FMT-602「提权副本没有返回结果」。
+    {
+        fmt::service::ServerRuntime runtime(root, temp / "state");
+        FMT_CHECK(fmt::ok(runtime.start()));
+        FMT_CHECK(fmt::file_exists(root / "temp" / "fmt-elev-123.json"));
+        FMT_CHECK(fmt::file_exists(mine));
+    }
 
-    // 我们的临时文件清掉，用户手放的其它文件不动
-    FMT_CHECK(!fmt::file_exists(root / "temp" / "fmt-elev-123.json"));
-    FMT_CHECK(fmt::file_exists(mine));
+    // ② 陈旧的要清掉：把时间拨回一小时再启动一次
+    std::error_code code;
+    const std::filesystem::path stale = root / "temp" / "fmt-elev-123.json";
+    std::filesystem::last_write_time(
+        stale, std::filesystem::file_time_type::clock::now() - std::chrono::hours(1), code);
+    FMT_CHECK(!code);
+
+    fmt::service::ServerRuntime runtime(root, temp / "state-2");
+    FMT_CHECK(fmt::ok(runtime.start()));
+    FMT_CHECK(!fmt::file_exists(stale));
+    FMT_CHECK(fmt::file_exists(mine));  // 用户手放的其它文件始终不动
 }
 
 FMT_TEST(Service, 管道能上传与操作文件) {

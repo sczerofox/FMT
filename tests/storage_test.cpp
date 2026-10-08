@@ -1,13 +1,61 @@
 // storage 的单元测试
 #include "fmt/storage/storage.hpp"
 
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "fmt/common/string.hpp"
 #include "fmt_test.hpp"
 #include "temp_dir.hpp"
+
+FMT_TEST(Storage, 两个写者同时写同一个文件不会互相踩) {
+    fmt_test::TempDir temp("storage-concurrent");
+    const auto target = temp / "state.json";
+
+    // 同一时刻有多个写者写同一个目标，这是**真实发生**的：
+    // `service install` 会在启动服务之后写 service.json，而服务启动时也写它。
+    // 旧的实现固定用 `<目标>.tmp`，先完成的一方把它 rename 走，另一方做读回校验时
+    // 文件已经不在 → 报「无法打开文件 …tmp」，两边都可能失败（安装器那处还忽略了
+    // 返回值），结果就是 service.json 静默地一直不更新。
+    std::atomic<int> failures{0};
+    std::vector<std::thread> writers;
+    for (int writer = 0; writer < 8; ++writer) {
+        writers.emplace_back([&target, &failures, writer] {
+            for (int round = 0; round < 40; ++round) {
+                const nlohmann::json value{{"writer", writer}, {"round", round}};
+                if (!ok(fmt::write_json_file(target, value))) {
+                    ++failures;
+                }
+            }
+        });
+    }
+    for (std::thread& writer : writers) {
+        writer.join();
+    }
+
+    FMT_CHECK_EQ(failures.load(), 0);
+
+    // 内容必须是**某一次完整写入**的结果（不能是两份内容交错的产物）
+    const auto parsed = fmt::read_json_file(target);
+    FMT_CHECK(ok(parsed));
+    if (ok(parsed)) {
+        const nlohmann::json& value = std::get<nlohmann::json>(parsed);
+        FMT_CHECK(value.contains("writer"));
+        FMT_CHECK(value.contains("round"));
+        FMT_CHECK(value["writer"].get<int>() >= 0 && value["writer"].get<int>() < 8);
+        FMT_CHECK(value["round"].get<int>() >= 0 && value["round"].get<int>() < 40);
+    }
+
+    // 临时文件不能留下来
+    std::error_code code;
+    for (const auto& entry : std::filesystem::directory_iterator(temp.path(), code)) {
+        FMT_CHECK(entry.path().extension() != ".tmp");
+    }
+}
 
 FMT_TEST(Storage, 文本原子写与读回) {
     fmt_test::TempDir temp("storage-text");

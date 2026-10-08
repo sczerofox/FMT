@@ -44,6 +44,17 @@ int clean_temp_directory(const PathManager& paths) {
         return 0;
     }
 
+    // 只清**真的陈旧**的临时文件。
+    //
+    // 提权副本回传结果的临时文件也叫 `fmt-elev-<pid>.json(.tmp)`，而 `service install`
+    // 会在同一次操作里**启动服务**——服务启动就来清 temp/。原来只看前缀 `fmt-`，
+    // 于是把父进程正在收的结果文件一起删掉，父进程只好报
+    // `FMT-602 提权副本没有返回结果`（服务其实已经装好并启动了，用户看到的是假失败）。
+    //
+    // 正在回传的结果文件寿命只有几十毫秒，所以按年龄放过新的、只清旧的。
+    constexpr auto kStaleAfter = std::chrono::minutes(10);
+    const auto now = std::filesystem::file_time_type::clock::now();
+
     int removed = 0;
     for (const auto& entry : std::filesystem::directory_iterator(paths.temp(), code)) {
         if (code) {
@@ -55,6 +66,14 @@ int clean_temp_directory(const PathManager& paths) {
         }
         if (!starts_with(path_to_utf8(entry.path().filename()), "fmt-")) {
             continue;
+        }
+        std::error_code time_code;
+        const std::filesystem::file_time_type modified = entry.last_write_time(time_code);
+        if (time_code) {
+            continue;  // 读不到时间就别动它
+        }
+        if (now - modified < kStaleAfter) {
+            continue;  // 可能是**正在写**的：放过
         }
         std::error_code ignored;
         if (std::filesystem::remove(entry.path(), ignored)) {
