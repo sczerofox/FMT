@@ -4160,7 +4160,7 @@ help / help <组>           交互循环内同上（--help 在交互里是 help 
 
 ```text
 可用命令：
-  (service)  install  uninstall  start  stop  status
+  (service)  install  uninstall  start  stop  reinstall  status
   (bucket)   create  list  get  use  delete
   (file)     upload  list  get  delete
   (trash)    list  get  restore  delete
@@ -4226,11 +4226,24 @@ service —— Windows 服务管理
              不删除 repository / trash / config / data / log / temp
   start      启动服务；需要管理员权限
   stop       停止服务；需要管理员权限
+  reinstall  一次 UAC 里做完「卸载 → 按**当前这个 exe** 重新安装并启动」；
+             需要管理员权限。两个用途：
+               ① 用新 exe 更新服务——直接运行**新 exe** 的这条命令即可，
+                  它会先停掉旧宿主（解开文件占用）、再指向自己并启动；
+               ② 修复宿主 exe 被移动或删除。
+             **业务数据一个都不动**（repository / trash / config / data / log）。
+             注意：宿主会变成「你运行的那一份 exe」；数据根仍由连上来的
+             CLI 声明（见窗口横幅上的「数据根：…」）。
   status     查询服务状态；不需要管理员权限
 
 说明：启动类型为自动启动，运行账户为 LocalSystem；异常退出由 Windows
       服务恢复策略自动重启（第一次 5 秒、第二次 10 秒、之后 30 秒）。
 ```
+
+> **`reinstall` 是提交 `c573f14` 新增的正式命令**（原来只有双击引导内部会用它，
+> 「文档冻结的是四条命令」那句已作废）。用法提示行因此是
+> `用法：service install | uninstall | start | stop | reinstall | status`（两处都是）。
+> 语义上的三个「不变」见第 126.1 节。
 
 四组业务命令的详情里原本都要注明「服务端尚未实现，现在返回 FMT-602」。
 
@@ -4420,8 +4433,8 @@ fmt.exe service status
 ```text
 不带 -- 前缀（旧写法 fmt.exe --service install 作废）
 没有 pause，也没有 delete（旧 delete 更名为 uninstall）
-五条命令都直连 SCM，不走命名管道、不走 HTTP
-四条动作命令（install / uninstall / start / stop）一律走 UAC 提权
+六条子命令都直连 SCM，不走命名管道、不走 HTTP
+**除 `status` 外每条都提权**（install / uninstall / start / stop / **reinstall**）
 status 是查询命令：不提权、不弹 UAC、不需要管理员权限
 ```
 
@@ -5682,10 +5695,10 @@ fmt.exe
 
 ```text
 service 命令不带 -- 前缀（旧写法 fmt.exe --service install 作废）
-service 有 install / uninstall / start / stop / status 五条
+service 有 install / uninstall / start / stop / **reinstall** / status 六条子命令（提交 `c573f14` 起 `reinstall` 从引导内部用法变成正式命令）
 没有 pause，也没有 delete（旧 delete 更名为 uninstall）
 业务命令（bucket / file / share / trash）经命名管道交给服务执行
-service 命令直连 SCM：install / uninstall / start / stop 走 UAC 提权，
+service 命令直连 SCM：install / uninstall / start / stop / reinstall 走 UAC 提权，
                         status 是查询、不提权、不弹 UAC
 help / --help 是本地命令：不连服务、不提权、不写日志
 exit / quit 是交互循环里的正式命令（help exit 有说明）
@@ -6609,9 +6622,22 @@ HTTP 作用于**当前数据根**，默认只监听 `127.0.0.1:4122`；CLI 不�
 | **两个写者同时原子写同一个文件**（提交 `5b316b3`） | `Storage.两个写者同时写同一个文件不会互相踩`：8 线程 × 40 轮写同一个文件，断言零失败、内容必须是某一次**完整**写入、且**不留 `.tmp`**（第 11 节） | ✅ |
 | **版本文本只有一个来源**（提交 `d108c80`） | `Cli.版本文本只有一个来源`（`tests/cli_test.cpp`）：断言 `version_text()` 里含 `File Manager Tool` / `v1.0` / `build`——**不钉具体日期**，因为构建日期是 CMake 配置时生成的。钉住的是「横幅 / `--version` / `version` 命令同源」这件事（第 68、127.1 节） | ✅ |
 | **数据根切换提示要把两个根都说清楚**（提交 `bb7a40f`，**第一次给控制台输出加测试**） | `Cli.数据根切换提示要把两个根都说清楚`（`tests/cli_test.cpp`）：断言 `cli::root_switch_notice("D:/old","D:/new")` 里**同时**出现旧根、新根、「数据根」、「切回去」；并检查旧根为空（服务首次启动）时也包含新根。**文本收进 `root_switch_notice()` 就是为了能断言**——别把文本再写回连接路径里（第 127.1 节） | ✅ |
+| **service 子命令集合**（提交 `c573f14`，**命令集合第一次有断言**） | `Cli.service子命令集合`（`tests/cli_test.cpp`）：断言 `cli::is_user_service_command()` 对 `install` / `uninstall` / `start` / `stop` / **`reinstall`** 为真，对 `status`、空串、`Install`（大小写不同）、乱写的词为假。**这个集合决定「敲了什么会被当成什么」**，所以它从匿名命名空间搬到 `cli.hpp` 里专门钉住（第 126 节） | ✅ |
 | HTTP 下载入库 | `File.从HTTP下载入库`（本机起一个 httplib 服务端当地源） | ✅ |
 | 端到端（管道） | `Service.管道能上传与操作文件`（upload → list → get×2 → 去重被拒 → delete → get 仍可查到；**【9c3d2cb】再追加**：删除后 `file get` 命中回收站记录时 `data.trash_path` 以 `trash/user/.files/` 开头，见第 42 节） | ✅ |
 | 端到端（HTTP） | `Server.File路由与上传`（**【6a40742】追加**：`file_name = fmt-20261008-0` → 400 + `FMT-106`；**【0fc242b】追加**：`DELETE ?dry_run=1` 只读、零副作用） | ✅ |
+| 端到端（真实 exe + 真实管道，提交 `a340d1e`） | **`tests/cli_e2e_test.cpp`（套件 `CliE2e`）**：进程内起 `ServerRuntime`（用 `FMT_PIPE` 私有管道名）→ 把 `fmt.exe` 复制到临时数据根 → `CreateProcessW` 拉起**真实 exe**、喂 stdin、合并收 stdout+stderr → 断言退出码与用户看到的文字。两条用例：`CliE2e.核心链路走真实exe与真实管道`（version / bucket create WORK → 小写归一 + 提示 / bucket list / file upload / FMT-304 / FMT-105 / file get 按名与按 id / FMT-002 / file delete → trash list（含 `[文件]`）→ trash get（含「回收站路径」）→ trash restore / 跨桶删除无 `--yes` → `FMT-016` 且**文件仍在**、带 `--yes` → 成功且消息带「Bucket：work」/ 永久删除无 `--yes` → `FMT-016` / 删桶：空桶成功但仍打印「只能整体恢复」、非空桶无 `--yes` → `FMT-016`）、`CliE2e.交互式确认答n不删答y才删`（**交互式确认此前完全没有自动化覆盖**：喂 `n` → 「确认执行？」+「已取消」且文件仍在；喂 `y` → 不再出现「已取消」且条目进了回收站） | ✅ |
+
+> **为什么必须有这一层（工程教训，与 `abort()` 那次崩溃同源）**：`file delete a7.jpg`
+> 弹「Debug Error! abort() has been called」那次，**单元测试全绿却没挡住**——测试直接调
+> 业务层、**按服务端期望的形状拼请求**，而 CLI 拼的是另一种形状（把 `dry_run` 挂在位置参数
+> **数组**上 → `type_error.305` → `abort()`，第 127.7 节）。只有让**真实 exe 走一遍用户走的路**，
+> 这类回归才会当场露出来。
+> **那次崩溃的代码路径对所有破坏性操作都生效**，所以本套件的第一个 `file delete` 用例
+> 就会当场失败——不是碰巧覆盖到的。
+> **耗时**：全量约 17 秒（端到端部分约 5 秒）；这个套件会拉起子进程，比纯单元测试慢，
+> 但仍在十几秒量级。`FMT 技术文档.md` 第 13.9.1、17.2、18.35 节。
+
 | 不同 Bucket / 不同用户同名 | 作用域已按「同用户 + 任何 Bucket」实现（第 37、38 节）；**跨 Bucket 的用例有三条**：`File.按名字删除用的是记录自己的Bucket`（提交 `0ad9efc`，钉的是删除落点）、`File.删除预检会把情况说清楚`（提交 `711da4c`，钉的是「跨桶要先说清两个桶名」）、`Service.破坏性操作先预检再确认`（跨桶缺 `force` → `FMT-016`、带 `force` 成功且消息带 Bucket）；**桶侧的大小写另有一条**：`Bucket.大小写不同也认得同一个桶`（提交 `5bf2c1f`）。**文件级 trash 的用例已在提交 `0fc242b` 补上**（`Trash.文件级条目能列出并回退` 等 4 条，第 112 节）；「不同用户同名」仍无用例 | 🟡 |
 
 > **名字长得像 `file_id` 的「先查 id 遮住」问题：提交 `9c3d2cb` 已定稿并落地**
@@ -7073,13 +7099,13 @@ V2
 14. File 本身不保存下载限制
 15. JSON 损坏不能静默重置
 16. 关键文件操作必须具备事务式处理
-17. Windows Service V1 保持简单（五条命令 + SCM + Recovery，不自建 watchdog）
+17. Windows Service V1 保持简单（六条子命令 + SCM + Recovery，不自建 watchdog）
 18. CLI（命名管道）与 HTTP 使用统一业务核心
 19. 单一 fmt.exe，三种形态：CLI / Service / 提权短命副本
 20. manifest 为 asInvoker，绝不 requireAdministrator
-21. service 有 install / uninstall / start / stop / status 五条，没有 pause、没有 delete
-22. service 的四条动作命令（install / uninstall / start / stop）一律走 UAC 提权，不做免提权优化；
-    status 是查询命令，不提权、不弹 UAC
+21. service 有 install / uninstall / start / stop / **reinstall** / status 六条子命令（提交 `c573f14` 起 `reinstall` 从引导内部用法变成正式命令），没有 pause、没有 delete
+22. service 的动作命令（install / uninstall / start / stop / **reinstall**）一律走 UAC 提权，
+    不做免提权优化；status 是查询命令，不提权、不弹 UAC
 23. CLI 走命名管道，HTTP 只给浏览器（CLI 不走 HTTP）
 24. 数据根由 CLI 声明，服务维护当前数据根，切换不删旧数据；
     hello 响应回填 switched / previous_root，CLI 据此**在 stderr 打印换根提示**（`root_switch_notice()`，提交 `8f2fbc5`）并记一行日志「数据根切换：旧 -> 新」
@@ -7224,6 +7250,33 @@ V2
        交互窗口握着管道时别的 CLI 连不上（`ERROR_PIPE_BUSY` → 重试 → `FMT-601`），
        所以「会话中途被搬走」**不可能发生**——切换只可能发生在某个 CLI 连上的那一刻。
        用例 `Cli.数据根切换提示要把两个根都说清楚` 钉住文本（控制台输出第一次有测试覆盖）
+56. `service reinstall` 是正式命令（提交 `c573f14`）：`is_user_service_command()` 加入
+    `reinstall`（该函数已从匿名命名空间移到 `cli.hpp`，便于测试），两处用法提示、
+    命令总览、`help service` 正文都跟着更新。
+    **service 子命令是六条**：install / uninstall / start / stop / **reinstall** / status，
+    其中**除 `status` 外每条都提权**（原口径「文档冻结的是四条命令」「reinstall 只在引导
+    流程内部使用」**已作废**）。`reinstall` = 一次 UAC 里「卸载 → 按**当前这个 exe** 重新
+    注册 → 启动」，因此是**更新 exe 的正确路径**（不需要先复制、只要一次 UAC），
+    也用于修复宿主 exe 被移动或删除。**三个不变**：业务数据不变
+    （`uninstall()` 只 `DeleteService`，不删 `repository / trash / config / data / log / temp`）、
+    `C:\ProgramData\FMT\service.json` 不变（卸载不删状态目录 → `current_root` 保留）、
+    数据根仍由 CLI 声明（与宿主是谁无关）。第 126.1 节与
+    `FMT 技术文档.md` 第 13.8.2 / 13.8.4 节
+57. 管道名可被环境变量 `FMT_PIPE` 覆盖（提交 `a340d1e`）：`ipc::pipe_name()` 默认返回
+    `kPipeName`（`\\.\pipe\fmt.control`），非空时用环境变量。使用点两处：服务端
+    accept 循环（**循环外算一次**）与 CLI 的 `ensure_connected()`。
+    **线上行为不变**（真服务由 SCM 启动、不带这个变量）；这是**端到端测试的隔离前提**
+    ——测试要在同一台机器上再起一个进程内服务，而真服务通常正占着默认名，不换名字
+    要么起不来、要么把命令打到**用户的真服务上**。安全边界不变：仍是本机同一用户范围内
+    的名字覆盖，DACL / MIC（第 15.1 节那套）不改，服务侧的变量来自 SCM 环境
+58. 端到端冒烟测试是**必须的一层**（提交 `a340d1e`，`tests/cli_e2e_test.cpp`）：
+    进程内起 `ServerRuntime` → 把 `fmt.exe` 复制到临时数据根 → `CreateProcessW` 拉起
+    **真实 exe**、喂 stdin、合并收 stdout+stderr → 断言退出码与用户看到的文字。
+    **为什么**：`file delete` 弹 `abort()` 那次崩溃，单元测试全绿却没挡住——测试直接调
+    业务层、自己拼请求形状，而 CLI 拼的是另一种形状；**只有真实 exe 走一遍用户走的路
+    才会当场露出来**（那次崩溃对所有破坏性操作都生效，所以第一个 `file delete`
+    用例就会失败）。全量约 17 秒（端到端约 5 秒），比纯单元测试慢但仍可每次跑
+    （第 109 节、`FMT 技术文档.md` 第 13.9.1、17.2、18.35 节）
 
 ```
 
@@ -7349,7 +7402,7 @@ FMT 重构设计.md
 
 ```text
 单一 fmt.exe 三种形态（manifest 为 asInvoker）
-service install / uninstall / start / stop / status（无 pause、无 delete）
+service install / uninstall / start / stop / reinstall / status（无 pause、无 delete）
 service 四条动作命令一律 UAC 提权 + 结果经结果文件 <数据根>\temp\fmt-elev-<父进程 pid>.json 回传
   （提权副本 operation 五种：install / uninstall / start / stop / reinstall）
 service status 是查询命令：不提权、不弹 UAC，未安装时 FMT-601 / 退出码 8
@@ -7779,6 +7832,81 @@ data root moves」+ `bb7a40f`「test(cli): give the root notice a home and a tes
   原口径「只进日志、不刷控制台」作废）
 ```
 
+**`service reinstall` 正式化并入的决策（提交 `c573f14`「feat(cli): expose service reinstall」）**：
+
+```text
+事实：提权副本早就有 reinstall（src/cli/elevation.cpp）——
+      一次 UAC 内「卸载（先停服务、解开旧 exe 的文件占用）→ 按**当前这个 exe**
+      重新注册 → 启动」；本轮只做接线。
+接线：is_user_service_command() 加入 reinstall（该函数已从匿名命名空间移出、
+      在 cli.hpp 声明，便于测试）、两处用法提示、命令总览、help service 正文。
+命令集：service **六条子命令** install / uninstall / start / stop / reinstall / status，
+      其中**除 status 外每条都提权**。
+      原口径「service 只有四条命令」「文档冻结的是四条」「reinstall 只在引导流程内部
+      使用」**均已作废**。
+用法行：用法：service install | uninstall | start | stop | reinstall | status
+help service 新增正文（照源码抄，第 68 节）：两个用途（用新 exe 更新服务 /
+      修复宿主 exe 被移动或删除）+ **业务数据一个都不动** + 宿主会变成你运行的这一份、
+      数据根仍由连上来的 CLI 声明。
+三个「不变」：① 业务数据不变（uninstall() 只 DeleteService，不删
+      repository / trash / config / data / log / temp）；
+      ② C:\ProgramData\FMT\service.json 不变（卸载不删状态目录 → current_root 保留，
+         重装后数据根仍是原来那个，直到某个 CLI 连上来重新声明）；
+      ③ 数据根仍由 CLI 声明，与「宿主 exe 是谁」无关。
+为什么重要：服务在跑时旧宿主 exe 被占用、无法直接覆盖；reinstall 先停旧宿主解开占用，
+      再把注册指向**你运行的那一份**新 exe——**不需要先复制，也只要一次 UAC**
+      （用户之前要 uninstall → install 两次）。与宿主 exe 丢失的修复路径是同一件事
+      （FMT 技术文档 13.8.4）。
+测试：146 → **147 项全绿**。新增 Cli.service子命令集合（断言 install / uninstall /
+      start / stop / reinstall 为真；status、空串、Install、乱写为假）——
+      **命令集合第一次有断言**，因为它决定「敲了什么会被当成什么」
+实测（2026-10-09，对已安装服务）：服务已停止时 reinstall → exit 0、服务 RUNNING、
+      宿主 = 执行它的那份 exe、数据根仍是 D:/Data/Temp/JMT/fmt、桶/文件/回收站全未变；
+      服务正在运行时 → exit 0、宿主 PID 2088 → 9212（换成新进程）、STATE 仍 RUNNING、
+      业务命令正常
+（`FMT 技术文档.md` 第 11.3、11.4、11.6、13.7、13.8.2、13.8.4、17.2、18.34 节）
+```
+
+**端到端冒烟测试并入的决策（提交 `a340d1e`「test(cli): drive the real exe over the real
+pipe」）**：
+
+```text
+① 管道名可用 FMT_PIPE 覆盖（这是测试能隔离的前提）
+   ipc::pipe_name()（include/fmt/ipc/pipe.hpp 声明、src/ipc/pipe.cpp 实现）：
+   默认 kPipeName = \\.\pipe\fmt.control；环境变量非空时用它。
+   使用点：ServerRuntime::run() 的 accept 循环（循环外算一次）、CLI ensure_connected()。
+   **线上行为不变**：真服务由 SCM 启动，不会带这个变量；默认名照旧。
+   **为什么留口子**：端到端测试要在同一台机器上再起一个进程内服务，而真服务通常正占着
+   默认名——不换名字要么起不来，要么更糟：把命令打到用户的真服务上、动到真数据。
+   安全边界不变：本机同一用户范围内的名字覆盖，DACL / MIC 那套不改（第 15.1 节），
+   服务侧的变量来自 SCM。
+② 新测试文件 tests/cli_e2e_test.cpp（套件 CliE2e，2 条用例）
+   做法：进程内起 ServerRuntime → 把 fmt.exe 复制到临时数据根（「数据根 = CLI 所在目录」）
+        → CreateProcessW 拉起真实 exe、喂 stdin、合并收 stdout+stderr
+        → 断言退出码与用户看到的文字
+   覆盖（逐条见第 109 节的表）：version；bucket create WORK（小写归一 + 提示）、list；
+        file upload、FMT-304、FMT-105；file get 按名/按 id、FMT-002；
+        file delete → trash list（含 [文件]）→ trash get（含「回收站路径」）→ trash restore；
+        跨桶删除无 --yes → FMT-016 且随后确认文件仍在、带 --yes → 成功且消息带「Bucket：work」；
+        永久删除无 --yes → FMT-016、带 --yes → 成功；
+        删桶：空桶成功（仍打印「只能整体恢复」）、非空桶无 --yes → FMT-016；
+        **交互式确认**（此前完全没有自动化覆盖）：喂 n → 「确认执行？」+「已取消」且文件仍在，
+        喂 y → 不再出现「已取消」且条目进了回收站
+③ 为什么要有它（工程教训）
+   file delete 弹 abort() 那次崩溃，单元测试**全绿**却没挡住——测试直接调业务层、
+   按服务端期望的形状拼请求，而 CLI 拼的是另一种形状。只有让真实 exe 走一遍用户走的路，
+   这类回归才会当场露出来。**那次崩溃的代码路径对所有破坏性操作都生效**，
+   所以本测试的第一个 file delete 用例就会当场失败。
+④ 计数与耗时：147 → **150**（新增 CliE2e.核心链路走真实exe与真实管道、
+   CliE2e.交互式确认答n不删答y才删、Ipc.管道名可被FMT_PIPE覆盖）；
+   全量约 17 秒（端到端约 5 秒）——会拉起子进程，比纯单元测试慢，但仍在十几秒量级
+实测（2026-10-09，对已安装且**正在运行**的真服务）：跑 CliE2e 前服务运行中、
+   数据根 D:/Data/Temp/JMT/fmt；跑完 2/2 通过，服务仍运行中、数据根不变，
+   桶 lazy、2 个文件、回收站里 a7.jpg ——**完全未变**；全量 150 项通过、17.3 秒、
+   无残留进程与临时目录
+（`FMT 技术文档.md` 第 13.9.1、13.9.2、13.9.3、17.2、18.35 节）
+```
+
 > **实测风险 → 已被提交 `8f2fbc5` 处理（2026-10-09）**：做 `version` 测试时在**构建目录**里
 > 跑了交互模式，CLI 按设计把**自己所在目录**声明为数据根，于是服务的数据根被切到了构建目录
 > （日志里是 `[Main] 数据根切换: D:/Data/CLionProjects/FMT/cmake-build-debug/bin
@@ -7939,7 +8067,8 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 > **测试计数走过的台阶**：118（`188e85d`）→ 124（`a2b6cd1`）→ 126（`0ad9efc`）→
 > 129（`5bf2c1f`）→ 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→
 > 142（`a9af276`）→ 143（`2c841c8`）→ 144（`5b316b3`）→ 144（`8f0fd5c` 只补断言，
-> 计数不变）→ 145（`d108c80`）→ **146（`bb7a40f`）**。第 109、112、125 节已按 146 更新。
+> 计数不变）→ 145（`d108c80`）→ 146（`bb7a40f`）→ 147（`c573f14`）→ **150（`a340d1e`）**。
+> 第 109、112、125 节已按 150 更新。
 
 后续开发过程中，如果发现：
 
@@ -7978,6 +8107,42 @@ HTTP 实现限制
 ---
 
 # 126. 提权流程
+
+## 126.1 `service reinstall` 的语义（提交 `c573f14` 起是正式命令）
+
+`reinstall` **本来就有**（提权副本的 operation，双击引导内部用它），提交 `c573f14` 只是
+把它**接线给用户**：加进 `is_user_service_command()`、两处用法提示、命令总览与
+`help service`。它的实现是一次 UAC 里做完「卸载 → 按**当前这个 exe** 重新注册 → 启动」：
+
+```cpp
+} else if (operation == "reinstall") {
+    const Status removed = service::uninstall();          // 未安装也当作可继续
+    const bool removable = ok(removed) || error_of(removed)->code == ErrorCode::ServiceNotInstalled;
+    status = removable ? service::install(path_to_utf8(executable_path()), true) : removed;
+}
+```
+
+**三个「不变」（这是 `reinstall` 最值得记住的部分）**：
+
+```text
+① 业务数据不变   uninstall() 只 DeleteService，**明确不删** repository / trash / config /
+                 data / log / temp（service.cpp 里那句注释就是这条口径），
+                 所以桶、文件、回收站、配置全都原样
+② C:\ProgramData\FMT\service.json 不变   卸载不删状态目录，所以 current_root 保留——
+                 重装之后数据根**仍是原来那个**，直到某个 CLI 连上来重新声明
+③ 数据根仍由 CLI 声明   与「宿主 exe 是谁」无关；重装完打开窗口会看到横幅上的
+                 「数据根：…」（提交 8f2fbc5），换根提示照旧在连上那一刻报
+```
+
+**为什么这是「更新 exe」的正确路径**（用户之前要 `uninstall` → `install` 两次 UAC）：
+
+```text
+服务在跑时，旧宿主 exe 被占用 → 直接覆盖会失败（文件被锁）。
+reinstall 先停掉已注册的宿主（解开占用），再把服务注册指向**你运行的那一份** exe
+并启动——所以**不需要先把新 exe 复制过去**，也**只要一次 UAC**。
+宿主 exe 被移动或删除时同理：它按现在这份 exe 重新注册（与第 4.8 节
+「服务宿主 exe 已丢失」的修复路径是同一件事，`FMT 技术文档.md` 第 13.8.4 节）。
+```
 
 service 命令里的**四条动作命令**（`install` / `uninstall` / `start` / `stop`）**每条都走 UAC 提权**，
 即使目标状态已经满足也照常弹 UAC，不做免提权优化。提权副本额外支持一个组合操作
@@ -8314,7 +8479,7 @@ fmt >help service
 ```text
 fmt> help
 可用命令：
-  (service)  install  uninstall  start  stop  status
+  (service)  install  uninstall  start  stop  reinstall  status
   (bucket)   create  list  get  use  delete
   (file)     upload  list  get  delete
   (trash)    list  get  restore  delete
