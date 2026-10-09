@@ -15,11 +15,11 @@
 > |---|---|
 > | `FMT 开发文档.md` | 规范主体：模块职责、数据结构、命令、流程、测试要求 |
 > | `FMT 项目架构.md` | 总体架构、冻结决策、错误码清单（附录 A） |
-> | `FMT 重构设计.md` | 本次重构的冻结决策、通道设计、阶段拆分、错误码补充表 |
+> | ~~`FMT 重构设计.md`~~ | **该文档已删除**：内容并入本文与另外两份文档——冻结决策见 `FMT 开发文档.md` 第 122 / 128 节，通道与阶段见本文 12.3、13 节与 `FMT 项目架构.md` 第 11 节 |
 > | **本文档** | **技术实现**：技术栈、接口设计、实现方式、类与函数、协议细节、落地步骤 |
 >
 > 与开发文档或架构文档冲突时以它们为准；本文档只补实现细节，不另立规范。
-> 本次重构涉及的决策以 `FMT 重构设计.md` 第 2 节「冻结决策一览」为准。
+> 本次重构涉及的决策以 `FMT 开发文档.md` 第 122 节「开发中的冻结规则」（为什么这么定见第 128 节）与 `FMT 项目架构.md` 第 2 节「关键设计决策」为准。
 >
 > `项目基本提示词.txt` 是项目背景说明（项目类型、架构方向、技术层补充），
 > 不作为规范依据。
@@ -2090,6 +2090,14 @@ ServerRuntime::run_upload(args)        // 管道与 HTTP 共用这一份（12.3.
 其余业务命令仍是「取锁 → `execute_business()`」。`commands.cpp` 的 `file_command()`
 里**没有** `file.upload` 分支——它只处理 `file.list` / `file.get` / `file.delete`。
 
+> **提交 `d3aeb3d` 之后多了一条近亲：`file.upload_stream`**（HTTP 流式上传用）。
+> 它的**第一阶段不同**：HTTP 处理器用 `ContentReader` 把请求体**边收边写**到
+> `temp/`（边判上限，超了立刻中止并删暂存文件），落盘后再交给业务层——
+> op 的 `args.argv = [暂存路径, 文件名]`，第二阶段与 `file.upload` 同一套
+> （补算大小与 MD5 后入库，**只有一次移动**）。所以「上传必须先有完整文件」这条
+> 只对 `file.upload` 成立：流式那条连「本地路径」都不需要（12.3.2）。
+> `file.upload` 仍是**管道侧唯一**走 `run_upload()` 的 op。
+
 **换根不会插进第 ② 段**：换根只由 `hello` 触发，而管道的 accept/serve 是串行的
 （15.1 ①）——上传期间不会再处理第二个请求，所以第 ① 段拿到的快照在整段下载期间都成立。
 HTTP 侧每个请求各自取当前 `context_`，真正的写只在第 ③ 段的锁内发生。
@@ -3216,7 +3224,7 @@ FMT-NNN   业务/系统错误码，跨进程传递（管道、HTTP 信封），�
 退出码     进程退出状态，给脚本与用户看，粒度粗（0~8）
 ```
 
-本次重构涉及的映射（与 `FMT 重构设计.md` 第 9 节的冻结表一致）：
+本次重构涉及的映射（与 12.7 的冻结表一致）：
 
 | 场景 | 错误码 | 退出码 |
 |---|---|---|
@@ -3232,7 +3240,7 @@ FMT-NNN   业务/系统错误码，跨进程传递（管道、HTTP 信封），�
 
 还原函数（CLI/HTTP 两侧共用，见 11.1）：`error_code_from_string(std::string_view)`，
 把信封里的 `"FMT-305"` 这类字符串还原成 `ErrorCode`；反向用 `to_string(ErrorCode)`。
-这两个函数名是实现细节，`FMT 重构设计.md` 里把它表述为「同一个字符串还原函数」。
+这两个函数名是实现细节，原 `FMT 重构设计.md`（已并入本文）把它表述为「同一个字符串还原函数」。
 
 ### 11.9 界面与交互模式
 
@@ -4165,6 +4173,44 @@ Unauthorized`**（退出码 5）。细节见下面的「认证」小节。
 > 原口径的 `/api/bucket` 五条路由（以及 `/api/config` 两条）**已作废**——
 > `config` 目前也没开 HTTP 接口，`config list` 的 token 要**从 CLI 拿**。
 
+**流式上传（提交 `d3aeb3d`，`POST /api/file/upload`）**：
+
+```text
+请求体     **就是文件内容**（Java / Python 客户端直接推字节流）。
+           **旧的「请求体里给服务端一个本地路径」那套已删除**——对远端客户端没有意义。
+文件名     ?name=xxx，或请求头 Content-Disposition: attachment; filename="x.jar"
+           （也支持 filename*=UTF-8''… 的百分号编码形式）；
+           **没给文件名 → FMT-100（400）**
+边收边写   temp/ 下的暂存文件 fmt-upload-<pid>-<序号>.tmp，**沿用 fmt- 前缀**，
+           所以服务启动时的清理会收走中断留下的碎片（有 10 分钟年龄保护，4.2）
+上限       超过 max_upload_size **立刻中止接收并删掉暂存文件**（FMT-303 → 400）——
+           不是「写完再看」
+入库       落盘后交给业务层补算大小与 MD5 并入库：**全程只有一次移动、不二次拷贝**
+           （这正是大文件走流式上传的意义）；失败路径一律删暂存文件
+新增 op    **file.upload_stream**（args.argv = 暂存路径 + 文件名）——管道也能调，
+           但它是给 HTTP 流式上传用的
+新增函数   prepare_staged_upload(paths, staged, name, size_limit, logger)（流式版第一阶段）、
+           content_type_of(file_name)（按扩展名猜 MIME，兜底 application/octet-stream）
+```
+
+**下载与预览（提交 `d3aeb3d`）**：
+
+```text
+实现     都用 httplib 的 set_content_provider **流式回**，不把整个文件读进内存
+下载     **不受预览策略限制**：任何类型都能下载；Content-Type 猜不出来就给
+         application/octet-stream；Content-Disposition: attachment;
+         filename*=UTF-8''<百分号编码>（中文名任何客户端都能正确落地）
+预览     Content-Disposition: inline；Content-Type 由**唯一一份**预览策略给出——
+         `preview_content_type(file_type, file_name)` 在文件模块里：
+           file_type == "image" → 按扩展名给 image/*
+           文本类（.txt/.md/.json/.csv/.log/.xml）→ 对应 MIME
+           **其余一律 FMT-701（400，可下载但不可预览）**
+         HTTP 与将来的其它入口**共用这一份**，不各写一套
+data.path file.get 与 share.download 的响应新增 **path**（**相对数据根**，例如
+         repository/user/lazy/2026/10/09/x.txt），HTTP 层按它定位文件；
+         **file.list 不加**（用户要求列表只输出文件信息）
+```
+
 **认证（提交 `4b812b5`）**：
 
 ```text
@@ -4203,10 +4249,14 @@ token 从哪拿  **`config list`** 会打印「用户 ID / 访问 token / 建议
 > `/api/file/<标识>` 共用），缺确认就不往 `args` 里放 `force`，由 `service` 层统一拒绝，
 > 因此**管道与 HTTP 的确认语义完全一致**。
 >
-> **提交 `188e85d` 追加 `/api/file` 四条（共十三条）**，与管道 op 一一对应：
-> `GET /api/file` → `file.list`、`POST /api/file` → `file.upload`、
-> `GET /api/file/<id_or_name>` → `file.get`、`DELETE /api/file/<file_id_or_name>` → `file.delete`。
-> 四条都走同一份 `run` 闭包 → `BusinessHandler`，`file.upload` 也不例外
+> **提交 `188e85d` 追加 `/api/file` 四条**，与管道 op 一一对应：
+> `GET /api/file` → `file.list`、**`POST /api/file/upload` → `file.upload_stream`**
+> （**提交 `d3aeb3d` 改的**：原来的 `POST /api/file` + `{"url"/"path"}` 让服务端读本地路径，
+> 对远端客户端没有意义，已删除）、
+> `GET /api/file/<id_or_name>` → `file.get`、`DELETE /api/file/<file_id_or_name>` → `file.delete`；
+> **提交 `d3aeb3d` 再加流式下载与预览两条**（`GET .../download`、`GET .../preview`，
+> 都走 `set_content_provider`）。
+> 这些路由都走同一份 `run` 闭包 → `BusinessHandler`，`file.upload` 也不例外
 > （HTTP 侧转给 `ServerRuntime::run_upload()`，与管道完全同一份两段式实现）。
 > `DELETE /api/file/<file_id_or_name>` **不需要 `force`**：软删除可恢复，服务端没有任何确认检查。
 > 路径参数名在提交 `0ad9efc` 从 `<file_id>` 改成 `<file_id_or_name>`：服务端
@@ -4218,13 +4268,23 @@ token 从哪拿  **`config list`** 会打印「用户 ID / 访问 token / 建议
 > ① **`/api/share` 四条已落地**：`POST /api/share`（`{"file_id":…}`）、
 > `GET /api/share/<share_id>`、`GET /api/share?file_id=…`、`DELETE /api/share/<share_id>`；
 > 全部**要 token**（除下面那条下载）。`GET /api/share/<id>/download` **公开、不要 token**
-> （分享链接本身就是凭证），但**流式下载第 3 步才做**，现在返回 **501 + `FMT-602`**。
+> （分享链接本身就是凭证）；**提交 `d3aeb3d` 起它已真正实现**：流式回文件，且
+> **先记账再放行**（开发文档第 50/51 节在这里生效——计数写不进去就不下载，避免超发）。
 > ② **`/api/bucket*` 五条已删除**（用户明确「桶不要」）→ **404 + `FMT-017`**（不是 501：
 > 这是故意不要，不是还没做）；桶继续由 CLI 管。
 > ③ `/api/config` 两条仍未加（`config list` 是**从 CLI** 拿 token 的地方）。
-> ④ `trash empty` 也没加 HTTP 路由（`DELETE /api/trash` 仍不存在）。
+> ④ `trash empty` 也没加 HTTP 路由（`DELETE /api/trash` 仍不存在；`DELETE /api/trash/<标识>`
+> 是**永久删除单条**，两者不是一回事）。
 > ⑤ **所有 `/api/*` 都要 token**，只有 `/api/ping` 与分享下载公开（见上面的「认证」）。
 > 原口径「`share` 四条仍是设计约定、`/api/bucket` 五条已落地」**已作废**。
+
+> **提交 `d3aeb3d` 之后：HTTP 路由表就是上面这张，第 3 步（流式）已完成**
+> ——上传走 `POST /api/file/upload`（请求体即内容）、下载/预览各一条流式路由、
+> 分享下载公开且**先记账再放行**。**两个真实 bug 已修**（18.40）：
+> ① ContentReader 型处理器**早退前必须 `drain_reader()` 把请求体读干净**，否则 httplib
+> 直接断开连接，客户端拿到的是「没有响应」而不是我们精心写的错误码；
+> ② **下载曾经误用预览策略**，`.bin` 的下载被 `FMT-701` 挡掉——下载与预览是两件事，
+> 下载不受预览策略限制。
 
 **`service *` 没有、也不会有 HTTP 路由**：它操作的是 SCM，与服务进程内的业务无关，
 且服务可能尚未安装/运行。见 13.8。
@@ -4526,6 +4586,50 @@ DELETE /api/trash/<标识>             200（永久删除 {entry, message}）；
 - 大文件**不得**一次性读入内存，用固定大小缓冲区（如 64 KB）循环发送
 - 传输中断视为失败，不计数
 - 只有**完整成功**才 `download_count + 1`
+
+---
+
+### 12.7 错误码 / 退出码 场景表（原 `FMT 重构设计.md` 第 9 节）
+
+> **来源**：整体搬自 `FMT 重构设计.md` 第 9 节（该文件已并入本文与其他两份文档，随后删除）。
+> 它是「**什么场景 → 哪个 FMT 编号 → 哪个退出码**」的对照表，与 12.5 的「错误码 → HTTP 状态码」互补；
+> 错误码本身的含义与分组见 `FMT 项目架构.md` 附录 A。
+
+退出码沿用旧表：`0` 成功、`1` 通用、`2` 参数、`3` 对象不存在、`4` 冲突、`5` 权限/访问、`6` 数据一致性、`7` 配置、`8` Service。`FMT-NNN` 定位原因，退出码给脚本分类，两层不混用。
+
+| 场景 | 错误码 | 退出码 |
+|---|---|---|
+| 服务已存在，重复 install | `FMT-600 ServiceAlreadyInstalled` | 8 |
+| 服务不存在 | `FMT-601 ServiceNotInstalled` | 8 |
+| `service status` 发现服务未安装（打印 `服务状态：未安装`，但**不提权**） | `FMT-601 ServiceNotInstalled` | 8 |
+| `service status` 成功（含「已安装但已停止」） | — | 0 |
+| SCM 操作失败 / 提权等待超时（60 秒） | `FMT-602 ServiceOperationFailed` | 8 |
+| `ShellExecuteExW` 其它失败 / 结果文件不存在（提权副本崩了） | `FMT-602 ServiceOperationFailed` | 8 |
+| **提权结果文件被 temp 清理误删**（提交 `5b316b3` 已修：启动清理只清十分钟以前的 `fmt-*`） | `FMT-602 ServiceOperationFailed`（「提权副本没有返回结果」）——**假失败**：提权副本报成功、服务其实已装好并启动，父进程却读不到结果文件，因为 `service install` 会在同一次操作里启动服务，而服务启动时把 `fmt-elev-<pid>.json(.tmp)` 一起清掉了 | 8 |
+| 需要管理员权限（打印「需要管理员权限」，或 `ShellExecuteExW` 失败且 `ERROR_ACCESS_DENIED` 5） | `FMT-603 AdminRequired` | 5 |
+| 用户在 UAC 点「否」（`ERROR_CANCELLED` 1223） | `FMT-004 PermissionDenied` | 5 |
+| **需要显式确认的操作缺 `force`**——永久删除（两级 `trash delete`）、跨 Bucket 的 `file delete`、非空桶的 `bucket delete`（提交 `711da4c`） | **`FMT-016 ConfirmRequired`**（默认消息「该操作需要显式确认（force）」；具体消息说明要确认什么，例如「永久删除不可恢复，需要确认（force = true）」「<预检消息>；确认删除请加 force（CLI：--yes）」；**HTTP 400**） | 2 |
+| **HTTP ：缺少 / 无效的 token**（提交 `4b812b5`） | **`FMT-018 Unauthorized`**（**HTTP 401**，退出码 5）：`/api/*` 都要 token，唯一例外是 `/api/ping` 与 `/api/share/<id>/download`（分享链接本身就是凭证）；认证**只在一处**（httplib pre-routing 钩子——「漏给某条路由加认证」是这类代码最典型的事故），且**没有注入校验器时一律 401**（fail-closed）；请求头收 `X-FMT-Token` 与 `Authorization: Bearer`，比较常量时间；token 从 `config list` 拿 | 5 |
+| **HTTP 兜底路由：完全打错的 `/api/...` 路径**（提交 `4ddb515`，真机实测后定；`GET /api/nosuch` 原来是 `500 + FMT-602`） | **`FMT-017 RouteNotFound`**（默认消息「没有这个接口」，**HTTP 404**；**只由 HTTP 兜底路由产生**——管道入口没有「路由」概念）。**提交 `4b812b5` 追加一种用法**：`/api/bucket*` 也返回它——**故意不要**（用户明确「桶不要」），不是「还没做」 | 3 |
+| **HTTP 兜底路由：已知模块下没有这个接口**（`/api/file/list` 这类，提交 `4ddb515`；`bucket` **不在**已知模块里） | `FMT-602 ServiceOperationFailed`（消息「接口尚未实现：<path>」，**HTTP 501**——原口径落 `default: 500`，等于说「服务器坏了」；分享的流式下载端点属于这一类） | 8 |
+| 回收站条目不存在（`trash get` / `trash delete` 也走它，不只是回退） | `FMT-400 TrashEntryNotFound` | 3 |
+| 上传时来源协议不是 http/https（如 `ftp://`，提交 `a2b6cd1`；原文此处写的是 `https://`，已作废） | `FMT-300 UrlInvalid`（「只支持 http:// 与 https:// 的来源：<来源>」；**不是 `FMT-002`**） | 2 |
+| 上传时 URL 带用户名密码 / 端口非法 / 缺主机名（提交 `a2b6cd1`） | `FMT-300 UrlInvalid` | 2 |
+| 下载超时（`ERROR_WINHTTP_TIMEOUT`，提交 `a2b6cd1`） | `FMT-302 DownloadTimeout` | 1 |
+| 下载因域名/连接/TLS/响应异常失败，或服务器返回非 identity 的压缩内容（提交 `a2b6cd1`） | `FMT-301 DownloadFailed`（证书类失败附「根证书不受信任 / 证书主机名不符 / 证书已过期」） | 1 |
+| 上传时文件名推不出来（如 `http://example.com/`，提交 `188e85d`） | `FMT-100 FileNameEmpty`（「无法从来源推断文件名，请显式给出文件名」） | 2 |
+| 上传时本地路径找不到，而**原始输入里带不可见格式字符**（从聊天窗口/网页/终端复制路径夹进来的 `U+202A` 等，提交 `a9af276`；清掉后仍找不到） | `FMT-002 FileNotFound`（「本地文件不存在：<清理后的路径>（你粘贴的路径里有不可见字符 U+202A、U+202C，它会让路径对不上；已自动清掉，请检查路径是否还有别的问题）」；只去掉引号/空白时另有一句说明） | 3 |
+| 文件名 / Bucket 名里**带**不可见格式字符（提交 `a9af276`；名字要长期存下来、还要被用户重敲一遍） | 文件名 `FMT-101 FileNameInvalidChar`、Bucket 名 `FMT-202 BucketNameInvalid`（消息点名码位，「请把名字重敲一遍」） | 2 |
+| 上传时同用户（**跨 Bucket**）已有相同 MD5 的正常文件 | `FMT-304 Md5Duplicate`（「该文件已经存在：<名字>（<file_id>）」） | 4 |
+| 上传时同用户（**跨 Bucket**）已有同名正常文件（不自动改名） | `FMT-105 FileNameConflict`（「同名文件已存在：<file_name>（换一个文件名再上传）」） | 4 |
+| 上传时文件名与 `file_id` 同形（`fmt-YYYYMMDD-N`，提交 `9c3d2cb`；前缀按 ASCII 折叠比较，「最短 14 个字符」「日期段恰好 8 位数字」「序号段全数字且非空」） | `FMT-106 FileNameLikeFileId`（「文件名不能与文件标识同形（fmt-YYYYMMDD-N）：<名字>（会与 file_id 混淆，请换一个名字）」；属 `FMT-1xx` 文件名校验一组，与 Windows 保留设备名同类，**显式名与从来源推断的名字走同一道校验**） | 2 |
+| `file delete` 的 key 同时命中一条 `file_id` 与**另一条**记录的文件名（旧数据里已经存在这种形状） | `FMT-001 InvalidArgument`（「有歧义：<key> 既是 <file_id> 的文件标识，又是另一个文件的文件名（file_id <file_id>）。这种名字现在不允许上传；请直接用 file_id 指定要删哪一个」；**只给 `file delete`**，`file get` 不加） | 2 |
+| `file delete` 的文件已经在回收站里 | `FMT-001 InvalidArgument`（「该文件已经在回收站里：<file_id>」；提交 `0ad9efc` 起按**名字**命中的那一路报「该文件已经在回收站里：<名字>（file_id <file_id>）」，**不是** `FMT-002`） | 2 |
+| `file get` / `file delete` 按 `file_id` 或文件名都查不到 | `FMT-002 FileNotFound`（提交 `0ad9efc` 起 `file delete` 的定位与 `file get` 一致：先当 `file_id`、再当文件名（当前用户 + 正常文件），两步都没有才是 `FMT-002`） | 3 |
+| `file get` 命中的记录在回收站里（提交 `9c3d2cb`） | 不是错误：照常回 `is_trash` / `trash_reason`，并**增加** `trash_path`（相对数据根、正斜杠，形如 `trash/user/.files/工作/2026/10/08/test.txt`）；仓库里找不到该文件时**不返回** `path`——这是设计，不是缺失。CLI 多打一行「回收站路径：…」 | 0 |
+| 文件的落地路径推不出来且在日期树里有多个同名文件（有歧义） | `FMT-015 ConsistencyError` | 6 |
+
+编号一旦发布不复用、不修改语义，新增只能追加。
 
 ---
 
@@ -6807,7 +6911,7 @@ Bucket 就是 `repository/<user>/<bucket>` 目录，**没有**独立的 `bucket.
 
 新增错误码 `FMT-604 NoCurrentUser`（追加在末尾，已有编号语义不变）。
 
-> 注意：`FMT 重构设计.md` 第 9 节的例子把「未设置当前 Bucket」写成 `FMT-305`。
+> 注意：12.7 那张表（原 `FMT 重构设计.md` 第 9 节）的例子把「未设置当前 Bucket」写成 `FMT-305`。
 > 两者编号不同（`FMT-604` = 无当前用户，`FMT-305` = 无当前 Bucket），
 > **正式编号以 `FMT 项目架构.md` 附录 A 为准**；本文档只引用，不定义。
 
@@ -6946,7 +7050,7 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 | `file delete` | CLI 与路由都在，handler 返回「本版本尚未实现」。落地方案已定：标记 `is_trash=true` + `trash_reason="file"` + 把物理文件移入 **`trash/<user>/.files/<bucket>/YYYY/MM/DD/`**（提交 `4fee290` 定下的落点；原口径写成 `trash/<user>/<bucket>/YYYY/MM/DD/` **已作废**）。**（这一行是上一次实现的记录；本次重构的提交 `188e85d` 已经把 `file delete` 做完，见 10.2.4、18.19）** |
 | Bucket 删除的元数据标记 | 旧实现的 `bucket::remove` 只做了目录搬迁。第 30 节要求同时把该 Bucket 下所有文件的 `is_trash` 置 true——等 `file delete` 落地时一并做，两处必须同一套逻辑 |
 | Trash 全部命令 | `trash list/get/restore/delete` 均未实现（**上一次实现的记录**） |
-| Preview | `file preview` / `share preview` 返回 FMT-701 |
+| Preview | `file preview` / `share preview` 返回 FMT-701 ——**提交 `d3aeb3d` 起 HTTP 侧已有预览**（`GET /api/file/<id>/preview`，只有策略允许的类型可预览，其余仍 701）；CLI 仍没有 `preview` 子命令 |
 | `common/md5` 的测试覆盖 | 无自动化测试；实测与 `md5sum` 对比一致（上传后 `file.json` 里的 md5 与外部工具一致） |
 
 > **上面第一、二行说的是上一次实现，本次重构已经修掉**：`BucketService::remove()`
@@ -8686,6 +8790,89 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
 
 ---
 
+### 18.40 HTTP 第 3 步：流式 upload / download / preview + 公开分享下载（commit `d3aeb3d`）
+
+`d3aeb3d`「feat(http): stream uploads, downloads and previews」。**HTTP 接口的最后一部分**，
+**156 个用例仍全绿**（流式断言加进既有 `Server.File路由与上传`，用例数不变）。
+
+```text
+① 路由表（最终形态，见 12.3.2）
+   POST   /api/file/upload            请求体**就是文件内容**（流式）；
+                                      文件名来自 ?name= 或 Content-Disposition
+   GET    /api/file                   列出文件（**只有文件信息**）
+   GET    /api/file/<id|名字>         get 单个信息（响应含相对数据根的 path）
+   GET    /api/file/<id|名字>/download  下载（attachment，流式）
+   GET    /api/file/<id|名字>/preview   预览（inline，流式）
+   DELETE /api/file/<id|名字>         软删除（?dry_run=1 / ?force=1）
+   GET    /api/trash                  列表
+   GET    /api/trash/<标识>           get
+   DELETE /api/trash/<标识>           **永久删除**（?dry_run=1 / ?force=1）
+   POST   /api/trash/<标识>/restore   回退
+   POST   /api/share                  {"file_id": "…"}
+   GET    /api/share/<share_id>
+   GET    /api/share?file_id=…
+   DELETE /api/share/<share_id>
+   公开（唯一不要 token）：GET /api/share/<share_id>/download
+     —— 分享链接本身就是凭证；**必须先记账再放行**（第 50/51 节在这里生效，
+        计数写不进去就不下载，避免超发）
+
+② 流式上传的要点
+   请求体就是文件内容（Java / Python 客户端直接推字节流）。
+   **旧的「请求体给服务端本地路径」那套已删除**——对远端客户端没有意义。
+   边收边写、边判上限：超过 max_upload_size **立刻中止接收并删掉暂存文件**
+     （FMT-303 → 400），不是「写完再看」。
+   暂存文件名 fmt-upload-<pid>-<序号>.tmp 放在 temp/ 下：**沿用 fmt- 前缀**，
+     所以服务启动时的清理会收走中断留下的碎片（有 10 分钟年龄保护）。
+   落盘后交给业务层补算大小与 MD5 并入库：**全程只有一次移动，不二次拷贝**
+     （这正是大文件走流式上传的意义）；失败路径一律删暂存文件。
+   文件名：?name=xxx，或 Content-Disposition: attachment; filename="x.jar"
+     （也支持 filename*=UTF-8''… 百分号编码）；**没给文件名 → FMT-100（400）**。
+   链路多了一个业务 op：**file.upload_stream**（argv = 暂存路径 + 文件名）；
+     管道也能调，但它是给 HTTP 流式上传用的。
+   新增函数：prepare_staged_upload(paths, staged, name, size_limit, logger)、
+     content_type_of(file_name)、preview_content_type(file_type, file_name)。
+
+③ 下载 / 预览
+   都用 httplib 的 set_content_provider 流式回，不把整个文件读进内存。
+   **下载不受预览策略限制**：任何类型都能下载；Content-Type 猜不出来就给
+     application/octet-stream；Content-Disposition: attachment;
+     filename*=UTF-8''<百分号编码>（中文名任何客户端都能正确落地）。
+   **预览策略只有一份**，在文件模块 preview_content_type() 里：
+     file_type == "image" → 按扩展名给 image/*；
+     文本类（.txt/.md/.json/.csv/.log/.xml）→ 对应 MIME；
+     **其余一律 FMT-701（400，可下载但不可预览）**——HTTP 与将来的其它入口共用。
+
+④ 数据字段
+   file.get 与 share.download 的响应新增 **path**（**相对数据根**，例如
+     repository/user/lazy/2026/10/09/x.txt），HTTP 层按它定位文件；
+     **file.list 不加**（用户要求列表只输出文件信息）。
+
+⑤ 两个真实 bug（都进「陷阱」清单）
+   ① **ContentReader 型处理器早退不读请求体 → httplib 直接断开连接**：
+      客户端拿到的是「没有响应」，而不是我们精心写的错误码
+      （没给文件名本该回 FMT-100）。修法：早退前先 `drain_reader()` 把体读干净。
+   ② **下载误用了预览策略**：一开始下载与预览共用一个分支，结果 `.bin` 的**下载**
+      被 FMT-701 挡掉。下载与预览是两件事，**下载不受预览策略限制**。
+
+⑥ 测试（仍 156 项，全绿）
+   流式断言加在既有 `Server.File路由与上传` 里（该用例上限传 4096）：
+     没给文件名 → FMT-100；与 file_id 同形的名字 → FMT-106；
+     **10KB 上传 → FMT-303 且 temp/ 里不留 fmt-upload-* 碎片**；
+     100 字节上传成功；**下载字节与原文件逐字节相同**且 Content-Disposition 是
+     attachment；`.bin` 预览 → FMT-701。
+
+⑦ 真机验收（localhost:4122）
+   POST /api/file/upload?name=live-probe.txt（体 525 字节）→ 200，md5 3f39d8bc…，size 525
+   GET  /api/file/fmt-20261009-0/download                 → 525 字节，逐字节一致
+   GET  /api/file/fmt-20261009-0/preview                  → 200，text/plain; charset=utf-8，inline
+   POST /api/share {"file_id":"fmt-20261009-0"}           → share_id 0d7b3cf4bc2e
+   GET  /api/share/0d7b3cf4bc2e/download  **不带 token**  → 200，且 download_count 变成 1
+   清理：撤销分享 + 软删除 + 永久删除；file list 仍 2 个文件、trash list 仍 1 项、
+        temp/ 无残留
+```
+
+---
+
 ## 19. 待决事项
 
 ### 19.1 本次重构引入的待决事项
@@ -8713,7 +8900,7 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
 | 双击引导「等待落定」的具体时长 | **已定稿，从待决清单移出**：不写死时长，改为**按 SCM 的 `dwWaitHint` 自适应**——每轮查询把 `dwWaitHint` 夹在 100 ms – 2000 ms 之间作为下次间隔，兜底上限 30 秒，状态一旦不是等待类就立即结束（13.4.3）。理由是写死 8 秒在慢机器上会把「还在启动」误判成「启动失败」，白弹一次解决不了问题的 UAC 重装。判定用的错误码集合也已冻结（13.2.3）。「仍没起」时是否再多试一次 `reinstall` 仍待实测后定 |
 | `service status` 输出是否要机器可读格式 | **已定稿，从待决清单移出**：**V1 不做 `--json`，也不预留参数名**。机器可读通道是**命令退出码**（`0` 成功；未安装 `FMT-601` → `8`；查询失败 → `8`），人类可读通道是那几行文本（11.6、13.4.1）。需要结构化字段（如 `wait_hint_ms`）时再加 |
 | **`server.json` 的 `enabled` 仍由安装流程负责（缺口收窄，2026-10-09）** | **提交 `22c3c3e` 起**：代码默认 `host` 从 `127.0.0.1` 改成 **`localhost`**，线上 `config/server.json` 已 `enabled: true` 并真机验收（「HTTP 监听 localhost:4122」，接口全通；18.39）。**仍是缺口**：`ServerConfig::enabled` 代码默认仍是 `false`，而**全仓库没有任何代码把它置为 `true`**（`git grep 'enabled = true'` 在 `src/` 零命中；唯一一次是 `tests/config_test.cpp`），安装流程不碰 `config/server.json`，CLI 也没有命令能开 → **全新数据根**装完服务后不会监听，要手改配置。**可选做法（未定，等用户拍）**：① 让安装流程按 5.2 的原文把 `enabled` 置为 `true`；② 加一条 CLI 命令（如 `config http on` / `config set enabled true`）显式打开——**提交 `674d0b0` 起 `config list/set` 已实现**（但 `set` 只让改 `max_upload_size`），做法 ② 已经近在手边。见 5.2、12.1、12.2、18.37、18.39 |
-| **HTTP 开放哪几个接口（第 3 步待定）** | 第 1、2 步（认证 + share 路由 + 去掉桶）已在提交 `4b812b5` 落地并真机验收（18.39）：**`/api/ping` 与分享下载公开、其余都要 token**、`/api/bucket*` 故意返回 **404 + `FMT-017`**。**还没做**：**分享的流式下载端点**（`GET /api/share/<id>/download` 现在 501 + `FMT-602`，第 3 步）、`/api/config` 两条、`DELETE /api/trash`（清空）。见 12.3.2、18.39 |
+| **HTTP 第 3 步已完成，接口层面没有待决项** | 提交 `d3aeb3d` 落地了上传（流式）、下载、预览与**公开分享下载**（`GET /api/share/<id>/download`，先记账再放行）——12.3.2 那张表就是最终形态（18.40）。**仍未开**：`/api/config` 两条、`DELETE /api/trash`（清空）；CLI 仍没有 `preview` 子命令。见 12.3.2、18.40 |
 
 ### 19.2 上一次实现遗留的待决事项（仍然有效）
 
@@ -8754,7 +8941,9 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
 提交 `d5779db` 新增 `Service.分享的创建查看列出撤销与计数`（154），见 18.38；
 提交 `bfd89f7` / `4b812b5` 新增 3 条（**156**：`Server.管理接口要token且桶路由已下线`、
 `App.初始化数据根会建默认账号与token`、`App.已有空users文件时也要补建默认账号`；
-`Config.服务配置默认值` 的期望值改成 `localhost`），见 18.39）。
+`Config.服务配置默认值` 的期望值改成 `localhost`），见 18.39；
+提交 `d3aeb3d` 落地流式 upload / download / preview 与公开分享下载（**156 项不变**，
+流式断言加进既有 `Server.File路由与上传`），见 18.40）。
 **端到端夹具的隔离要求（提交 `ff237d5`，真事故）**：除 `FMT_PIPE` 外，每个子进程还必须设
 **`FMT_NO_SERVICE=1`**——无参数跑真 `fmt.exe` 会走**双击引导**，而引导会装/启动/重装
 **真实服务**，`FMT_PIPE` 管不到 SCM（详见下面的「测试隔离的硬教训」与 18.39）。
