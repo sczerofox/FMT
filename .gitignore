@@ -77,3 +77,7 @@ desktop.ini
 # ---- Logs & temp ----
 *.log
 *.tmp
+
+# 发布产物（fmt.exe 等）：不进版本库，随 Release 一起分发
+dist/
+cmake-build-release/
