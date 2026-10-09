@@ -1,10 +1,19 @@
 # ---- Build output ----
-cmake-build-*/
+# CMake 预设把产物写入 cmake-build-debug/，绝不提交。
 build/
+cmake-build-*/
 out/
 bin/
 lib/
 install/
+
+# ---- FMT 运行时数据目录 ----
+# fmt.exe 启动时在自身所在目录创建（即 cmake-build-debug/bin/），属于用户数据。
+/repository/
+/trash/
+/config/
+/data/
+/log/
 
 # CMake generated files
 CMakeCache.txt
@@ -28,6 +37,7 @@ compile_commands.json
 *.exe
 *.exe.*
 *.pdb
+*.idb
 *.ilk
 *.exp
 *.gch
@@ -50,6 +60,14 @@ compile_flags.txt
 *.swp
 *.swo
 *~
+
+# ---- 临时诊断文件 ----
+# 排查问题时用的独立驱动、日志与临时数据根，用完即删。
+.diag-*
+.asan-*
+.smoke-*
+.srv.out
+.srv.err
 
 # ---- OS ----
 .DS_Store

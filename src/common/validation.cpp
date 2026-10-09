@@ -1,0 +1,187 @@
+#include "fmt/common/validation.hpp"
+
+#include <cctype>
+#include <string>
+#include <vector>
+
+#include "fmt/common/string.hpp"
+
+namespace fmt {
+namespace {
+
+// Windows 文件名里不允许出现的字符（路径分隔符单独判断，好给出更准的错误码）。
+constexpr std::string_view kInvalidChars = "<>:\"|?*";
+
+bool is_ascii_alpha(char ch) {
+    const auto value = static_cast<unsigned char>(ch);
+    return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z');
+}
+
+// 控制字符与 DEL；UTF-8 多字节序列的字节都 >= 0x80，不受影响。
+bool has_control(std::string_view name) {
+    for (const char ch : name) {
+        const auto value = static_cast<unsigned char>(ch);
+        if (value < 0x20 || value == 0x7F) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_invalid_char(std::string_view name) {
+    for (const char ch : name) {
+        if (kInvalidChars.find(ch) != std::string_view::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool has_separator(std::string_view name) {
+    return name.find('/') != std::string_view::npos || name.find('\\') != std::string_view::npos;
+}
+
+std::string to_lower_ascii(std::string_view text) {
+    std::string result(text);
+    for (char& ch : result) {
+        if (is_ascii_alpha(ch)) {
+            ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        }
+    }
+    return result;
+}
+
+std::vector<std::string> reserved_names() {
+    std::vector<std::string> names{"con", "prn", "aux", "nul"};
+    for (int i = 1; i <= 9; ++i) {
+        names.push_back("com" + std::to_string(i));
+        names.push_back("lpt" + std::to_string(i));
+    }
+    return names;
+}
+
+// 名称以 '.' 或 ' ' 结尾在 Windows 上会被静默截断，直接拒绝，别让用户以为存住了。
+bool has_bad_tail(std::string_view name) {
+    return !name.empty() && (name.back() == '.' || name.back() == ' ');
+}
+
+}  // namespace
+
+bool is_windows_reserved_name(std::string_view name) {
+    const std::size_t dot = name.find('.');
+    const std::string stem = to_lower_ascii(dot == std::string_view::npos ? name : name.substr(0, dot));
+
+    static const std::vector<std::string> kReserved = reserved_names();
+    for (const std::string& reserved : kReserved) {
+        if (stem == reserved) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 名字是否与 file_id 同形：fmt-YYYYMMDD-N（前缀按 ASCII 折叠，因为 file_id 比对本身
+// 也不区分大小写）。这种名字会让「先查 id、再查名字」的定位产生歧义。
+bool looks_like_file_id(std::string_view name) {
+    // fmt-YYYYMMDD-N 最短是 14 个字符（4 + 8 + 1 + 1）。
+    // 前缀按 ASCII 折叠比较（file_id 的比对本身也不区分大小写）。
+    if (name.size() < 14) {
+        return false;
+    }
+    if (to_lower_ascii(name.substr(0, 4)) != "fmt-" || name[12] != '-') {
+        return false;
+    }
+    for (std::size_t i = 4; i < 12; ++i) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+    }
+    for (std::size_t i = 13; i < name.size(); ++i) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+Status validate_bucket_name(std::string_view name) {
+    if (name.empty()) {
+        return make_error(ErrorCode::BucketNameInvalid, "Bucket 名称不能为空");
+    }
+    if (name.size() > kMaxNameBytes) {
+        return make_error(ErrorCode::BucketNameInvalid,
+                          "Bucket 名称过长（上限 " + std::to_string(kMaxNameBytes) + " 字节）");
+    }
+    if (has_separator(name)) {
+        return make_error(ErrorCode::BucketNameInvalid, "Bucket 名称不能包含路径分隔符");
+    }
+    if (name == "." || name == "..") {
+        return make_error(ErrorCode::BucketNameInvalid, "Bucket 名称不能是 . 或 ..");
+    }
+    if (has_control(name)) {
+        return make_error(ErrorCode::BucketNameInvalid, "Bucket 名称不能包含控制字符");
+    }
+    if (has_invalid_char(name)) {
+        return make_error(ErrorCode::BucketNameInvalid,
+                          "Bucket 名称不能包含 < > : \" | ? * 这些字符");
+    }
+    // 同文件名：不可见字符不进名字（屏幕上看不出来，却会让按名查找对不上）
+    if (const std::vector<std::string> hidden = invisible_characters(name); !hidden.empty()) {
+        std::string list;
+        for (const std::string& item : hidden) {
+            list += (list.empty() ? "" : "、") + item;
+        }
+        return make_error(ErrorCode::BucketNameInvalid,
+                          "Bucket 名称里有不可见字符（" + list + "），请把名字重敲一遍");
+    }
+    if (is_windows_reserved_name(name)) {
+        return make_error(ErrorCode::BucketNameInvalid,
+                          "Bucket 名称不能是 Windows 保留设备名：" + std::string(name));
+    }
+    if (has_bad_tail(name)) {
+        return make_error(ErrorCode::BucketNameInvalid, "Bucket 名称不能以点或空格结尾");
+    }
+    return std::monostate{};
+}
+
+Status validate_file_name(std::string_view name) {
+    if (name.empty()) {
+        return make_error(ErrorCode::FileNameEmpty, "文件名不能为空");
+    }
+    if (name.size() > kMaxNameBytes) {
+        return make_error(ErrorCode::FileNameTooLong,
+                          "文件名过长（上限 " + std::to_string(kMaxNameBytes) + " 字节）");
+    }
+    if (has_separator(name) || name == "." || name == "..") {
+        return make_error(ErrorCode::FileNameSeparator, "文件名不能包含路径分隔符");
+    }
+    if (has_control(name) || has_invalid_char(name)) {
+        return make_error(ErrorCode::FileNameInvalidChar,
+                          "文件名不能包含 Windows 非法字符");
+    }
+    // 不可见字符（U+202A 左右方向嵌入等）绝不能进名字：屏幕上看不出来，
+    // 却会让按名字查找、排序、日志对不上，复制粘贴还会一路带着。
+    if (const std::vector<std::string> hidden = invisible_characters(name); !hidden.empty()) {
+        std::string list;
+        for (const std::string& item : hidden) {
+            list += (list.empty() ? "" : "、") + item;
+        }
+        return make_error(ErrorCode::FileNameInvalidChar,
+                          "文件名里有不可见字符（" + list + "），请把名字重敲一遍");
+    }
+    if (is_windows_reserved_name(name)) {
+        return make_error(ErrorCode::FileNameReserved,
+                          "文件名不能是 Windows 保留设备名：" + std::string(name));
+    }
+    if (looks_like_file_id(name)) {
+        return make_error(ErrorCode::FileNameLikeFileId,
+                          "文件名不能与文件标识同形（fmt-YYYYMMDD-N）：" + std::string(name) +
+                              "（会与 file_id 混淆，请换一个名字）");
+    }
+    if (has_bad_tail(name)) {
+        return make_error(ErrorCode::FileNameInvalidChar, "文件名不能以点或空格结尾");
+    }
+    return std::monostate{};
+}
+
+}  // namespace fmt

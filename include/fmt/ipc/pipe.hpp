@@ -1,0 +1,133 @@
+// 命名管道：服务端监听 + 客户端连接
+//
+// 管道名 \\.\pipe\fmt.control，消息模式、多实例、64 KB 缓冲（技术文档 §13.9.1）。
+//
+// 两个必须处理的 Windows 坑（§13.9.2）：
+//   1. 服务以 LocalSystem 运行，默认 DACL 只允许 SYSTEM / Administrators，
+//      普通用户连接会直接 ERROR_ACCESS_DENIED —— 必须用 SDDL 授权交互用户；
+//   2. 高完整性进程创建的对象带高完整性标签，中完整性 CLI 会被「禁止向上写」
+//      挡住 —— 必须在同一个 SDDL 里加 MIC 标签 S:(ML;;NW;;;ME)。
+//
+// 读写都用重叠 I/O，因为 ConnectNamedPipe / ReadFile 必须能超时返回：
+// 服务停止时不能有线程无限期挂在读上。
+#pragma once
+
+#include <windows.h>
+
+#include <string>
+
+#include "fmt/common/error.hpp"
+#include "fmt/ipc/protocol.hpp"
+
+namespace fmt::ipc {
+
+inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\fmt.control";
+
+// 实际使用的管道名：默认 kPipeName；环境变量 `FMT_PIPE` 非空时用它。
+//
+// 为什么留这个口子：端到端冒烟测试要在**同一台机器上**再起一个进程内服务，而真服务
+// 正常运行时正占着默认管道名——测试若不换名字，要么起不来，要么更糟：把命令打到
+// 用户的真服务上、动到真数据。测试进程设好 `FMT_PIPE`，它自己起的服务与它拉起的
+// `fmt.exe` 子进程都用同一个名字，于是与真服务完全隔离。
+//
+// 真服务由 SCM 启动，不会带这个变量，所以线上仍是默认名字。
+std::wstring pipe_name();
+
+// 读一个请求的结果。服务端必须能区分这三种情况：
+//   客户端只是还没发命令（Timeout）  -> 继续等，不能断开
+//   客户端真的走了（Closed）        -> 结束这条连接
+//   其余（Failed）                  -> 记日志后断开
+enum class ReadStatus { Ok, Timeout, Closed, Failed };
+
+struct RequestOutcome {
+    ReadStatus status = ReadStatus::Failed;
+    Request request;
+    Error error;
+};
+
+// 服务端的一条连接。accept() 会创建一个新实例并阻塞到有客户端连上或超时。
+class PipeConnection {
+public:
+    PipeConnection() = default;
+    ~PipeConnection();
+
+    PipeConnection(PipeConnection&& other) noexcept;
+    PipeConnection& operator=(PipeConnection&& other) noexcept;
+    PipeConnection(const PipeConnection&) = delete;
+    PipeConnection& operator=(const PipeConnection&) = delete;
+
+    // 建实例 + 等连接。超时返回 FMT-602。
+    // pipe_name 默认是真实管道名；测试传独立名字，免得跟正在运行的服务抢同一个实例。
+    static Result<PipeConnection> accept(int timeout_ms, const wchar_t* pipe_name = kPipeName);
+
+    // 读一个完整请求。超时不算错误（ReadStatus::Timeout），调用方继续等即可。
+    RequestOutcome read_request(int timeout_ms);
+
+    // 写一个响应。
+    Status write_response(const Response& response, int timeout_ms);
+
+    bool valid() const { return handle_ != INVALID_HANDLE_VALUE; }
+    HANDLE native_handle() const { return handle_; }
+
+private:
+    void reset();
+
+    struct Chunk {
+        ReadStatus status = ReadStatus::Failed;
+        std::string data;
+        Error error;
+    };
+
+    Chunk read_some(int timeout_ms);
+    Status write_all(std::string_view data, int timeout_ms);
+
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+    HANDLE event_ = nullptr;
+    std::string buffer_;
+};
+
+// 客户端。只连一次，之后可以复用这条连接发多条命令。
+class PipeClient {
+public:
+    PipeClient() = default;
+    ~PipeClient();
+
+    PipeClient(PipeClient&& other) noexcept;
+    PipeClient& operator=(PipeClient&& other) noexcept;
+    PipeClient(const PipeClient&) = delete;
+    PipeClient& operator=(const PipeClient&) = delete;
+
+    // 连接失败分类（§13.9.4）：
+    //   管道不存在   -> FMT-601 服务未安装 / 未运行
+    //   实例被占满   -> WaitNamedPipeW 重试一次
+    //   权限被拒     -> FMT-004（DACL 或 MIC 不对）
+    static Result<PipeClient> connect(int timeout_ms, const wchar_t* pipe_name = kPipeName);
+
+    // 在「管道还不存在」时重试到 total_timeout_ms。
+    // 场景：service start 刚返回，服务进程还在初始化、监听还没起来，
+    // 这时候一次失败就报 FMT-601 会误伤「刚启动完就敲命令」。
+    // 权限类错误不重试（重试也不会变好）。
+    static Result<PipeClient> connect_waiting(int total_timeout_ms,
+                                              const wchar_t* pipe_name = kPipeName);
+
+    // 发一帧请求。
+    Status send(const Request& request, int timeout_ms);
+
+    // 收一帧响应，并校验 id 与请求一致。
+    Result<Response> receive(int expected_id, int timeout_ms);
+
+    // send + receive。
+    Result<Response> call(const Request& request, int timeout_ms);
+
+    bool valid() const { return handle_ != INVALID_HANDLE_VALUE; }
+
+private:
+    Result<std::string> read_some(int timeout_ms);
+    Status write_all(std::string_view data, int timeout_ms);
+
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+    HANDLE event_ = nullptr;
+    std::string buffer_;
+};
+
+}  // namespace fmt::ipc

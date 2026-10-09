@@ -1,0 +1,135 @@
+// cli 的单元测试：命令行切分、提权辅助函数
+#include "fmt/cli/cli.hpp"
+
+#include <string>
+#include <vector>
+
+#include "fmt/common/string.hpp"
+#include "fmt/core/path.hpp"
+#include "fmt_test.hpp"
+
+FMT_TEST(Cli, 版本文本只有一个来源) {
+    // 横幅、`--version`、`version` 命令都调 version_text()：分开写就会漂移
+    //（以前窗口里敲 version 是「未知命令」，而 --version 能用）。
+    const std::string text = fmt::cli::version_text();
+    FMT_CHECK(text.find("File Manager Tool") != std::string::npos);
+    FMT_CHECK(text.find("v1.0") != std::string::npos);
+    FMT_CHECK(text.find("build") != std::string::npos);
+    // 构建日期由 CMake 在配置时生成，所以只断言长度，不钉具体日期
+    FMT_CHECK(text.size() > 30);
+}
+
+FMT_TEST(Cli, 位置参数的信封形状) {
+    const nlohmann::json positional = nlohmann::json::array({"a7.jpg"});
+
+    // 旧写法（把开关直接挂到位置参数数组上）会抛 type_error.305；
+    // 未捕获就是用户看到的「Debug Error! abort() has been called」弹窗。
+    nlohmann::json broken = positional;
+    bool threw = false;
+    try {
+        broken["dry_run"] = true;
+    } catch (const nlohmann::json::exception&) {
+        threw = true;
+    }
+    FMT_CHECK(threw);
+
+    // 新写法：位置参数在 argv，开关与它**同级**
+    const nlohmann::json check = fmt::cli::argument_envelope(positional, /*dry_run=*/true);
+    FMT_CHECK(check.is_object());
+    FMT_CHECK(check.contains("argv"));
+    FMT_CHECK_EQ(check["argv"][0].get<std::string>(), std::string("a7.jpg"));
+    FMT_CHECK(check.value("dry_run", false));
+    FMT_CHECK(!check.contains("force"));
+
+    const nlohmann::json real =
+        fmt::cli::argument_envelope(positional, /*dry_run=*/false, /*force=*/true);
+    FMT_CHECK(real.contains("argv"));
+    FMT_CHECK(real.value("force", false));
+    FMT_CHECK(!real.contains("dry_run"));
+
+    // 没有位置参数的命令（file list）也要拿到合法对象
+    const nlohmann::json empty = fmt::cli::argument_envelope(nlohmann::json::array(), false, true);
+    FMT_CHECK(empty.is_object());
+    FMT_CHECK(!empty.contains("argv"));
+    FMT_CHECK(empty.value("force", false));
+}
+
+FMT_TEST(Cli, 数据根切换提示要把两个根都说清楚) {
+    // 这句提示是用户唯一能看到的信号（数据根由 CLI 声明，换个目录的 fmt.exe
+    // 一连上就会把服务的数据根搬走）。所以两个根、原因、怎么切回去都得在。
+    const std::string notice = fmt::cli::root_switch_notice("D:/old", "D:/new");
+    FMT_CHECK(notice.find("D:/old") != std::string::npos);
+    FMT_CHECK(notice.find("D:/new") != std::string::npos);
+    FMT_CHECK(notice.find("数据根") != std::string::npos);
+    FMT_CHECK(notice.find("切回去") != std::string::npos);
+    // 空的前一个根（服务首次启动）也不能打出「原来：」后面空着没说明
+    const std::string first = fmt::cli::root_switch_notice("", "D:/new");
+    FMT_CHECK(first.find("D:/new") != std::string::npos);
+}
+
+FMT_TEST(Cli, service子命令集合) {
+    // 这个集合决定「敲了什么会被当成什么」：在里面 → 走提权执行那条路；
+    // 不在里面 → 交互窗口报用法错误、一次性命令退回 FMT-001。
+    FMT_CHECK(fmt::cli::is_user_service_command("install"));
+    FMT_CHECK(fmt::cli::is_user_service_command("uninstall"));
+    FMT_CHECK(fmt::cli::is_user_service_command("start"));
+    FMT_CHECK(fmt::cli::is_user_service_command("stop"));
+    // reinstall：一次 UAC 换宿主 exe（卸载 + 按当前 exe 重装并启动）
+    FMT_CHECK(fmt::cli::is_user_service_command("reinstall"));
+    // status 不提权，所以不在这个集合里（它走 show_service_status()）
+    FMT_CHECK(!fmt::cli::is_user_service_command("status"));
+    FMT_CHECK(!fmt::cli::is_user_service_command(""));
+    FMT_CHECK(!fmt::cli::is_user_service_command("Install"));  // 大小写敏感
+    FMT_CHECK(!fmt::cli::is_user_service_command("nonsense"));
+}
+
+FMT_TEST(Cli, 命令切分) {
+    const std::vector<std::string> simple = fmt::cli::split_command("service stop");
+    FMT_CHECK_EQ(simple.size(), std::size_t{2});
+    FMT_CHECK_EQ(simple[0], std::string("service"));
+    FMT_CHECK_EQ(simple[1], std::string("stop"));
+
+    const std::vector<std::string> spaced = fmt::cli::split_command("   file    list   ");
+    FMT_CHECK_EQ(spaced.size(), std::size_t{2});
+    FMT_CHECK_EQ(spaced[0], std::string("file"));
+    FMT_CHECK_EQ(spaced[1], std::string("list"));
+
+    const std::vector<std::string> empty = fmt::cli::split_command("    ");
+    FMT_CHECK(empty.empty());
+
+    // 带空格的参数用引号包起来
+    const std::vector<std::string> quoted =
+        fmt::cli::split_command("file upload \"D:\\my files\\a b.txt\"");
+    FMT_CHECK_EQ(quoted.size(), std::size_t{3});
+    FMT_CHECK_EQ(quoted[2], std::string("D:\\my files\\a b.txt"));
+
+    // 中文参数
+    const std::vector<std::string> chinese = fmt::cli::split_command("bucket create 工作");
+    FMT_CHECK_EQ(chinese.size(), std::size_t{3});
+    FMT_CHECK_EQ(chinese[2], std::string("工作"));
+}
+
+FMT_TEST(Cli, 管道输入带BOM也能识别) {
+    // 重定向/管道进来的第一行常见带上 UTF-8 BOM
+    const std::vector<std::string> with_bom = fmt::cli::split_command("\xEF\xBB\xBF" "exit");
+    FMT_CHECK_EQ(with_bom.size(), std::size_t{1});
+    FMT_CHECK_EQ(with_bom[0], std::string("exit"));
+}
+
+FMT_TEST(Cli, 提权结果文件放在数据根的temp下) {
+    const std::string path = fmt::cli::result_file_for(4242);
+    FMT_CHECK(path.find("fmt-elev-4242.json") != std::string::npos);
+    FMT_CHECK(path.find("temp") != std::string::npos);
+
+    // 就在本进程 exe 所在目录的 temp/ 里：临时文件跟着 exe 走
+    const std::string root = fmt::to_forward_slashes(fmt::path_to_utf8(fmt::executable_directory()));
+    const std::string normalized = fmt::to_forward_slashes(path);
+    FMT_CHECK(fmt::starts_with(normalized, root));
+    FMT_CHECK(normalized.find("/temp/fmt-elev-") != std::string::npos);
+}
+
+FMT_TEST(Cli, 提权判断不崩溃) {
+    // 测试进程通常未提权；即使提权了，也只要求它能正常回答。
+    const bool elevated = fmt::cli::is_elevated();
+    FMT_CHECK(elevated == true || elevated == false);
+}
