@@ -71,7 +71,7 @@ V1 用 **JSON + 文件系统**满足需求，不使用数据库、Redis、MQ、�
 
 ## 2. 关键设计决策
 
-V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～39** 项是
+V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～40** 项是
 `arch-restart` 分支新增的**重构冻结项**，逐条对应 `FMT 重构设计.md` 第 2 节的决策索引：
 
 | # | 规则 |
@@ -97,7 +97,7 @@ V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 �
 | 19 | CLI 单实例：命名互斥体 `Local\FMT.CLI.v1`，已有窗口则激活、不新建——因此**同时只有一个 CLI 窗口，也就只有一个数据根** |
 | 20 | **数据根由 CLI 声明**：CLI 用 hello 帧上报自身 exe 所在目录，服务维护「当前数据根」，切换**不删**旧根数据；响应用 `switched` / `previous_root` 回执本次是否发生切换（第 3.1 节） |
 | 21 | 初始化规则**两边共用同一套幂等实现**（`ensure_root` / `check_root`）：六个目录（`repository/`、`trash/`、`config/`、`data/`、`log/`、`temp/`）+ 默认 JSON，`.tmp` 原子替换，**只补缺失、已存在不改、不删、不覆盖**；服务在启动/换根时执行，CLI 在双击时对自己的数据根执行 |
-| 22 | 双入口直连服务：CLI 走命名管道 `\\.\pipe\fmt.control`（**提交 `a340d1e` 起可被环境变量 `FMT_PIPE` 覆盖**——只为端到端测试隔离，线上默认名不变，见 `FMT 技术文档.md` 第 13.9.1 节），浏览器走 `127.0.0.1:4122`（cpp-httplib），两者进同一个 service 层 |
+| 22 | 双入口直连服务：CLI 走命名管道 `\\.\pipe\fmt.control`（**提交 `a340d1e` 起可被环境变量 `FMT_PIPE` 覆盖**——只为端到端测试隔离，线上默认名不变，见 `FMT 技术文档.md` 第 13.9.1 节），浏览器走 `localhost:4122`（cpp-httplib），两者进同一个 service 层 |
 | 23 | `service` 命令有 `install` / `uninstall` / `start` / `stop` / **`reinstall`** / `status` **六条**（`reinstall` 提交 `c573f14` 起正式化），**无 `pause`、无 `delete`**（`delete` 更名为 `uninstall`），命令**不带 `--` 前缀**；其中 `status` 是**只读查询**，见第 24 项 |
 | 24 | **四条动作命令**（`install` / `uninstall` / `start` / `stop`）都走 UAC 提权，不做「目标状态已满足就免提权」的优化；`status` **不提权、不弹 UAC**，它是查询命令 |
 | 25 | 服务自身状态写 `%ProgramData%\FMT\service.json`（当前数据根 + 安装信息），**不属于业务数据** |
@@ -123,6 +123,8 @@ V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 �
 
 | 38 | **零碎三项：`trash empty` / `file list --sort` / `config list`·`set`（提交 `674d0b0`）**：`trash empty` 一次清空两级（dry_run 预检回 `{files,buckets,bytes,needs_confirm,blocked:false,message}`、缺 `force` → `FMT-016`、**空站不打扰**；实现上**每删一项重新 list**、**先文件级后桶级**、单条失败跳过 + `kMaxRounds` 兜底；**没加 HTTP 路由**）；`file list --sort name\|size\|id`（默认 name 不区分大小写、size 大的在前、id 是入库顺序，**乱写 → `FMT-001`**，响应回显 `sort`，`--sort` 是本地开关）；`config list` / `config set max_upload_size <大小>`（**只让改这一项**，其余只读 → `FMT-001`；1KB=1024 字节、下限 1KB、上限 100GB；落盘失败**回滚内存值**）。另：**`FMT-203 BucketInUse` 写成「保留（V1 未使用）」**——没有代码会产生它 | 
 | 39 | **share 数据面（提交 `d5779db`）**：`src/share/` 真实落地，`share create/get/list/delete` 可用；`share_id` = **12 位随机十六进制**（`BCryptGenRandom`，撞号重摇、生成失败当错误返回）；默认 **20 次 + 7 天**（两条件**相互独立**）；`share get` **如实报状态**（未知 id 才是 `FMT-500`；已过期 / 次数用尽 / 已撤销 / 关联文件在回收站都是成功 + `state`/`available`/`message`）；检查顺序按开发文档 §49（**过期在次数之前**，§50 图的顺序以 §49 为准）；`expire_time` 解析失败按已过期；文件进回收站 → share 立刻不可用 + 阻断 create（`FMT-503`）；新增 **`share.download`** op，`register_download()` 在**业务锁内**一次完成检查+计数+落盘，**写不进去就拒绝**。**HTTP 路由一个都没加**（用户决定，等定开放哪几个）。**原口径「share 未实现、返回 `FMT-602`」已作废**——`FMT-602` 现在只对应 `server.*` 与未实现的 HTTP 路由 |
+
+| 40 | **HTTP 接口第 1、2 步 + 账号/令牌（提交 `bfd89f7` / `4b812b5` / `ff237d5` / `22c3c3e`）**：① HTTP **已开启**，监听 **`localhost:4122`**（`ServerConfig::host` 代码默认值从 `127.0.0.1` 改成 `localhost`；线上 `server.json` 为 `enabled: true`）；**仍是缺口**：安装流程不会自动打开 `enabled`，新数据根要手改配置。② **所有 `/api/*` 都要 token**，唯一例外是 `/api/ping` 与 `/api/share/<id>/download`（分享链接本身就是凭证）；缺 / 错 → **401 + `FMT-018 Unauthorized`**；认证**只在一处**（httplib pre-routing 钩子，「漏给某条路由加认证」是这类代码最典型的事故），且**没有校验器时一律 401**（fail-closed）；请求头收 `X-FMT-Token` 与 `Authorization: Bearer`，比较常量时间；token 从 `config list` 拿。③ **桶的 HTTP 接口已全部删除**（用户明确「桶不要」）：`/api/bucket*` → **404 + `FMT-017`**（故意不要，不是 501），「已知模块」列表里**没有 bucket**。④ 分享路由四条已落地（都要 token），`GET /api/share/<id>/download` 公开但**流式下载第 3 步才做**（现在 501 + `FMT-602`）。⑤ `data/user.json` 定稿（**没有 `buckets` 字段**，桶以磁盘为准；密码只存 PBKDF2-SHA256 哈希；token 永久有效；默认账号在数据根初始化时创建，老的空 `users` 也会补建、已存在不覆盖）。⑥ **测试隔离教训**：`FMT_PIPE` 管不到 SCM，新增 **`FMT_NO_SERVICE=1`** 让引导完全不碰服务管理（提交 `ff237d5`，出过一次真事故：测试把真服务注册指向临时目录） |
 
 系统明确**禁止自动**执行：覆盖文件、修改用户文件名、选择其他 Bucket、创建恢复目标
 Bucket、绕过下载限制、删除文件、清空损坏 JSON、**删除旧数据根的数据**、**把服务宿主的
@@ -211,9 +213,10 @@ CLI 启动
 │                                                （trashed / original / deleted_at）
 ├── config/
 │   ├── config.json       version、current_user、current_bucket、max_upload_size、size_unit、language
-│   └── server.json       version、enabled、host、port（默认 127.0.0.1:4122）
+│   └── server.json       version、enabled、host、port（默认 localhost:4122）
 ├── data/
-│   ├── user.json         {"version":1,"users":[]}
+│   ├── user.json         {"version":1,"users":[…]}（**提交 `bfd89f7` 定稿**：账号 + 密码哈希 +
+│   │                      token + current_bucket；**没有 buckets 字段**，桶以磁盘为准）
 │   ├── file.json         {"version":1,"files":[]} 文件元数据（含 is_trash / trash_reason）
 │   ├── share.json        {"version":1,"shares":[]} 分享记录
 │   └── trash.json        {"version":1,"trash":[]} 回收站管理信息——**只服务文件级条目**
@@ -379,7 +382,7 @@ wmain
   │ 服务控制管理器  │
   └────────────────┘
 
-  浏览器 ── HTTP 127.0.0.1:4122（cpp-httplib，进程内线程）──→ Service 形态的 server 模块
+  浏览器 ── HTTP localhost:4122（cpp-httplib，进程内线程）──→ Service 形态的 server 模块
 ```
 
 三条路径互相独立，不能混用：
@@ -387,7 +390,7 @@ wmain
 | 路径 | 谁走 | 通道 | 为什么不能混 |
 |---|---|---|---|
 | 业务命令 | CLI → 服务 | 命名管道 | HTTP 可关闭、端口可被占，CLI 不应随之失效 |
-| 业务命令 | 浏览器 → 服务 | HTTP `127.0.0.1:4122` | 浏览器只会 HTTP |
+| 业务命令 | 浏览器 → 服务 | HTTP `localhost:4122` | 浏览器只会 HTTP |
 | 服务生命周期 | CLI → SCM | **直连 SCM + UAC 提权** | 服务尚未安装时走任何进程间通道都是死锁 |
 | 提权结果回传 | 提权副本 → CLI 父进程 | **结果文件** `<数据根>\temp\fmt-elev-<父进程 pid>.json`（数据根不可写时退回 `%TEMP%`） | 提权副本是高完整性进程，它创建的命名管道会被 MIC「禁止向上写」挡住（4.5 节） |
 
@@ -434,11 +437,11 @@ wmain
 ### 4.4 浏览器 ↔ 服务：HTTP
 
 ```text
-http://127.0.0.1:4122        cpp-httplib，编译进 fmt.exe，只在 Service 形态里监听
+http://localhost:4122        cpp-httplib，编译进 fmt.exe，只在 Service 形态里监听
 ```
 
 - 开关与地址由**数据根**下的 `config/server.json` 控制（`enabled`、`host`、`port`，默认
-  `127.0.0.1:4122`），默认只绑本机回环，不监听外部网卡。
+  `localhost:4122`），默认只绑本机回环，不监听外部网卡。
 - HTTP 请求作用于**当前数据根**。
 - 浏览器入口与 CLI 入口**进入同一个 service 层**（第 1 节分层图），业务行为天然一致，不存在
   第二套文件处理逻辑。
@@ -1743,7 +1746,7 @@ before a bucket goes」；
 | 3 服务与通道（`service` / `ipc` / `cli`） | ✅ 完成 |
 | 4 Bucket（create / list / get / use / delete + `current_bucket` + 名称校验 + 两条入口 + **桶级回收站四条命令** + 删桶前预检） | ✅ 完成（明细见 `FMT 技术文档.md` 第 18.15、18.17、18.25 节） |
 | 5 File / Upload / Trash（**两级**条目）/ Share | 🟡 **`file` / `trash` / `share` 数据面 / `config list·set` 都完成；只剩 share 的 HTTP 下载端点**：`file upload/list/get/delete`（+ **提交 `674d0b0` 的 `--sort name|size|id`**）；**文件级与桶级回收站合成一份视图**（`src/trash/` 的 `TrashService`，提交 `0fc242b`），`trash list/get/restore/delete` 两级都能用、`list` 标出 `[文件]` / `[桶]`，**`trash empty` 一次清空两级**（`674d0b0`）；**破坏性操作走「先检查 → 说清楚 → 再确认」**（提交 `711da4c`：只读预检 + `FMT-016` + y/N 或 `--yes`）；**`share` 数据面**（`d5779db`：`create/get/list/delete` + 20 次 / 7 天 + `share.download` 记账）；**`config list` / `config set max_upload_size`**（`674d0b0`）。明细见 `FMT 技术文档.md` 第 18.19～18.38 节。**剩下的**：share 的 HTTP 下载端点（**等用户决定开放哪几个接口**）与永久删除时的 `share.json` 清理 |
-| 6 HTTP Server + Preview | ⏳ 未开始（阶段 4 已落地 `/api/bucket` 五条 + `/api/trash` 四条路由，阶段 5 又补 `/api/file` 四条；`/api/trash` 与 `/api/file` 的 `DELETE` 现在共用 `delete_args()` 解析 `?dry_run=1` / `?force=1`；下载/预览路由与浏览器页面未开始） |
+| 6 HTTP Server + Preview | 🟡 **HTTP 接口第 1、2 步已完成**（提交 `bfd89f7` / `4b812b5` / `22c3c3e`）：**监听 `localhost:4122`、`enabled: true`**、**全部 `/api/*` 要 token**（401 + `FMT-018`，`/api/ping` 与分享下载除外）、`/api/file` 四条、`/api/trash` 四条、**`/api/share` 四条**；**`/api/bucket*` 已删除**（404 + `FMT-017`）。**还没做**：**分享的流式下载端点**（第 3 步，现在 501 + `FMT-602`）、下载/预览路由与浏览器页面 |
 | 7 收尾（永久删除时的 share 清理 + 真机实测） | ⏳ 未开始（**当前只剩一个缺口**：删桶 / 永久删除时**没有**联动清理 `share.json` 记录。原缺口「文件级 trash 只写不读」**已在 `0fc242b` 关闭**；**share 数据面已在 `d5779db` 落地**，只剩它的 HTTP 下载端点等用户定接口） |
 
 当前代码里**已经存在**的部分（阶段 2～5）：
@@ -1757,7 +1760,7 @@ before a bucket goes」；
 | `ipc`：命名管道帧、安全描述符 + MIC、`hello` 的 `switched` / `previous_root`、**`pipe_name()`（`FMT_PIPE` 覆盖，提交 `a340d1e`）** | `src/ipc/` |
 | `service`：SCM **六条子命令**（`reinstall` 提交 `c573f14` 起正式化）、`ServiceMain`、统一查询接口、按 `dwWaitHint` 落定、`Runtime`（锁 + 业务分发 + **启动/换根时校验 `current_bucket`**，失效置空） | `src/service/` |
 | `cli`：交互循环、横幅、`help`、单实例、UAC 提权引导、双击体检与补齐 | `src/cli/` |
-| `server`：cpp-httplib 监听、`/api/ping` / `/api/status`、`/api/bucket` 五条路由、`/api/trash` 四条路由、`/api/file` 四条路由、`delete_args()`（`?dry_run=1` / `?force=1` / 请求体 `{"force":true}`，`/api/trash` 与 `/api/file` 的 `DELETE` 共用）、错误码 → 状态码映射 | `src/server/` |
+| `server`：cpp-httplib 监听 **`localhost:4122`**、`/api/ping` / `/api/status`、`/api/file` 四条、`/api/trash` 四条、`/api/share` 四条（提交 `4b812b5`）、**token 认证（pre-routing 钩子，401 + `FMT-018`）**、`/api/bucket*` **已删除**（404 + `FMT-017`）、路由、`/api/file` 四条路由、`delete_args()`（`?dry_run=1` / `?force=1` / 请求体 `{"force":true}`，`/api/trash` 与 `/api/file` 的 `DELETE` 共用）、错误码 → 状态码映射 | `src/server/` |
 | `bucket`：`BucketService`（无独立 ID；桶级 `list_trashed` / `restore` / `get_trashed` / `purge` / **`check_remove`**） + 业务分发 `bucket.*` | `src/bucket/`、`src/service/commands.cpp` |
 | `file`（**提交 `188e85d`**）：`FileService`（`commit_upload` / `list` / `get_by_id` / `get_by_name` / `remove` / `resolve_path` / `trash_path_of`）+ 自由函数 `prepare_upload()` / `file_name_from_source()` / `extension_of()`；业务分发 `file.list` / `file.get` / `file.delete`。**提交 `0ad9efc`**：签名改为 `remove(std::string_view file_id_or_name)`，私有新增 `locate_record(records, key)`。**提交 `9c3d2cb`**：`locate_record()` 命中不同记录时报 `FMT-001` 歧义；`file.get` 增加 `trash_path`。**提交 `711da4c`**：新增 `check_remove()`（`FileDeleteCheck`）与 `bucket` 消息归属。**提交 `0fc242b`**：新增 `list_trashed()` / `check_restore()` / `restore()` / `purge()` 与 `deleted_at` 字段，**不再写 `trash.json`** | `src/file/`、`src/service/commands.cpp`、`src/service/runtime.cpp` |
 | **`trash`（提交 `0fc242b`）**：`TrashService`（`include/fmt/trash/trash.hpp` / `src/trash/trash.cpp`）**组合** `FileService` 与 `BucketService`，合并两级视图 + 跨命名空间标识解析 + 两级预检（`TrashCheck`）；**提交 `674d0b0`** 再加 `trash.empty`（`empty()`：每删一项重新 list、先文件级后桶级、单条失败跳过 + `kMaxRounds`） | `src/trash/`、`src/service/commands.cpp` |
@@ -1765,7 +1768,7 @@ before a bucket goes」；
 | `common/hash`（**提交 `188e85d`**）：`Md5`（Windows CNG / bcrypt 增量接口）+ `md5_hex()`；`bcrypt.lib` 在 `src/common/CMakeLists.txt` 链接 | `include/fmt/common/hash.hpp`、`src/common/hash.cpp` |
 | `core`：`PathManager`（`trash_file` 落点 `trash/<user>/.files/<bucket>/YYYY/MM/DD/`，提交 `4fee290`） | `src/core/` |
 | `common/http_client`（**提交 `a2b6cd1`**）：`is_remote_url()` + `http_download()`——WinHTTP + Schannel 的流式 GET（跟随重定向、连接/发送/接收超时、`Accept-Encoding: identity`、只有 2xx 交给 sink、sink 返回 false 即中止、证书失败给准提示）；`src/common/CMakeLists.txt` 链 `winhttp`，`src/file/CMakeLists.txt` 不再链 cpp-httplib | `include/fmt/common/http_client.hpp`、`src/common/http_client.cpp` |
-| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**154 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`），提交 `2c841c8` 增到 143（`Cli.位置参数的信封形状`），提交 `5b316b3` 增到 144（`Storage.两个写者同时写同一个文件不会互相踩`，并把 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」），提交 `d108c80` 增到 145（`Cli.版本文本只有一个来源`），提交 `bb7a40f` 增到 146（`Cli.数据根切换提示要把两个根都说清楚`——**控制台输出第一次有测试覆盖**），提交 `c573f14` 增到 147（`Cli.service子命令集合`——**命令集合第一次有断言**），提交 `a340d1e` 增到 150（`CliE2e.核心链路走真实exe与真实管道` / `CliE2e.交互式确认答n不删答y才删` / `Ipc.管道名可被FMT_PIPE覆盖`——**第一次让真实 exe 走真实管道**），提交 `821aba3` 增到 152（`Logger.超过上限会轮转出一代` / `Logger.上限为零时不轮转`），提交 `674d0b0` 增到 153（`Service.列表排序配置与清空回收站`），提交 `d5779db` 增到 154（`Service.分享的创建查看列出撤销与计数`）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
+| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**156 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`），提交 `2c841c8` 增到 143（`Cli.位置参数的信封形状`），提交 `5b316b3` 增到 144（`Storage.两个写者同时写同一个文件不会互相踩`，并把 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」），提交 `d108c80` 增到 145（`Cli.版本文本只有一个来源`），提交 `bb7a40f` 增到 146（`Cli.数据根切换提示要把两个根都说清楚`——**控制台输出第一次有测试覆盖**），提交 `c573f14` 增到 147（`Cli.service子命令集合`——**命令集合第一次有断言**），提交 `a340d1e` 增到 150（`CliE2e.核心链路走真实exe与真实管道` / `CliE2e.交互式确认答n不删答y才删` / `Ipc.管道名可被FMT_PIPE覆盖`——**第一次让真实 exe 走真实管道**），提交 `821aba3` 增到 152（`Logger.超过上限会轮转出一代` / `Logger.上限为零时不轮转`），提交 `674d0b0` 增到 153（`Service.列表排序配置与清空回收站`），提交 `d5779db` 增到 154（`Service.分享的创建查看列出撤销与计数`），提交 `bfd89f7` / `4b812b5` 增到 156（`Server.管理接口要token且桶路由已下线` / `App.初始化数据根会建默认账号与token` / `App.已有空users文件时也要补建默认账号`）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
 | vendored 第三方库 | `third_party/nlohmann/json.hpp`、`third_party/cpp-httplib/httplib.h`（**只服务 HTTP 服务端**；URL 下载走系统 `winhttp`） |
 | 版本号的单一来源（CMake 生成头） | `cmake/version.hpp.in` |
 | 构建辅助脚本 | `tools/build.ps1` |
@@ -1860,7 +1863,7 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 | `service status` 是否要机器可读输出 | **已定稿，从待决清单移出**：**V1 不做 `--json`、也不预留参数名**。机器可读通道是**命令退出码**（`0` 成功 / 未安装 `FMT-601` → `8`），人类可读通道是固定顺序的那几行文本（第 4.5、7.5 节）；需要结构化输出时再加 |
 
 > **已冻结、不再是待解决问题**：Service 与 CLI 的通信方式（CLI 走命名管道
-> `\\.\pipe\fmt.control`，第 4.3 节；浏览器走 HTTP `127.0.0.1:4122`，第 4.4 节）、
+> `\\.\pipe\fmt.control`，第 4.3 节；浏览器走 HTTP `localhost:4122`，第 4.4 节）、
 > 提权副本的结果通道（**`<数据根>\temp\` 下的结果文件**，第 4.5 节；命名管道方案作废）、
 > 控制台编码（UTF-8：`SetConsoleOutputCP(CP_UTF8)` + `SetConsoleCP(CP_UTF8)`，第 7.5 节）、
 > `service` 六条子命令与提权语义（第 4.5 节；除 `status` 外都提权）、服务注册参数与恢复策略
@@ -1888,22 +1891,29 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
   500 等于告诉调用方「服务器坏了」（实测 `GET /api/nosuch` 就是这样）。
   `FMT-602` 的映射也从「落 `default: 500`」改成**显式 501**
   （`FMT 技术文档.md` 第 12.3、12.5、18.31 节）。
-- **⚠ 待决缺口（真机实测，2026-10-09，未修）：`server.json` 的 `enabled` 没人打开。**
-  `ServerConfig::enabled` 默认 `false`，而 `src/` 里**没有任何代码**把它置为 `true`
-  （安装流程不碰 `config/server.json`，CLI 也没有命令能开），所以服务装好、在跑，
-  `127.0.0.1:4122` **根本不监听**——浏览器入口打不开（CLI 不受影响，它走管道）。
-  手动改成 `true` 并重启服务后 HTTP 入口**完全正常**，问题只在「没人开这个开关」。
+- **HTTP 已开启（提交 `22c3c3e`，真机验收 2026-10-09 21:29）**：代码默认 `host` 从
+  `127.0.0.1` 改成 **`localhost`**，线上 `config/server.json` 为 `enabled: true`，
+  日志「HTTP 监听 localhost:4122」，接口全部可用。**认证**：所有 `/api/*` 都要 token
+  （401 + `FMT-018`），例外是 `/api/ping` 与分享下载；**桶的接口已整体删除**
+  （`/api/bucket*` → 404 + `FMT-017`）。
+  **仍是缺口**：`ServerConfig::enabled` 代码默认仍是 `false`，而 `src/` 里
+  **没有任何代码**把它置为 `true`（安装流程不碰 `config/server.json`，CLI 也没有命令能开），
+  所以**全新数据根**装完服务后 `localhost:4122` 不会监听。
   **待用户决策**：① 安装流程按文档置 `true`，还是 ② 加一条 CLI 命令（如 `config http on`）。
-  **在定下来之前不要写成已实现**（第 4.4 节、`FMT 技术文档.md` 第 5.2、12.1、19.1 节）。
+  （第 4.4 节、`FMT 技术文档.md` 第 5.2、12.1、12.2、18.39、19.1 节）。
 
 - **Bucket 级 Trash 元数据结构**：**权威是 `trash/<user>/.original`**，形状
   `{"version":1,"buckets":[{"trashed","original","deleted_at"}]}`；回收站目录名一律带删除
   时间戳（同秒冲突加 `_2`）；**`data/trash.json` 不再记桶级条目**（旧的 `type:"bucket"` 作废），
   **提交 `0fc242b` 起也不再记文件级条目**——文件级权威是 `file.json`（第 5.4 节），
   `trash.json` 只做只读兼容。
-- **`/api/bucket` 五条路由与参数形状**：`GET/POST /api/bucket`、
-  `GET/POST /api/bucket/<name>[/use]`、`DELETE /api/bucket/<name>`；请求体接受
-  `{"name":"工作"}` 或 `{"argv":["工作"]}`；路径参数里的中文由服务端 `url_decode` 解码；
+- **~~`/api/bucket` 五条路由~~ 已删除（提交 `4b812b5`，用户明确「桶不要」）**：
+  `/api/bucket*` 现在返回 **404 + `FMT-017`**——**故意不要**，不是「还没做」，
+  所以**不是 501**；「已知模块」列表里没有 `bucket`。桶继续由 CLI 管，
+  HTTP 客户端操作的是**当前桶**。原先冻结的那五条路由与参数形状**已作废**
+  （`FMT 技术文档.md` 第 12.3.2 节）。
+  请求体仍接受 `{"name":"工作"}` 或 `{"argv":["工作"]}`（**其它路由沿用**）；
+  路径参数里的中文由服务端 `url_decode` 解码；
   错误码 → HTTP 状态码的映射表也一并冻结（`FMT 技术文档.md` 第 12.3.2.1、12.5 节）。
 - **`/api/trash` 四条路由（两级，提交 `0fc242b` 收口）**：`GET /api/trash`（列条目，回
   `{entries:[{type,id,name,bucket,deleted_at,bytes,files,present,restorable,trash_path?,reason?}], count, files, buckets}`）、
@@ -2002,7 +2012,8 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 | FMT-014 | `PathEscape` | 路径穿越 | 2 |
 | FMT-015 | `ConsistencyError` | 数据一致性异常 | 6 |
 | FMT-016 | `ConfirmRequired` | 该操作需要显式确认（`force`）——**提交 `711da4c` 追加**：永久删除（两级 `trash delete`）、跨 Bucket 的 `file delete`、非空桶的 `bucket delete` 缺 `force` 时返回它；HTTP 400；**不再复用 `FMT-001`** | 2 |
-| FMT-017 | `RouteNotFound` | **没有这个接口**——**提交 `4ddb515` 追加**：HTTP 兜底路由遇到完全打错的 `/api/...` 路径时返回它（HTTP 404），默认消息「没有这个接口」。**只由 HTTP 兜底路由产生**——管道入口没有「路由」概念（op 名写错走业务层错误）。**已知模块下没有这个接口是另一回事**：`501 + FMT-602`（见下表 FMT-602 行） | 3 |
+| FMT-017 | `RouteNotFound` | **没有这个接口**——**提交 `4ddb515` 追加**：HTTP 兜底路由遇到完全打错的 `/api/...` 路径时返回它（HTTP 404），默认消息「没有这个接口」。**只由 HTTP 兜底路由产生**——管道入口没有「路由」概念（op 名写错走业务层错误）。**已知模块下没有这个接口是另一回事**：`501 + FMT-602`（见下表 FMT-602 行）。**提交 `4b812b5` 追加一种用法**：`/api/bucket*` 也返回它——那是**故意不要**（用户明确「桶不要」），不是「还没做」 | 3 |
+| FMT-018 | `Unauthorized` | **缺少 / 无效的访问 token**——**提交 `4b812b5` 追加**：HTTP 401、退出码 5。`/api/*` 都要 token，唯一例外是 `/api/ping`（健康检查）与 `/api/share/<id>/download`（分享链接本身就是凭证）；由 httplib 的 **pre-routing 钩子一处拒绝**（不逐个路由判断），且**没有注入校验器时一律 401**（fail-closed）。请求头收 `X-FMT-Token: <token>` 与 `Authorization: Bearer <token>`，比较是**常量时间**；token 从 `config list` 拿 | 5 |
 
 **文件名校验（阶段 5 前，`common/validation`）**
 

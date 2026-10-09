@@ -62,7 +62,7 @@ MSVC（Visual Studio Build Tools，cl.exe / link.exe）
 #include <cpp-httplib/httplib.h>
 ```
 
-`cpp-httplib` 提供 `httplib::Server`（Service 侧监听 `127.0.0.1:4122`）。Windows 下需链接
+`cpp-httplib` 提供 `httplib::Server`（Service 侧监听 `localhost:4122`）。Windows 下需链接
 `ws2_32`（已在 `third_party/CMakeLists.txt` 中处理）。
 
 > **URL 下载已经从 cpp-httplib 移走（提交 `a2b6cd1`）**：原文的「用途」栏写的是
@@ -854,13 +854,13 @@ JSON（`.tmp` 原子替换，见 4.4.2）；CLI 不写入任何配置文件的�
 
 | 字段 | 说明 |
 |---|---|
-| `enabled` | 是否启用 HTTP。**默认 `false`**；**原口径「Service 场景下由安装流程置为 `true`」是文档跑了在实现前面——全仓库没有任何代码把它置为 `true`（`grep 'enabled = true'` 在 `src/` 里零命中，只有 `tests/config_test.cpp` 里为了测试写过一次），安装流程不碰 `config/server.json`，CLI 也没有命令能开。这是**待决缺口**，见 12.1 与 19.1** |
-| `host` | 监听地址，`0.0.0.0` 允许局域网访问 |
+| `enabled` | 是否启用 HTTP。**代码默认 `false`**（由 `config/server.json` 打开）；**线上已置为 `true`**（提交 `22c3c3e`，真机验收见 18.39）。**仍是缺口**：**安装流程不会自动打开**它——那句「Service 场景下由安装流程置为 `true`」一直没实现（`grep 'enabled = true'` 在 `src/` 里零命中，只有 `tests/config_test.cpp` 写过一次），所以全新数据根装完服务后 HTTP 仍是关的，要手改配置。见 12.1、12.2、19.1 |
+| `host` | 监听地址，默认 **`localhost`**（提交 `22c3c3e`：**代码默认值从 `127.0.0.1` 改成 `localhost`**，用户明确要求写 `localhost`）；`0.0.0.0` 允许局域网访问 |
 | `port` | 监听端口，默认 4122 |
 
 V1 的**浏览器入口只提供 HTTP**，后续可扩展 HTTPS。
 
-> **别把这一条与「上传下载」混起来**：`server.json` 说的是本地浏览器入口（`127.0.0.1:4122`）
+> **别把这一条与「上传下载」混起来**：`server.json` 说的是本地浏览器入口（`localhost:4122`）
 > 的监听协议，它至今仍只有 HTTP。**下载来源**的 `http://` / `https://` 都支持
 > （`common/http_client`，WinHTTP + Schannel，提交 `a2b6cd1`，见 1.2 与 10.2.2）。
 
@@ -1278,17 +1278,33 @@ Bucket 级记录**不使用 `file_id`**，用 Bucket 名称标识。常量在
 
 ### 7.4 user.json
 
+**最终 schema（提交 `bfd89f7`）**：
+
 ```json
-{
-  "version": 1,
-  "users": [
-    { "username": "user" }
-  ]
-}
+{ "version": 1, "users": [ {
+  "user_id": "u-b1e7c28f", "username": "user",
+  "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节随机盐>",
+  "token": "<32 位十六进制，永久有效>", "current_bucket": "lazy",
+  "created_at": "…", "updated_at": "…", "last_login_at": "" } ] }
 ```
 
-V1 不实现完整用户系统，保留此文件作为扩展入口。
-当前用户由 `config.json` 的 `current_user` 确定。
+```text
+**没有 buckets 字段**（用户要求删除）：桶以磁盘上真实存在的
+          repository/<user>/<bucket>/ 为准。读的时候**忽略**老字段，
+          **下一次初始化会把老文件里的它清掉**（线上已验证清掉了）。
+current_bucket 保留（用户说以后可能有用），但它只是**快照**——
+          运行时的权威仍是 config.json 的 current_bucket。
+密码      只存哈希：PBKDF2-SHA256 **10 万轮** + 每用户盐；初始密码生成后**不落地明文**。
+          V1 没有登录接口，所以拿不到也不影响——**真正的凭证是 token**。
+token     32 位十六进制、**永久有效**；`config list` 会打印它（机主唯一方便拿到的地方）。
+默认账号  在数据根初始化时创建（initialize_root）：**新根会建**；
+          **已经是 {"users":[],"version":1} 的老根也会补建**（线上就是这种情况）；
+          **已存在则绝不覆盖**。
+```
+
+> **原口径「V1 不实现完整用户系统，只保留 `{"username":"user"}` 作为扩展入口」已作废**
+> （提交 `bfd89f7`）：文件现在有账号、密码哈希与 token，HTTP 认证就靠它（12.3.2）。
+> 当前用户仍由 `config.json` 的 `current_user` 确定。
 
 ### 7.5 时间格式
 
@@ -2760,7 +2776,7 @@ Service 完成。唯一的例外是它**双击时对自己所在数据根做的�
         SCM API  ────────────────────→  FMT Service（LocalSystem）
              ▲                               │
              └── service status（不提权）      ├──→ 业务层 → Storage → 文件系统
-                                              └──→ HTTP 127.0.0.1:4122（仅浏览器）
+                                              └──→ HTTP localhost:4122（仅浏览器）
 ```
 
 | 通道 | 用于 | 说明 |
@@ -2769,7 +2785,7 @@ Service 完成。唯一的例外是它**双击时对自己所在数据根做的�
 | SCM API（经 UAC 提权的短命副本） | `service install/uninstall/start/stop` | 见 13.8 |
 | SCM API（**不提权**，本地直连） | `service status` | 只读查询，见 11.2 / 13.4.1 |
 | 本地处理 | `--help` / `--version` / `-v` / **`version`** / `help` / `exit` | 不依赖 Service（`version` 是提交 `d108c80` 新增的命令，见 11.6） |
-| HTTP `127.0.0.1:4122` | **仅浏览器** | CLI 不再使用 |
+| HTTP `localhost:4122` | **仅浏览器** | CLI 不再使用 |
 
 **唯一写入者是 Service。** 这样不存在 CLI 与 Service 两个进程同时改 `data/*.json`
 的并发问题（CLI 双击时的幂等补齐只**新增缺失文件**，不修改任何已有内容）。
@@ -3995,7 +4011,7 @@ blocked 的情况      歧义（file.delete）、同名冲突 / 随桶删除 / �
 无需自研 HTTP 服务栈。
 
 ```text
-Service 侧：httplib::Server    监听 127.0.0.1:4122，注册路由（浏览器用）
+Service 侧：httplib::Server    监听 localhost:4122，注册路由（浏览器用）
 下载侧    ：WinHTTP + Schannel file upload <url> 时由 Service 下载远程文件（10.2.2）
 CLI 侧    ：不使用 HTTP        CLI 走命名管道（第 11.1 节 / 第 13.9 节）
 ```
@@ -4010,11 +4026,11 @@ CLI 侧    ：不使用 HTTP        CLI 走命名管道（第 11.1 节 / 第 13.
 > 详见 1.2 与 10.2.2.1。
 
 **冻结决策：CLI 不再走 HTTP。** 早期设计的「CLI 是 HTTP 客户端、
-Service 是 HTTP 服务端，两者通过 127.0.0.1:4122 通信」已作废：
+Service 是 HTTP 服务端，两者通过 localhost:4122 通信」已作废：
 
 | 对比 | 旧（作废） | 新（冻结） |
 |---|---|---|
-| CLI ↔ Service 通道 | `httplib::Client` → `127.0.0.1:4122` | 命名管道 `\\.\pipe\fmt.control` |
+| CLI ↔ Service 通道 | `httplib::Client` → `localhost:4122` | 命名管道 `\\.\pipe\fmt.control` |
 | HTTP 端口 4122 的使用者 | CLI + 浏览器 | **仅浏览器** |
 | 数据根声明 | 无法表达 | 管道 hello 帧声明（13.10） |
 | 是否需要端口监听 | CLI 依赖端口可用 | CLI 与端口无关，端口占用不影响 CLI |
@@ -4051,25 +4067,25 @@ src/common/
     └─ true  → server.listen(host, port)
 ```
 
-默认 `127.0.0.1:4122`。绑定失败（端口占用）→ 记录 ERROR 日志，
-Service 模式下不中断其他功能。
+默认 **`localhost:4122`**（提交 `22c3c3e`：`ServerConfig::host` 的**代码默认值从
+`127.0.0.1` 改成 `localhost`**，用户明确要求写 `localhost` 而不是 `127.0.0.1`）。
+绑定失败（端口占用）→ 记录 ERROR 日志，Service 模式下不中断其他功能。
 
-> **⚠ 待决缺口：`enabled` 没有任何代码去打开（真机实测，2026-10-09）**
+> **HTTP 入口的口径（提交 `22c3c3e`，真机验收 2026-10-09 21:29）**
 >
 > ```text
-> 实测     服务装好、正在跑，但 127.0.0.1:4122 **没有监听**
-> 原因     ① ServerConfig::enabled 默认 false（include/fmt/config/config.hpp）
->          ② 全仓库没有代码把它置为 true（git grep 'enabled = true' 在 src/ 零命中；
->             安装流程不碰 config/server.json；CLI 也没有命令能开）
->          ③ 5.2 里那句「Service 场景下由安装流程置为 true」**没实现**
-> 手动验证 把 config/server.json 的 enabled 改成 true、重启服务后，HTTP 入口**完全正常**
->          （ping / status / bucket / file / trash 全部可用）——问题只在「没人开这个开关」
-> 后果     安装完的服务在浏览器侧等于没有入口；CLI 不受影响（走管道）
+> 代码默认   ServerConfig::enabled = false、host = "localhost"、port = 4122
+>            （enabled 仍是默认关闭：由 config/server.json 打开）
+> 线上配置   config/server.json 已改成 enabled: true, host: "localhost"
+>            → 真机日志「HTTP 监听 localhost:4122」，接口全部可用
+> **仍是缺口**：**安装流程目前不会自动打开** `enabled`（那句「Service 场景下由安装流程
+>            置为 true」一直没实现）。所以全新数据根装完服务后，HTTP 仍是关的，
+>            需要手改 `config/server.json`（或将来加 `config http on` 这类命令）。
 > ```
 >
-> **还没有结论**（等用户定）：是让**安装流程**按 5.2 的原文把 `enabled` 置为 `true`，
-> 还是加一条 **CLI 命令**（例如 `config http on` / `config set enabled true`）来开。
-> 见 5.2、19.1。**在定下来之前，任何文档都不要把它写成已实现。**
+> **原口径「localhost:4122 没有监听、enabled 没人打开」只对「全新数据根 + 安装流程」
+> 成立**——线上那台已经手动打开并真机验收通过（18.39 有完整记录）。
+> 待决项见 19.1。
 
 > **端口占用不再是致命问题。** 旧的 CLI 依赖 4122，端口被占时整条命令链路失效；
 > 现在 CLI 走管道（13.9），HTTP 只服务浏览器，起不来只是「浏览器访问不了」。
@@ -4119,27 +4135,48 @@ HTTP 状态码（12.5）与简短文本。CLI 不访问它们，只把链接打�
 
 请求与响应体均为 JSON。
 
+**所有 `/api/*` 都要 token（提交 `4b812b5`）**，唯一两个例外是
+**`/api/ping`**（健康检查）与 **`/api/share/<id>/download`**（别人拿分享链接下载——
+**分享链接本身就是凭证**，这是用户选的方案 B）。缺 token / token 不对 → **401 + `FMT-018
+Unauthorized`**（退出码 5）。细节见下面的「认证」小节。
+
 | 方法 | 路径 | 对应命令 |
 |---|---|---|
-| GET | `/api/bucket` | `bucket list` |
-| POST | `/api/bucket` | `bucket create <name>` |
-| GET | `/api/bucket/<name>` | `bucket get <name>` |
-| POST | `/api/bucket/<name>/use` | `bucket use <name>` |
-| DELETE | `/api/bucket/<name>` | `bucket delete <name>` |
-| GET | `/api/file` | `file list`（**已落地**，提交 `188e85d`） |
-| POST | `/api/file` | `file upload`（**已落地**，提交 `188e85d`；请求体 `{"url":"…"}` 或 `{"path":"…"}`，可带 `"file_name"`） |
-| GET | `/api/file/<id_or_name>` | `file get <file_id>` / `file get <文件名>`（**已落地**，提交 `188e85d`，路径参数百分号解码） |
+| GET | `/api/file` | `file list`（**已落地**，提交 `188e85d`；响应里带 `sort`；**只有文件信息**——`current_bucket` 与 `path` 都不在里面，用户要求） |
+| POST | `/api/file/upload` | `file.upload_stream`（**提交 `d3aeb3d`，流式**）：**请求体就是文件内容**，文件名来自 `?name=` 或 `Content-Disposition`（见下）。**旧的 `POST /api/file` + `{"url"/"path"}` 已删除**——让服务端去读本地路径对远端客户端没有意义 |
+| GET | `/api/file/<id_or_name>` | `file get <file_id>` / `file get <文件名>`（**已落地**，提交 `188e85d`，路径参数百分号解码；**响应含相对数据根的 `path`**，提交 `d3aeb3d`） |
+| GET | `/api/file/<id_or_name>/download` | **流式下载**（提交 `d3aeb3d`）：`Content-Disposition: attachment`、`Content-Type` 猜不出来就给 `application/octet-stream`；**任何类型都能下载**——不受预览策略限制 |
+| GET | `/api/file/<id_or_name>/preview` | **流式预览**（提交 `d3aeb3d`）：`Content-Disposition: inline`，`Content-Type` 由**唯一一份**预览策略给出（`preview_content_type()`）；不支持的 → `400 + FMT-701` |
 | DELETE | `/api/file/<file_id_or_name>` | `file delete <file_id\|文件名>`（**软删除，已落地**，提交 `188e85d`；路径参数在提交 `0ad9efc` 起也可给文件名；**同桶不需要确认**；**跨 Bucket 需要 `force`**，否则 `400 + FMT-016`（提交 `711da4c`）；`?dry_run=1` 只预检） |
-| GET | `/api/config` | `config get` |
-| PUT | `/api/config` | `config set --user/--bucket` |
-| GET | `/api/share` | `share list <file_id>` |
-| POST | `/api/share` | `share create <file_id>` |
-| GET | `/api/share/<share_id>` | `share get <share_id>` |
-| DELETE | `/api/share/<share_id>` | `share delete <share_id>` |
+| POST | `/api/share` | `share create <file_id>`（**已落地**，提交 `4b812b5`；请求体 `{"file_id": "fmt-20261009-0"}`） |
+| GET | `/api/share/<share_id>` | `share get <share_id>`（**已落地**，提交 `4b812b5`） |
+| GET | `/api/share?file_id=…` | `share list <file_id>`（**已落地**，提交 `4b812b5`） |
+| DELETE | `/api/share/<share_id>` | `share delete <share_id>`（**已落地**，提交 `4b812b5`） |
+| GET | `/api/share/<id>/download` | **公开、不要 token**；**流式下载 + 先记账再放行**（提交 `d3aeb3d`，开发文档第 50/51 节在这里生效：计数写不进去就不下载，避免超发） |
 | GET | `/api/trash` | `trash list`（**两级，`0fc242b` 起统一 `entries` 形状**） |
 | POST | `/api/trash/<标识>/restore` | `trash restore <标识>`（**两级，`0fc242b` 起文件级也可**，路径参数百分号解码；`?dry_run=1` 预检） |
 | GET | `/api/trash/<标识>` | `trash get <标识>`（**两级**，提交 `4fee290` 起桶级、`0fc242b` 起文件级） |
 | DELETE | `/api/trash/<标识>` | `trash delete <标识>`（**永久删除，两级**；需 `?force=1`（或 `force=true`，大小写不敏感）或请求体 `{"force":true}`，否则 `400 + **FMT-016**`（提交 `711da4c` 起，原来记的是 `FMT-001`）；`?dry_run=1` 只预检） |
+
+> **桶的 HTTP 接口已全部删除（提交 `4b812b5`，用户明确「桶不要」）**：
+> `/api/bucket*` 现在返回 **404 + `FMT-017`**，**不是 501**——它是**故意不要**，
+> 不是「还没做」。所以**「已知模块」列表里没有 `bucket`**（见下面的兜底路由）。
+> 桶继续由 CLI 管；HTTP 客户端操作的是**当前桶**。
+> 原口径的 `/api/bucket` 五条路由（以及 `/api/config` 两条）**已作废**——
+> `config` 目前也没开 HTTP 接口，`config list` 的 token 要**从 CLI 拿**。
+
+**认证（提交 `4b812b5`）**：
+
+```text
+放哪      **只在一处**：httplib 的 **pre-routing 钩子**（set_pre_routing_handler）
+为什么    「漏给某条路由加认证」是这类代码最典型的事故，所以不逐个路由判断；
+          一处集中检查，新增路由不可能忘
+fail-closed   **没有注入校验器时一律 401**（默认关着）——宁可全拒，也不放行
+请求头    X-FMT-Token: <token>  或  Authorization: Bearer <token>（两种都收）
+比较      常量时间（token 比较与密码哈希比较都是），避免时序侧信道
+token 从哪拿  **`config list`** 会打印「用户 ID / 访问 token / 建议的请求头」——
+          这是机主唯一方便拿到它的地方（V1 没有登录接口）
+```
 
 **兜底路由（提交 `4ddb515`，路由表的最后一层）**：
 
@@ -4177,14 +4214,17 @@ HTTP 状态码（12.5）与简短文本。CLI 不访问它们，只把链接打�
 > **路由本身没有动**——`src/server/server.cpp` 两条都还是 `R"(/api/file/([^/]+))"` +
 > `args_with_encoded_name()`（`url_decode` 之后装进 `args.argv`），只是语义放宽了。
 >
-> 剩下的 `/api/share`（四条）与 `/api/config`（两条）**仍是设计约定，一个路由都没加**
-> （提交 `d5779db` / `674d0b0` 之后的口径）：
-> `share` **数据面已完成**（10.3、18.38）、`config list/set` 也已完成（18.37），
-> 但 **HTTP 入口现在按用户决定是关闭的**，接口等用户定开放哪几个再一起做；
-> `trash empty` 同理——**`DELETE /api/trash`（清空）没有加**。
-> 现在打到这些路径会落到兜底路由：已知模块下没这个接口 → **501 + `FMT-602`**（12.5）。
-> 原口径「打到它们会返回 `FMT-602`，因为 `share.*` 没有实现」**已作废**——
-> 现在 `FMT-602` 只表示「这个接口还没做」，不再表示「模块没实现」。
+> **提交 `4b812b5` 之后（路由的最终形态）**：
+> ① **`/api/share` 四条已落地**：`POST /api/share`（`{"file_id":…}`）、
+> `GET /api/share/<share_id>`、`GET /api/share?file_id=…`、`DELETE /api/share/<share_id>`；
+> 全部**要 token**（除下面那条下载）。`GET /api/share/<id>/download` **公开、不要 token**
+> （分享链接本身就是凭证），但**流式下载第 3 步才做**，现在返回 **501 + `FMT-602`**。
+> ② **`/api/bucket*` 五条已删除**（用户明确「桶不要」）→ **404 + `FMT-017`**（不是 501：
+> 这是故意不要，不是还没做）；桶继续由 CLI 管。
+> ③ `/api/config` 两条仍未加（`config list` 是**从 CLI** 拿 token 的地方）。
+> ④ `trash empty` 也没加 HTTP 路由（`DELETE /api/trash` 仍不存在）。
+> ⑤ **所有 `/api/*` 都要 token**，只有 `/api/ping` 与分享下载公开（见上面的「认证」）。
+> 原口径「`share` 四条仍是设计约定、`/api/bucket` 五条已落地」**已作废**。
 
 **`service *` 没有、也不会有 HTTP 路由**：它操作的是 SCM，与服务进程内的业务无关，
 且服务可能尚未安装/运行。见 13.8。
@@ -4377,6 +4417,7 @@ V1 只实现图片，其他类型待后续扩展。
 | 200 | 成功并带响应体 |
 | 204 | 成功但无响应体（**不得带 body**） |
 | 400 | 参数错误 |
+| 401 | 缺少 / 无效的访问 token（`/api/ping` 与 `/api/share/<id>/download` 除外） |
 | 403 | 分享过期 / 次数耗尽 / 文件不可用 |
 | 404 | 资源不存在（含**没有这个接口**） |
 | 405 | 非 GET 方法 |
@@ -4391,6 +4432,7 @@ V1 只实现图片，其他类型待后续扩展。
 | 状态码 | 错误码 |
 |---|---|
 | 400 | `FMT-001` **`FMT-016`** `FMT-012` `FMT-014` `FMT-100` `FMT-101` `FMT-102` `FMT-103` `FMT-104` **`FMT-106`** `FMT-202` `FMT-300` `FMT-303` `FMT-700` `FMT-701` |
+| **401** | **`FMT-018 Unauthorized`**（提交 `4b812b5`）：缺 token / token 不对（`/api/ping` 与分享下载除外），由 **pre-routing 钩子**一处拒绝；退出码 5 |
 | 403 | `FMT-004` `FMT-501` `FMT-502` `FMT-503` |
 | 404 | `FMT-002` `FMT-200` `FMT-400` `FMT-500` `FMT-305` `FMT-402` **`FMT-017`** |
 | 409 | `FMT-003` `FMT-105` `FMT-201` `FMT-203`(保留未用) `FMT-304` `FMT-401` | 冲突（已存在、重名、仍被引用；**`FMT-203 BucketInUse` 保留、V1 未使用**——没有代码会产生它，见 12.5 下方的说明） |
@@ -4425,9 +4467,9 @@ CLI 只看信封里的 `FMT-NNN`）。
 原来      `Get(R"(/api/.*)")` 兜底里**硬编码 response.status = 500**，
           消息「操作尚未实现：<path>」——调用方看到 500 只会以为服务器坏了
 实测      GET /api/nosuch → HTTP 500 + FMT-602 操作尚未实现：/api/nosuch
-现在      ① 路径落在**已知模块**下但没有这个接口（/api/bucket | /api/file | /api/trash |
+现在      ① 路径落在**已知模块**下但没有这个接口（/api/file | /api/trash |
              /api/share | /api/config | /api/server | /api/preview）→ **501 + FMT-602**，
-             消息「接口尚未实现：<path>」（share 整组属于这一类）
+             消息「接口尚未实现：<path>」
           ② 完全打错的 /api/... 路径 → **404 + 新错误码 FMT-017 RouteNotFound**，
              消息「没有这个接口：<path>」
           ③ 已知路由但业务上找不到对象（如 GET /api/file/nope.bin）→ 404 + FMT-002（不变）
@@ -6407,7 +6449,7 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 > `fmt_test.cpp`，`FMT_TEST(suite, 名称)` / `FMT_CHECK_EQ` 宏，**零第三方依赖、可完全离线构建**，
 > 断言失败继续跑下一个用例），并在 `tests/CMakeLists.txt` 里用 `add_test(NAME fmt_tests …)`
 > 接进 CTest——所以「不写自动化测试」这条**只对 Catch2 那种形态成立**：不引外部框架，
-> 但模块行为仍有单元测试兜底。当前 **154 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
+> 但模块行为仍有单元测试兜底。当前 **156 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
 `HttpClient.*` + 提交 `0ad9efc` 新增 2 条 `File.*` + 提交 `5bf2c1f` 新增 2 条 `File.*`
 与 1 条 `Bucket.*` + **提交 `9c3d2cb` 新增 5 条** + **提交 `0fc242b` 新增 4 条** +
 **提交 `a9af276` 新增 2 条** + **提交 `2c841c8` / `5b316b3` 各新增 1 条** +
@@ -6422,7 +6464,9 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 `Cli.service子命令集合`、`CliE2e.核心链路走真实exe与真实管道`、
 `CliE2e.交互式确认答n不删答y才删`、`Ipc.管道名可被FMT_PIPE覆盖`、
 `Logger.超过上限会轮转出一代`、`Logger.上限为零时不轮转`、
-`Service.列表排序配置与清空回收站`、`Service.分享的创建查看列出撤销与计数`
+`Service.列表排序配置与清空回收站`、`Service.分享的创建查看列出撤销与计数`、
+`Server.管理接口要token且桶路由已下线`、`App.初始化数据根会建默认账号与token`、
+`App.已有空users文件时也要补建默认账号`
 （另有既有用例追加断言或改口径：`File.列表与查询` 的大写 file_id、`File.软删除进回收站`
 改断言 `file.json` 且断言 `trash.json` 保持空、`Service.管道能执行Bucket命令`、
 `Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、
@@ -6433,7 +6477,21 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 → 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→ 142（`a9af276`）
 → 143（`2c841c8`）→ 144（`5b316b3`，`8f0fd5c` 只补断言不变）→ 145（`d108c80`）
 → 146（`bb7a40f`）→ 147（`c573f14`）→ 150（`a340d1e`）→ 152（`821aba3`）
-→ 153（`674d0b0`）→ **154（`d5779db`）**。
+→ 153（`674d0b0`）→ 154（`d5779db`）→ **156（`bfd89f7` / `4b812b5`：账号存储 +
+认证与路由；`ff237d5` 只修测试隔离，不新增用例）**。
+
+**测试隔离的硬教训：只隔离管道不够（提交 `ff237d5`，2026-10-09 真事故）**
+
+```text
+事故    端到端交互测试用**无参数**跑真的 fmt.exe → 那是**双击引导** → 引导会装 / 启动 /
+        **重装真实的 Windows 服务**。FMT_PIPE 只隔离管道，**管不到 SCM** ✗：
+        测试因此把服务注册指向了自己的临时目录，测试结束目录被清理 →
+        **线上服务指向不存在的文件、部署的 fmt.exe 也没了**（已修复并 reinstall 指回真路径）。
+防护    新增 **FMT_NO_SERVICE=1**（测试专用）：引导函数开头看到它就**完全不碰服务管理**；
+        端到端夹具为每个子进程都设上它。
+规则    凡是要跑「用户双击也会走的入口」，**必须显式切断它对 SCM / 注册表 / ProgramData
+        的写入能力**——只把管道名换掉是不够的（13.9.1、18.35）。
+```
 > 端到端实测仍然是「真的对了」的最终判据（17.4 的硬标准不变）。
 >
 > **运行器的两条可观测性设计（提交 `a2b6cd1`，逐行照源码）**：
@@ -6853,7 +6911,7 @@ bucket delete 学习（当前）      → 数据移入 trash/小谷/学习，cur
 3) file list                       → fmt-20261007-0  .smoke-中文名.txt  text
 4) share create --file fmt-20261007-0
                                    → share_id=64c17f38464b567e
-                                     链接 http://127.0.0.1:4122/share/download/64c17f38464b567e
+                                     链接 http://localhost:4122/share/download/64c17f38464b567e
 5) 浏览器直连分享下载               → HTTP 200，27 字节，内容与源文件逐字节一致
 6) share list                      → 64c17f38464b567e  .smoke-中文名.txt  1/20  有效
                                      （下载计数只在完整写出后 +1，符合第 45 节）
@@ -8167,21 +8225,26 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 ① 已修：未知 / 未实现的 /api 路径原来一律 500（12.3、12.5）
    实测     GET /api/nosuch → HTTP 500 + FMT-602「操作尚未实现：/api/nosuch」
    原因     兜底路由 `Get(R"(/api/.*)")` 里**硬编码 response.status = 500**
-   现在     已知模块（bucket/file/trash/share/config/server/preview）下没有这个接口
-            → **501 + FMT-602**「接口尚未实现：<path>」（share 整组属这一类）
+   现在     已知模块（**file / trash / share / config / server / preview——`bucket` 不在其中**，
+            提交 `4b812b5` 把桶的接口整个删了）下没有这个接口
+            → **501 + FMT-602**「接口尚未实现：<path>」（如分享下载端点）
             完全打错的 /api/... → **404 + 新错误码 FMT-017 RouteNotFound**「没有这个接口」
+            **`/api/bucket*` → 404 + FMT-017**（故意不要，不是「还没做」）
             已知路由但业务找不到对象（GET /api/file/nope.bin）→ 404 + FMT-002（不变）
            `FMT-602` 的映射也从「落 default 500」改成**显式 501**
    新错误码 FMT-017 RouteNotFound（FMT-0xx 通用一组，退出码 3）**只由 HTTP 兜底路由产生**
             ——管道入口没有「路由」概念
 
-② 真缺口（**未修，待用户决策**）：HTTP 入口实际上永远打不开（5.2、12.1、19.1）
-   实测     服务装好、在跑，但 127.0.0.1:4122 **没有监听**
+② 缺口收窄（**提交 22c3c3e 之后**；18.39 有完结记录）
+   当时     服务装好、在跑，但 localhost:4122 **没有监听**
    原因     ServerConfig::enabled 默认 false，而全仓库没有代码把它置为 true
             （安装流程不碰 config/server.json，CLI 也没有命令能开）；
             5.2 里那句「Service 场景下由安装流程置为 true」**没实现**
    手动验证 改成 true 并重启服务后，HTTP 入口完全正常（下表那些 HTTP 检查就是这么跑通的）
-   待决     ① 安装流程按文档置 true，还是 ② 加一条 CLI 命令（如 config http on）——先不写结论
+   **现在**：代码默认 host 从 127.0.0.1 改成 **localhost**，线上 server.json 已
+            enabled: true 并真机验收通过（18.39）
+   **仍是缺口**：**全新数据根**装完服务后 enabled 仍默认 false（没人自动打开）
+   待决     ① 安装流程按文档置 true，还是 ② 加一条 CLI 命令（如 config http on）
 ```
 
 **真机测试通过的部分（2026-10-09，对已安装服务实测；用户提供素材目录）**：
@@ -8539,6 +8602,90 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
 
 ---
 
+### 18.39 HTTP 接口（第 1、2 步）+ 账号/令牌 + localhost（提交 `bfd89f7` / `4b812b5` / `ff237d5` / `22c3c3e`）
+
+四个提交：`bfd89f7` 账号存储、`4b812b5` 认证与路由、`ff237d5` 测试隔离修复、
+`22c3c3e` localhost + 开启 HTTP。**156 个用例全绿**（154 + 新增 3 条，另一条改期望值）。
+
+```text
+① HTTP 已开启，监听 localhost:4122（提交 22c3c3e）
+   ServerConfig::host 的**代码默认值从 127.0.0.1 改成 localhost**（用户明确要求写
+   localhost）；线上 config/server.json 改成 enabled: true, host: "localhost"，
+   真机日志「HTTP 监听 localhost:4122」。
+   **仍是缺口**：安装流程不会自动打开 enabled（那句「由安装流程置为 true」一直没实现），
+   全新数据根装完服务后 HTTP 仍是关的，要手改配置（12.1、12.2、19.1）。
+
+② 认证（提交 4b812b5）：FMT-018 Unauthorized → 401、退出码 5
+   范围      **所有 /api/* 都要 token**；唯一例外是 **/api/ping**（健康检查）与
+             **/api/share/<id>/download**（别人拿分享链接下载——**分享链接本身就是凭证**，
+             这是用户选的方案 B）
+   放哪      **只在一处**：httplib 的 **pre-routing 钩子**（set_pre_routing_handler）。
+             **为什么**：「漏给某条路由加认证」是这类代码最典型的事故，所以不逐个路由判断；
+             一处集中检查，新增路由不可能忘
+   fail-closed  **没有注入校验器时一律 401**（默认关着）——宁可全拒，也不放行
+   请求头    X-FMT-Token: <token> 与 Authorization: Bearer <token> 都接受
+   比较      常量时间（token 与密码哈希都是），避免时序侧信道
+   token 从哪拿  **config list** 打印「用户 ID / 访问 token / 建议的请求头」——
+             机主唯一方便拿到它的地方（V1 没有登录接口）
+
+③ 桶的 HTTP 接口已全部删除（提交 4b812b5，用户明确「桶不要」）
+   /api/bucket* → **404 + FMT-017**（**不是 501**：故意不要，不是还没做）
+   「已知模块」列表因此是 **file / trash / share / config / server / preview**，
+   **bucket 不在其中**；桶继续由 CLI 管，HTTP 客户端操作的是**当前桶**。
+
+④ 分享路由（管理接口都要 token）
+   POST   /api/share            请求体 {"file_id": "fmt-20261009-0"}
+   GET    /api/share/<share_id>
+   GET    /api/share?file_id=…
+   DELETE /api/share/<share_id>
+   GET    /api/share/<id>/download   公开（不要 token）；**流式下载第 3 步才做**，
+                                     现在 501 + FMT-602
+
+⑤ data/user.json 的最终 schema（**没有桶列表**，提交 bfd89f7）
+   { "version": 1, "users": [ { "user_id": "u-b1e7c28f", "username": "user",
+     "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节随机盐>",
+     "token": "<32 位十六进制，永久有效>", "current_bucket": "lazy",
+     "created_at": "…", "updated_at": "…", "last_login_at": "" } ] }
+   **buckets 字段已删除**：桶以磁盘上的 repository/<user>/<bucket>/ 为准；
+   读的时候忽略老字段，**下一次初始化会把老文件里的它清掉**（线上已验证清掉了）。
+   current_bucket 保留（以后可能有用），但只是**快照**——运行时权威仍是 config.json。
+   密码只存哈希（PBKDF2-SHA256 **10 万轮** + 每用户盐），初始密码不落地明文；
+   V1 没有登录接口，**真正的凭证是 token**。
+   默认账号在**数据根初始化**时创建（initialize_root）：新根会建；
+   **已经是 {"users":[],"version":1} 的老根也会补建**（线上就是这种情况）；
+   已存在则**绝不覆盖**。
+
+⑥ ⚠ 真事故与防护：FMT_NO_SERVICE（提交 ff237d5）
+   端到端交互测试用**无参数**跑真的 fmt.exe → 那是**双击引导** → 引导会装/启动/
+   **重装真实的 Windows 服务**。**FMT_PIPE 只隔离管道，管不到 SCM ✗**：测试把服务注册
+   指向了自己的临时目录，测试结束目录被清理 → **线上服务指向不存在的文件、
+   部署的 fmt.exe 也没了**（已修复，reinstall 指回真路径）。
+   防护：新增 **FMT_NO_SERVICE=1**（测试专用），引导函数开头看到它就**完全不碰服务管理**；
+   端到端夹具为每个子进程都设上它。
+   **规则**：凡是要跑「用户双击也会走的入口」，必须显式切断它对 **SCM / 注册表 /
+   ProgramData** 的写入能力——只换管道名不够（13.9.1、18.35）。
+
+⑦ 另一条工程教训：httplib::Client 不能按值返回
+   测试辅助函数里 `return client;` 让第一条 Server 测试**栈溢出**
+   （0xC00000FD）；改成就地构造即好（13.9.2 的陷阱清单同注）。
+
+⑧ 真机验收记录（2026-10-09 21:29，localhost:4122）
+   日志：HTTP 监听 localhost:4122
+   /api/ping            无 token → 200
+   /api/file            无 token → 401 FMT-018；带 token → 200
+                        （files 里只有文件信息，**已无 current_bucket**）
+   /api/bucket          带 token → 404 FMT-017
+   /api/trash           带 token → 200；无 token → 401
+   POST /api/share      → 200，share_id 3d92277fc240，0/20，到期 7 天后
+   GET  /api/share/<id> → 200，state「可用」
+   GET  /api/share?file_id=… → 200，count 1
+   GET  /api/share/<id>/download → 501 FMT-602（公开但第 3 步才做）
+   DELETE /api/share/<id> → 200；再 GET → 404 FMT-500
+   user.json → 已无 buckets 字段，current_bucket 保留
+```
+
+---
+
 ## 19. 待决事项
 
 ### 19.1 本次重构引入的待决事项
@@ -8565,8 +8712,8 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
 | `version` 字段与兼容 | `service.json` 沿用「未知版本直接拒绝」的策略，还是允许忽略未知字段待定 |
 | 双击引导「等待落定」的具体时长 | **已定稿，从待决清单移出**：不写死时长，改为**按 SCM 的 `dwWaitHint` 自适应**——每轮查询把 `dwWaitHint` 夹在 100 ms – 2000 ms 之间作为下次间隔，兜底上限 30 秒，状态一旦不是等待类就立即结束（13.4.3）。理由是写死 8 秒在慢机器上会把「还在启动」误判成「启动失败」，白弹一次解决不了问题的 UAC 重装。判定用的错误码集合也已冻结（13.2.3）。「仍没起」时是否再多试一次 `reinstall` 仍待实测后定 |
 | `service status` 输出是否要机器可读格式 | **已定稿，从待决清单移出**：**V1 不做 `--json`，也不预留参数名**。机器可读通道是**命令退出码**（`0` 成功；未安装 `FMT-601` → `8`；查询失败 → `8`），人类可读通道是那几行文本（11.6、13.4.1）。需要结构化字段（如 `wait_hint_ms`）时再加 |
-| **`server.json` 的 `enabled` 由谁打开（真机实测暴露的缺口，2026-10-09，尚未修）** | **实况**：`ServerConfig::enabled` 默认 `false`，而**全仓库没有任何代码把它置为 `true`**（`git grep 'enabled = true'` 在 `src/` 零命中；唯一一次是 `tests/config_test.cpp`），安装流程不碰 `config/server.json`，CLI 也没有命令能开 → 装好的服务在 `127.0.0.1:4122` **根本不监听**，浏览器入口打不开（CLI 不受影响，它走管道）。手动把 `enabled` 改成 `true` 并重启服务后，HTTP 入口**完全正常**（ping / status / bucket / file / trash 全通）。**可选做法（未定，等用户拍）**：① 让安装流程按 5.2 的原文把 `enabled` 置为 `true`（实现那句一直没落地的话）；② 加一条 CLI 命令（如 `config http on` / `config set enabled true`）显式打开。**提交 `674d0b0` 起 `config list/set` 已实现**（但 `set` 只让改 `max_upload_size`），所以做法 ② 已经近在手边。见 5.2、12.1、18.37 |
-| **HTTP 开放哪几个接口（用户决定，未定）** | 提交 `d5779db` 之后业务侧几乎都就绪了，但 **HTTP 入口按用户决定仍关闭**（`enabled` 缺口见上一行）。明确**没加**的路由：`/api/share` 四条（share 数据面已完成）、`DELETE /api/trash`（清空）、`/api/config` 两条（`config list/set` 已完成）。等用户定「先开哪几个简单接口」再一起做（12.3.2、18.37、18.38） |
+| **`server.json` 的 `enabled` 仍由安装流程负责（缺口收窄，2026-10-09）** | **提交 `22c3c3e` 起**：代码默认 `host` 从 `127.0.0.1` 改成 **`localhost`**，线上 `config/server.json` 已 `enabled: true` 并真机验收（「HTTP 监听 localhost:4122」，接口全通；18.39）。**仍是缺口**：`ServerConfig::enabled` 代码默认仍是 `false`，而**全仓库没有任何代码把它置为 `true`**（`git grep 'enabled = true'` 在 `src/` 零命中；唯一一次是 `tests/config_test.cpp`），安装流程不碰 `config/server.json`，CLI 也没有命令能开 → **全新数据根**装完服务后不会监听，要手改配置。**可选做法（未定，等用户拍）**：① 让安装流程按 5.2 的原文把 `enabled` 置为 `true`；② 加一条 CLI 命令（如 `config http on` / `config set enabled true`）显式打开——**提交 `674d0b0` 起 `config list/set` 已实现**（但 `set` 只让改 `max_upload_size`），做法 ② 已经近在手边。见 5.2、12.1、12.2、18.37、18.39 |
+| **HTTP 开放哪几个接口（第 3 步待定）** | 第 1、2 步（认证 + share 路由 + 去掉桶）已在提交 `4b812b5` 落地并真机验收（18.39）：**`/api/ping` 与分享下载公开、其余都要 token**、`/api/bucket*` 故意返回 **404 + `FMT-017`**。**还没做**：**分享的流式下载端点**（`GET /api/share/<id>/download` 现在 501 + `FMT-602`，第 3 步）、`/api/config` 两条、`DELETE /api/trash`（清空）。见 12.3.2、18.39 |
 
 ### 19.2 上一次实现遗留的待决事项（仍然有效）
 
@@ -8604,7 +8751,13 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
 `Ipc.管道名可被FMT_PIPE覆盖`），见 18.35；
 提交 `821aba3` 新增 2 条 `Logger.*`（152），见 18.36；
 提交 `674d0b0` 新增 `Service.列表排序配置与清空回收站`（**153**），见 18.37；
-提交 `d5779db` 新增 `Service.分享的创建查看列出撤销与计数`（**154**），见 18.38）。
+提交 `d5779db` 新增 `Service.分享的创建查看列出撤销与计数`（154），见 18.38；
+提交 `bfd89f7` / `4b812b5` 新增 3 条（**156**：`Server.管理接口要token且桶路由已下线`、
+`App.初始化数据根会建默认账号与token`、`App.已有空users文件时也要补建默认账号`；
+`Config.服务配置默认值` 的期望值改成 `localhost`），见 18.39）。
+**端到端夹具的隔离要求（提交 `ff237d5`，真事故）**：除 `FMT_PIPE` 外，每个子进程还必须设
+**`FMT_NO_SERVICE=1`**——无参数跑真 `fmt.exe` 会走**双击引导**，而引导会装/启动/重装
+**真实服务**，`FMT_PIPE` 管不到 SCM（详见下面的「测试隔离的硬教训」与 18.39）。
 **端到端冒烟测试（提交 `a340d1e`，`tests/cli_e2e_test.cpp`，套件名 `CliE2e`）**：
 进程内起 `ServerRuntime`（用 `FMT_PIPE` 私有管道名，13.9.1）→ 把 `fmt.exe` **复制到临时数据根**
 （「数据根 = CLI 所在目录」）→ `CreateProcessW` 拉起**真实 exe**、喂 stdin、合并收
