@@ -4150,7 +4150,7 @@ Unauthorized`**（退出码 5）。细节见下面的「认证」小节。
 
 | 方法 | 路径 | 对应命令 |
 |---|---|---|
-| GET | `/api/file` | `file list`（**已落地**，提交 `188e85d`；响应里带 `sort`；**只有文件信息**——`current_bucket` 与 `path` 都不在里面，用户要求） |
+| GET | `/api/file` | `file list`（**已落地**，提交 `188e85d`；响应里带 `sort`；**只有文件信息**——`current_bucket` 与 `path` 都不在里面，用户要求。**查询串**：`?search=关键字&sort=name\|size\|id&page=N&page_size=M`（提交 `53ec4be` 起**真正透传**；`page_size=abc` → `400 + FMT-001`，不悄悄当 0；**`page_size` 缺省或 0 = 不分页**，上限 1000；**过滤 → 排序 → 分页** 的顺序已冻结，见 18.41） |
 | POST | `/api/file/upload` | `file.upload_stream`（**提交 `d3aeb3d`，流式**）：**请求体就是文件内容**，文件名来自 `?name=` 或 `Content-Disposition`（见下）。**旧的 `POST /api/file` + `{"url"/"path"}` 已删除**——让服务端去读本地路径对远端客户端没有意义 |
 | GET | `/api/file/<id_or_name>` | `file get <file_id>` / `file get <文件名>`（**已落地**，提交 `188e85d`，路径参数百分号解码；**响应含相对数据根的 `path`**，提交 `d3aeb3d`） |
 | GET | `/api/file/<id_or_name>/download` | **流式下载**（提交 `d3aeb3d`）：`Content-Disposition: attachment`、`Content-Type` 猜不出来就给 `application/octet-stream`；**任何类型都能下载**——不受预览策略限制 |
@@ -4346,7 +4346,7 @@ HTTP   路由固定，参数可以来自请求体，也可以来自路径
 | `trash.get` | `{entry:{…}}`（同上的 `TrashEntry` 形状；**旧的顶层 `trashed` / `original` / `path` / `files` / `bytes` 已作废**） |
 | `trash.restore` | `{entry:{…}, message}`；`message` = `文件已回退：<name>` 或 `Bucket 已回退：<name>`；`dry_run` 时回 `{needs_confirm, blocked, entry, message?}` |
 | `trash.delete` | `{entry:{…}, message}`；`message` = `已永久删除：<name>`；`dry_run` 时回 `{needs_confirm（恒真）, blocked, entry, message?}`。**旧的 `removed_files` / `removed_records` 已作废**（那些数字改由预检在动手前给出）。缺 `force` → `FMT-016`（提交 `711da4c`） |
-| `file.list` | `{files:[{file_id,file_name,extension,file_type,size,md5}], count, current_bucket}`（提交 `188e85d`；**列表里没有 `user` / `bucket` / `is_trash`**——作用域已经限定，这三个字段没有信息量） |
+| `file.list` | `{files:[{file_id,file_name,extension,file_type,size,md5}], count, current_bucket, sort, total, page, page_size, total_pages[, search]}`（提交 `188e85d`；**列表里没有 `user` / `bucket` / `is_trash`**——作用域已经限定，这三个字段没有信息量。**提交 `674d0b0`** 加 `sort`（回显实际排序）；**提交 `53ec4be`** 加 `total`（**命中总数，不是本页条数**）、`page`、`page_size`、`total_pages`，有搜索时再回显 `search`。**`page_size` 缺省或 0 = 不分页**（`total_pages` = 1），上限 1000、超了 `FMT-001`；**越界页回空页**，不是错误） |
 | `file.upload` | `{file_id, file_name, bucket, extension, file_type, size, md5, message}`（提交 `188e85d`；`message` = `文件已入库：<file_name>（<file_id>）`） |
 | `file.get` | `{file_id, file_name, bucket, extension, file_type, size, md5, is_trash, trash_reason, path, trash_path}`（提交 `188e85d`；`path` 相对数据根、正斜杠，走 `relative_path_text`；**推不出路径或磁盘上没有时整个字段不出现**，其余字段照常返回。**提交 `9c3d2cb`：`is_trash == true` 时增加 `trash_path`**（`trash_path_of()` 相对数据根、正斜杠，形如 `trash/user/.files/工作/2026/10/08/test.txt`）——回收站里的记录**没有 `path`**，这是设计；两种查询范围差异见 10.2.4） |
 | `file.delete` | `{file_id, file_name, bucket, moved_to, message}`（**提交 `711da4c` 增加 `bucket`**；软删除，`file_id` 不变；`moved_to` = `trash/<user>/.files/<bucket>/YYYY/MM/DD/<file_name>`；`message` = `文件已移入回收站：<file_name>`，跨 Bucket 时补 `（Bucket：<bucket>）`）。**同桶不需要 `force`**；跨 Bucket 缺 `force` → `FMT-016`。`dry_run` 时回预检形状：`{ambiguous, other_bucket, blocked（= ambiguous）, needs_confirm（= other_bucket）, current_bucket, file_id?, file_name?, bucket?, path?, candidates[]?, message?}` |
@@ -6553,7 +6553,7 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 > `fmt_test.cpp`，`FMT_TEST(suite, 名称)` / `FMT_CHECK_EQ` 宏，**零第三方依赖、可完全离线构建**，
 > 断言失败继续跑下一个用例），并在 `tests/CMakeLists.txt` 里用 `add_test(NAME fmt_tests …)`
 > 接进 CTest——所以「不写自动化测试」这条**只对 Catch2 那种形态成立**：不引外部框架，
-> 但模块行为仍有单元测试兜底。当前 **156 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
+> 但模块行为仍有单元测试兜底。当前 **157 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
 `HttpClient.*` + 提交 `0ad9efc` 新增 2 条 `File.*` + 提交 `5bf2c1f` 新增 2 条 `File.*`
 与 1 条 `Bucket.*` + **提交 `9c3d2cb` 新增 5 条** + **提交 `0fc242b` 新增 4 条** +
 **提交 `a9af276` 新增 2 条** + **提交 `2c841c8` / `5b316b3` 各新增 1 条** +
@@ -6581,8 +6581,9 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 → 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→ 142（`a9af276`）
 → 143（`2c841c8`）→ 144（`5b316b3`，`8f0fd5c` 只补断言不变）→ 145（`d108c80`）
 → 146（`bb7a40f`）→ 147（`c573f14`）→ 150（`a340d1e`）→ 152（`821aba3`）
-→ 153（`674d0b0`）→ 154（`d5779db`）→ **156（`bfd89f7` / `4b812b5`：账号存储 +
-认证与路由；`ff237d5` 只修测试隔离，不新增用例）**。
+→ 153（`674d0b0`）→ 154（`d5779db`）→ 156（`bfd89f7` / `4b812b5`：账号存储 +
+认证与路由；`ff237d5` 只修测试隔离，不新增用例）→ **157（`53ec4be`：`Service.文件列表的搜索与分页`，
+净 +1——分页/搜索断言也加进了既有用例）**。
 
 **测试隔离的硬教训：只隔离管道不够（提交 `ff237d5`，2026-10-09 真事故）**
 
@@ -8873,6 +8874,51 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
 
 ---
 
+### 18.41 `file list` 的搜索与分页（commit `53ec4be`）
+
+`53ec4be`「feat(file): search and pagination for the file list」。**157 个用例全绿**
+（156 + 净 +1：新增 `Service.文件列表的搜索与分页`，分页/搜索断言也加进既有用例）。
+
+```text
+① 语义（CLI 与 HTTP 同一套业务实现）
+   search      对**文件名**做不区分大小写的**子串**匹配，**也匹配 file_id**——
+               理由是用户手里常有的就是 id
+   page        从 **1** 开始
+   page_size   **缺省或 0 = 不分页**（保持老行为一次给全，只是多回一个字段）；
+               上限 **1000**，超了报 **FMT-001**
+   新增字段     total（**命中总数，不是本页条数**）、page、page_size、total_pages；
+               有搜索时才回显 search
+   越界        超出末页返回**空页**（不是错误）——CLI 打印「共 2 个文件（第 9/2 页，
+               本页 0 条）」并成功退出
+
+② 顺序冻结为「**过滤 → 排序 → 分页**」
+   理由：先切片再排序、或排序不稳定，会让**同一个文件出现在两页、另一个一页都不出现**。
+   测试里就是遍历三页断言「不漏不重」。实现上 list 先按 search 过滤、
+   再按 sort 排、最后才切页。
+
+③ CLI
+   file list [--sort name|size|id] [--search 关键字] [--page N --page-size M]
+   --search / -s、--page、--page-size 都是**本地开关**（不进 argv），
+   单独放进 args.search / args.page / args.page_size（与 --sort 同一套路）。
+   打印：「匹配「jpg」共 2 个文件（第 1/2 页，本页 1 条）」
+
+④ 两个新坑（都进陷阱清单）
+   ① **`GET /api/file` 曾经「声明了 `?search=/?sort=/?page=/?page_size=` 却全部忽略」**：
+      路由**忘了把查询串放进 args**，参数看着支持、实际无效。现已透传并加测试；
+      并且 `page_size=abc` 报 **FMT-001**（不能悄悄当 0）。
+   ② **`args` 不是 JSON 对象时（`null` 等）在服务端会抛异常**——与历史上那次
+      `abort()` 同一类（18.28）。新增的取值函数先判类型、再取默认，**绝不抛**。
+
+⑤ 真机验收（localhost:4122）
+   ?search=jpg&page=1&page_size=1 → total 2 / count 1 / page_size 1 / total_pages 2
+   ?page_size=abc                 → 400 FMT-001「page_size 必须是整数」
+   ?sort=size&page_size=2         → 17364485.jpg（3.71MB）在前
+   CLI：--search jpg → 「匹配「jpg」共 2 个文件」
+        --page 9 --page-size 1 → 「共 2 个文件（第 9/2 页，本页 0 条）」，成功退出
+```
+
+---
+
 ## 19. 待决事项
 
 ### 19.1 本次重构引入的待决事项
@@ -8943,7 +8989,9 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
 `App.初始化数据根会建默认账号与token`、`App.已有空users文件时也要补建默认账号`；
 `Config.服务配置默认值` 的期望值改成 `localhost`），见 18.39；
 提交 `d3aeb3d` 落地流式 upload / download / preview 与公开分享下载（**156 项不变**，
-流式断言加进既有 `Server.File路由与上传`），见 18.40）。
+流式断言加进既有 `Server.File路由与上传`），见 18.40；
+提交 `53ec4be` 落地 `file list` 的搜索与分页（**157**：新增
+`Service.文件列表的搜索与分页`），见 18.41）。
 **端到端夹具的隔离要求（提交 `ff237d5`，真事故）**：除 `FMT_PIPE` 外，每个子进程还必须设
 **`FMT_NO_SERVICE=1`**——无参数跑真 `fmt.exe` 会走**双击引导**，而引导会装/启动/重装
 **真实服务**，`FMT_PIPE` 管不到 SCM（详见下面的「测试隔离的硬教训」与 18.39）。

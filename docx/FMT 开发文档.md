@@ -2648,6 +2648,26 @@ Trash 单独查询。
 原口径    重排前固定「按 file_id 升序」——它现在只是 id 这一种（默认换成 name）
 ```
 
+**搜索与分页（提交 `53ec4be`，CLI 与 HTTP 同一套业务实现）**：
+
+```text
+search     对**文件名**做不区分大小写的**子串**匹配，**也匹配 file_id**——
+           理由是用户手里常有的就是 id；响应里回显 search
+page       从 **1** 开始
+page_size  **缺省或 0 = 不分页**（保持老行为一次给全，只是多回一个字段）；
+           上限 **1000**，超了报 **FMT-001**
+新增字段   total（**命中总数，不是本页条数**）、page、page_size、total_pages；
+           有搜索时才回显 search
+顺序冻结   **过滤 → 排序 → 分页**
+           理由：先切片再排序、或排序不稳定，会让**同一个文件出现在两页、
+           另一个一页都不出现**（测试里就是遍历三页断言「不漏不重」）
+越界       超出末页返回**空页**（不是错误）
+CLI        file list [--sort name|size|id] [--search 关键字] [--page N --page-size M]
+           打印：「匹配「jpg」共 2 个文件（第 1/2 页，本页 1 条）」
+           （--search / -s、--page、--page-size 都是**本地开关**，不进 argv，
+             单独放进 args.search / args.page / args.page_size）
+```
+
 服务端 `data`（管道与 HTTP 完全相同，第 12.3.2.1 节）：
 
 ```json
@@ -2657,9 +2677,14 @@ Trash 单独查询。
       "file_type": "text", "size": 1024, "md5": "d41d8cd98f00b204e9800998ecf8427e" }
   ],
   "count": 1,
-  "current_bucket": "工作"
+  "current_bucket": "工作",
+  "sort": "name",
+  "total": 1, "page": 1, "page_size": 0, "total_pages": 1
 }
 ```
+
+**提交 `53ec4be` 追加的四个字段**：`total`（命中总数）、`page`、`page_size`、`total_pages`；
+`page_size` 为 0 表示不分页（此时 `total_pages` = 1）。有搜索时另回 `search`。
 
 注意列表里**没有 `user` / `bucket` / `is_trash`**——列表本来就限定在当前用户 + 当前 Bucket +
 正常文件，这三个字段没有信息量，服务端不返回（第 127.6 节的展示规则按这个形状打印）。
@@ -4478,8 +4503,11 @@ file —— 文件（当前用户在当前 Bucket 里的文件）
                            不重复入库。大小上限取 config.json 的 max_upload_size。
                            文件名不能与文件标识同形（fmt-YYYYMMDD-N）：
                            那会和 file_id 混淆，属保留形状（FMT-106）。
-  list [--sort name|size|id]  列出当前 Bucket 的正常文件；默认按名字，
+  list [--sort name|size|id] [--search 关键字] [--page N --page-size M]
+                           列出当前 Bucket 的正常文件；默认按名字，
                            size 大的在前，id 是入库顺序
+                           （提交 53ec4be：--search 按文件名/file_id 做不区分大小写的
+                             子串匹配；--page 从 1 开始，--page-size 省略或 0 = 不分页）
   get <file_id|文件名>     按文件名只查正常文件；按 file_id 连回收站里的
                            也查得到（带 is_trash 与 trash_path）
   delete <file_id|文件名>  软删除进回收站，file_id 不变；之后用
@@ -7311,6 +7339,24 @@ FMT 不允许：
 
 后续版本根据实际需求增加。
 
+**不在本次范围（原 `FMT 重构设计.md` 第 1 节，该文档已删除）**：
+
+```text
+pause                本次确认不需要：服务不声明 SERVICE_ACCEPT_PAUSE_CONTINUE，
+                     HandlerEx 只处理 STOP / SHUTDOWN / INTERROGATE（第 69、70 节）。
+                     不做「暂停服务」这条命令，也不预留它。
+HTTP 客户端 CLI      CLI 不再走 HTTP：改走命名管道直连服务，HTTP 只留给浏览器。
+                     理由是「HTTP 可关闭、端口可被占」——CLI 不应因为浏览器入口关着
+                     或 4122 被占用而整条命令链路失效（第 76 节、
+                     `FMT 技术文档.md` 第 12.1 节）。早期设计的「CLI 是 HTTP 客户端、
+                     与服务通过 localhost:4122 通信」**已作废**。
+多用户与权限系统      V1 没有用户系统：current_user 用占位名 user（第 122 节规则 20），
+                     不做登录、不做用户管理命令、不做按用户隔离的权限判定；
+                     文件与桶的名字作用域仍是「同用户」这一层。
+                     浏览器侧只做**单账号 + token 认证**（那把 token 就是凭证），
+                     不是多用户体系；复杂用户认证与权限系统留在上面那份「不实现」清单里。
+```
+
 ---
 
 # 121. 后续扩展方向
@@ -7627,6 +7673,22 @@ V2
     ② **下载误用了预览策略**：一开始下载与预览共用一个分支，结果 `.bin` 的**下载**
     被 `FMT-701` 挡掉——**下载与预览是两件事**，下载不受预览策略限制
     （`FMT 技术文档.md` 第 18.40 节）
+68. `file list` 的搜索与分页（提交 `53ec4be`，CLI 与 HTTP 同一套业务实现）：
+    `search` 对**文件名**做不区分大小写的**子串**匹配、**也匹配 file_id**（用户手里常有 id）；
+    `page` 从 **1** 开始，`page_size` **缺省或 0 = 不分页**（保持老行为，只是多回字段）、
+    上限 **1000**（超了 `FMT-001`）。响应新增 `total`（**命中总数，不是本页条数**）、
+    `page`、`page_size`、`total_pages`，有搜索时回显 `search`；**越界页回空页**，不是错误。
+    **顺序冻结为「过滤 → 排序 → 分页」**：先切片再排序、或排序不稳定，会让同一个文件
+    出现在两页、另一个一页都不出现（测试遍历三页断言「不漏不重」）。
+    CLI：`file list [--sort name|size|id] [--search 关键字] [--page N --page-size M]`，
+    打印「匹配「jpg」共 2 个文件（第 1/2 页，本页 1 条）」。第 41 节、
+    `FMT 技术文档.md` 第 10.2、12.3.2、18.41 节
+69. 两个新坑（提交 `53ec4be`，都属「陷阱」类）：① **`GET /api/file` 曾经「声明了
+    `?search=/?sort=/?page=/?page_size=` 却全部忽略」**——路由忘了把查询串放进 `args`，
+    参数看着支持、实际无效；现已透传并加测试，且 `page_size=abc` 报 `FMT-001`
+    （不能悄悄当 0）。② **`args` 不是 JSON 对象时（`null` 等）在服务端会抛异常**——
+    与那次 `abort()` 同一类；新增的取值函数**先判类型、再取默认，绝不抛**
+    （`FMT 技术文档.md` 第 18.41 节）
 
 ```
 
@@ -8324,6 +8386,34 @@ previews」）**：
 （`FMT 技术文档.md` 第 12.3.2、18.40 节）
 ```
 
+**`file list` 搜索与分页并入的决策（提交 `53ec4be`「feat(file): search and pagination for
+the file list」）**：
+
+```text
+search：按**文件名**不区分大小写的**子串**匹配，**也匹配 file_id**（用户手里常有 id）
+page：从 1 开始；page_size：**缺省或 0 = 不分页**（老行为一次给全 + 多回字段），
+      上限 1000，超了 FMT-001
+响应新增：total（**命中总数，不是本页条数**）、page、page_size、total_pages；
+      有搜索时回显 search；越界页回**空页**，不是错误
+顺序冻结：**过滤 → 排序 → 分页**——先切片再排序、或排序不稳定，会让同一个文件出现在
+      两页、另一个一页都不出现（测试遍历三页断言「不漏不重」）
+CLI：file list [--sort name|size|id] [--search 关键字] [--page N --page-size M]
+     打印「匹配「jpg」共 2 个文件（第 1/2 页，本页 1 条）」；
+     --search / -s、--page、--page-size 都是本地开关（不进 argv）
+两个坑：① GET /api/file 曾经**声明了 ?search=/?sort=/?page=/?page_size= 却全部忽略**
+      （路由忘了把查询串放进 args）：参数看着支持、实际无效；已透传并加测试，
+      page_size=abc → FMT-001，不悄悄当 0
+      ② **args 不是 JSON 对象时（null 等）服务端会抛异常**（与 abort() 那次同类）：
+      新增取值函数先判类型、再取默认，绝不抛
+测试：156 → **157 项全绿**（新增 Service.文件列表的搜索与分页，净 +1）
+真机验收（localhost:4122）：?search=jpg&page=1&page_size=1 → total 2 / count 1 /
+      page_size 1 / total_pages 2；?page_size=abc → 400 FMT-001「page_size 必须是整数」；
+      ?sort=size&page_size=2 → 3.71MB 的在前；
+      CLI --search jpg → 「匹配「jpg」共 2 个文件」；
+      CLI --page 9 --page-size 1 → 「共 2 个文件（第 9/2 页，本页 0 条）」，成功退出
+（第 41、68、69 条与 `FMT 技术文档.md` 第 10.2、12.3.2、18.41 节）
+```
+
 > **实测风险 → 已被提交 `8f2fbc5` 处理（2026-10-09）**：做 `version` 测试时在**构建目录**里
 > 跑了交互模式，CLI 按设计把**自己所在目录**声明为数据根，于是服务的数据根被切到了构建目录
 > （日志里是 `[Main] 数据根切换: D:/Data/CLionProjects/FMT/cmake-build-debug/bin
@@ -8485,9 +8575,9 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 > 129（`5bf2c1f`）→ 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→
 > 142（`a9af276`）→ 143（`2c841c8`）→ 144（`5b316b3`）→ 144（`8f0fd5c` 只补断言，
 > 计数不变）→ 145（`d108c80`）→ 146（`bb7a40f`）→ 147（`c573f14`）→ 150（`a340d1e`）→
-> 152（`821aba3`）→ 153（`674d0b0`）→ 154（`d5779db`）→ **156（`bfd89f7` / `4b812b5`，
-> `ff237d5` 只修测试隔离不新增用例）**。
-> 第 109、112、125 节已按 156 更新。
+> 152（`821aba3`）→ 153（`674d0b0`）→ 154（`d5779db`）→ 156（`bfd89f7` / `4b812b5`，
+> `ff237d5` 只修测试隔离不新增用例）→ **157（`53ec4be`）**。
+> 第 109、112、125 节已按 157 更新。
 
 后续开发过程中，如果发现：
 

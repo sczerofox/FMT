@@ -71,7 +71,7 @@ V1 用 **JSON + 文件系统**满足需求，不使用数据库、Redis、MQ、�
 
 ## 2. 关键设计决策
 
-V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～41** 项是
+V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 节）。其中第 **16～42** 项是
 `arch-restart` 分支新增的**重构冻结项**，逐条对应 `FMT 开发文档.md` 第 122 节的规则与第 128 节的差异清单：
 
 | # | 规则 |
@@ -127,6 +127,8 @@ V1 开发期间以下规则视为核心规则（`FMT 开发文档.md` 第 122 �
 | 40 | **HTTP 接口第 1、2 步 + 账号/令牌（提交 `bfd89f7` / `4b812b5` / `ff237d5` / `22c3c3e`）**：① HTTP **已开启**，监听 **`localhost:4122`**（`ServerConfig::host` 代码默认值从 `127.0.0.1` 改成 `localhost`；线上 `server.json` 为 `enabled: true`）；**仍是缺口**：安装流程不会自动打开 `enabled`，新数据根要手改配置。② **所有 `/api/*` 都要 token**，唯一例外是 `/api/ping` 与 `/api/share/<id>/download`（分享链接本身就是凭证）；缺 / 错 → **401 + `FMT-018 Unauthorized`**；认证**只在一处**（httplib pre-routing 钩子，「漏给某条路由加认证」是这类代码最典型的事故），且**没有校验器时一律 401**（fail-closed）；请求头收 `X-FMT-Token` 与 `Authorization: Bearer`，比较常量时间；token 从 `config list` 拿。③ **桶的 HTTP 接口已全部删除**（用户明确「桶不要」）：`/api/bucket*` → **404 + `FMT-017`**（故意不要，不是 501），「已知模块」列表里**没有 bucket**。④ 分享路由四条已落地（都要 token），`GET /api/share/<id>/download` 公开但**流式下载第 3 步才做**（现在 501 + `FMT-602`）。⑤ `data/user.json` 定稿（**没有 `buckets` 字段**，桶以磁盘为准；密码只存 PBKDF2-SHA256 哈希；token 永久有效；默认账号在数据根初始化时创建，老的空 `users` 也会补建、已存在不覆盖）。⑥ **测试隔离教训**：`FMT_PIPE` 管不到 SCM，新增 **`FMT_NO_SERVICE=1`** 让引导完全不碰服务管理（提交 `ff237d5`，出过一次真事故：测试把真服务注册指向临时目录） |
 
 | 41 | **HTTP 第 3 步：流式 upload / download / preview + 公开分享下载（提交 `d3aeb3d`）**：`POST /api/file/upload` 的**请求体就是文件内容**（旧的「请求体给服务端本地路径」那套删除——对远端客户端没有意义），**边收边写边判上限**（超 `max_upload_size` 立刻中止并删暂存文件，`FMT-303` → 400；暂存名 `fmt-upload-<pid>-<序号>.tmp` 沿用 `fmt-` 前缀，启动清理能收走碎片）；入库**只有一次移动、不二次拷贝**；新增 op **`file.upload_stream`**。`GET .../download`（attachment）与 `.../preview`（inline）都用 `set_content_provider` **流式回**；**下载不受预览策略限制**，**预览策略只有一份**（`preview_content_type()`，其余 → `FMT-701` 400）。**分享下载公开**（唯一不要 token 的接口，链接本身是凭证）且**先记账再放行**。`file.get` / `share.download` 新增 `path`（相对数据根），`file.list` 不加。两个坑：**ContentReader 早退前必须 `drain_reader()`**（否则 httplib 断开连接、客户端拿不到错误码）、**下载不能复用预览策略**（`.bin` 的下载曾被 `FMT-701` 挡掉）。见第 4.4 节与 `FMT 技术文档.md` 第 12.3.2、18.40 节 |
+
+| 42 | **`file list` 的搜索与分页（提交 `53ec4be`，CLI 与 HTTP 同一套业务实现）**：`search` 对**文件名**做不区分大小写的**子串**匹配、**也匹配 `file_id`**（用户手里常有 id）；`page` 从 **1** 开始，`page_size` **缺省或 0 = 不分页**（保持老行为一次给全，只是多回字段）、上限 **1000**（超了 `FMT-001`）。响应新增 `total`（**命中总数，不是本页条数**）、`page`、`page_size`、`total_pages`，有搜索时回显 `search`；**越界页回空页**，不是错误。**顺序冻结为「过滤 → 排序 → 分页」**——先切片再排序、或排序不稳定，会让同一个文件出现在两页、另一个一页都不出现（测试遍历三页断言「不漏不重」）。CLI：`file list [--sort name\|size\|id] [--search 关键字] [--page N --page-size M]`，打印「匹配「jpg」共 2 个文件（第 1/2 页，本页 1 条）」。两个坑：`GET /api/file` 曾**声明了查询串却全部忽略**（路由忘了把查询串放进 `args`，已透传并加测试）、**`args` 不是 JSON 对象时会抛异常**（新增取值函数先判类型再取默认）。见第 4.4 节与 `FMT 技术文档.md` 第 10.2、12.3.2、18.41 节 |
 
 系统明确**禁止自动**执行：覆盖文件、修改用户文件名、选择其他 Bucket、创建恢复目标
 Bucket、绕过下载限制、删除文件、清空损坏 JSON、**删除旧数据根的数据**、**把服务宿主的
@@ -1770,7 +1772,7 @@ before a bucket goes」；
 | `common/hash`（**提交 `188e85d`**）：`Md5`（Windows CNG / bcrypt 增量接口）+ `md5_hex()`；`bcrypt.lib` 在 `src/common/CMakeLists.txt` 链接 | `include/fmt/common/hash.hpp`、`src/common/hash.cpp` |
 | `core`：`PathManager`（`trash_file` 落点 `trash/<user>/.files/<bucket>/YYYY/MM/DD/`，提交 `4fee290`） | `src/core/` |
 | `common/http_client`（**提交 `a2b6cd1`**）：`is_remote_url()` + `http_download()`——WinHTTP + Schannel 的流式 GET（跟随重定向、连接/发送/接收超时、`Accept-Encoding: identity`、只有 2xx 交给 sink、sink 返回 false 即中止、证书失败给准提示）；`src/common/CMakeLists.txt` 链 `winhttp`，`src/file/CMakeLists.txt` 不再链 cpp-httplib | `include/fmt/common/http_client.hpp`、`src/common/http_client.cpp` |
-| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**156 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`），提交 `2c841c8` 增到 143（`Cli.位置参数的信封形状`），提交 `5b316b3` 增到 144（`Storage.两个写者同时写同一个文件不会互相踩`，并把 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」），提交 `d108c80` 增到 145（`Cli.版本文本只有一个来源`），提交 `bb7a40f` 增到 146（`Cli.数据根切换提示要把两个根都说清楚`——**控制台输出第一次有测试覆盖**），提交 `c573f14` 增到 147（`Cli.service子命令集合`——**命令集合第一次有断言**），提交 `a340d1e` 增到 150（`CliE2e.核心链路走真实exe与真实管道` / `CliE2e.交互式确认答n不删答y才删` / `Ipc.管道名可被FMT_PIPE覆盖`——**第一次让真实 exe 走真实管道**），提交 `821aba3` 增到 152（`Logger.超过上限会轮转出一代` / `Logger.上限为零时不轮转`），提交 `674d0b0` 增到 153（`Service.列表排序配置与清空回收站`），提交 `d5779db` 增到 154（`Service.分享的创建查看列出撤销与计数`），提交 `bfd89f7` / `4b812b5` 增到 156（`Server.管理接口要token且桶路由已下线` / `App.初始化数据根会建默认账号与token` / `App.已有空users文件时也要补建默认账号`）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
+| 单元测试（错误码、校验、配置、路径、存储、管道、服务、CLI、Bucket、File、**Trash**、Hash、HTTP 下载…；**157 个**：提交 `9c3d2cb` 由 129 增到 134（`Validation.与file_id同形的文件名被拒` / `File.与file_id同形的名字不能上传` / `File.标识与名字同时命中时报歧义` / `Bucket.创建时大写会转成小写` / `Bucket.use大写规范化到磁盘上的名字`），提交 `0fc242b` 再由 136 增到 140（`Trash.文件级条目能列出并回退` / `Trash.回退遇同名冲突要拦住` / `Trash.随桶删除的文件不能单独回退` / `Trash.永久删除文件级条目`），提交 `a9af276` 再由 140 增到 142（`String.清理粘贴带进来的路径污染` / `File.粘贴路径里的不可见字符会被清掉`），提交 `2c841c8` 增到 143（`Cli.位置参数的信封形状`），提交 `5b316b3` 增到 144（`Storage.两个写者同时写同一个文件不会互相踩`，并把 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」），提交 `d108c80` 增到 145（`Cli.版本文本只有一个来源`），提交 `bb7a40f` 增到 146（`Cli.数据根切换提示要把两个根都说清楚`——**控制台输出第一次有测试覆盖**），提交 `c573f14` 增到 147（`Cli.service子命令集合`——**命令集合第一次有断言**），提交 `a340d1e` 增到 150（`CliE2e.核心链路走真实exe与真实管道` / `CliE2e.交互式确认答n不删答y才删` / `Ipc.管道名可被FMT_PIPE覆盖`——**第一次让真实 exe 走真实管道**），提交 `821aba3` 增到 152（`Logger.超过上限会轮转出一代` / `Logger.上限为零时不轮转`），提交 `674d0b0` 增到 153（`Service.列表排序配置与清空回收站`），提交 `d5779db` 增到 154（`Service.分享的创建查看列出撤销与计数`），提交 `bfd89f7` / `4b812b5` 增到 156（`Server.管理接口要token且桶路由已下线` / `App.初始化数据根会建默认账号与token` / `App.已有空users文件时也要补建默认账号`），提交 `53ec4be` 增到 157（`Service.文件列表的搜索与分页`）；另有多条既有用例追加断言：`File.列表与查询`、`File.软删除进回收站`、`Service.管道能执行Bucket命令`、`Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、`Server.Bucket路由与状态码`、`Server.File路由与上传`） | `tests/` |
 | vendored 第三方库 | `third_party/nlohmann/json.hpp`、`third_party/cpp-httplib/httplib.h`（**只服务 HTTP 服务端**；URL 下载走系统 `winhttp`） |
 | 版本号的单一来源（CMake 生成头） | `cmake/version.hpp.in` |
 | 构建辅助脚本 | `tools/build.ps1` |
@@ -1929,10 +1931,15 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 
 **阶段 5 又追加了一条冻结（提交 `188e85d`，`0ad9efc` 把 `DELETE` 的参数名放宽）**：
 
-- **`/api/file` 四条路由与上传请求体**：`GET /api/file`（`file.list`）、
-  `POST /api/file`（`file.upload`，请求体 `{"url":"…"}` 或 `{"path":"…"}`，可带
-  `"file_name"`；**`file_name` 可省略**，省略时服务端从来源推断文件名）、
-  `GET /api/file/<id_or_name>`（`file.get`，路径参数百分号解码）、
+- **`/api/file` 四条路由与上传请求体**：`GET /api/file`（`file.list`；**查询串**
+  `?search=关键字&sort=name|size|id&page=N&page_size=M` 提交 `53ec4be` 起**真正透传**，
+  响应带 `total` / `page` / `page_size` / `total_pages`，**顺序冻结为「过滤 → 排序 → 分页」**）、
+  `POST /api/file/upload`（`file.upload_stream`，**请求体就是文件内容**——流式；
+  文件名来自 `?name=` 或 `Content-Disposition`，缺 → `400 + FMT-100`；
+  超过 `max_upload_size` 边收边中止 → `400 + FMT-303`。**旧的 `POST /api/file` +
+  `{"url"/"path"}` 已删除**——让服务端读本地路径对远端客户端没有意义；提交 `d3aeb3d`）、
+  `GET /api/file/<id_or_name>`（`file.get`，路径参数百分号解码；**`/download` 与 `/preview`
+  是另外两条流式路由**）、
   `DELETE /api/file/<file_id_or_name>`（`file.delete`，**同桶软删除不需要 `force`**；
   **跨 Bucket 需要 `force`**，否则 `400 + FMT-016`（提交 `711da4c`）；`?dry_run=1` 只预检；
   提交 `0ad9efc` 起路径参数与 `GET` 一样可以是文件名，**路由正则本身没改**，
