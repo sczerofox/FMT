@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cctype>
 #include <fstream>
+#include <map>
 #include <random>
+#include <vector>
 #include <system_error>
 #include <utility>
 
@@ -248,6 +250,93 @@ std::string extension_of(const std::string& file_name) {
 // 上传第一阶段（锁外）
 // ---------------------------------------------------------------------------
 
+std::string content_type_of(const std::string& file_name) {
+    const std::string ext = extension_of(file_name);
+    static const std::map<std::string, std::string> kTypes = {
+        {".jpg", "image/jpeg"},      {".jpeg", "image/jpeg"},   {".png", "image/png"},
+        {".gif", "image/gif"},       {".bmp", "image/bmp"},     {".webp", "image/webp"},
+        {".svg", "image/svg+xml"},   {".ico", "image/x-icon"},  {".txt", "text/plain; charset=utf-8"},
+        {".md", "text/markdown; charset=utf-8"},                {".json", "application/json"},
+        {".csv", "text/csv; charset=utf-8"},                    {".log", "text/plain; charset=utf-8"},
+        {".xml", "application/xml"}, {".pdf", "application/pdf"},
+    };
+    const auto found = kTypes.find(ext);
+    return found == kTypes.end() ? std::string("application/octet-stream") : found->second;
+}
+
+Result<std::string> preview_content_type(const std::string& file_type,
+                                         const std::string& file_name) {
+    const std::string ext = extension_of(file_name);
+    if (file_type == "image") {
+        const std::string type = content_type_of(file_name);
+        if (type.rfind("image/", 0) == 0) {
+            return type;
+        }
+        return make_error(ErrorCode::PreviewUnsupported, "这个图片格式还不支持预览：" + file_name);
+    }
+    // 文本类内联给浏览器/客户端看（其余一律不支持，让调用方去下载）
+    static const std::vector<std::string> kText = {".txt", ".md", ".json", ".csv", ".log", ".xml"};
+    for (const std::string& candidate : kText) {
+        if (ext == candidate) {
+            return content_type_of(file_name);
+        }
+    }
+    return make_error(ErrorCode::PreviewUnsupported,
+                      "这个类型不支持预览（可以下载）：" + file_name);
+}
+
+Result<PreparedUpload> prepare_staged_upload(const PathManager& paths,
+                                             const std::filesystem::path& staged,
+                                             const std::string& name,
+                                             std::uintmax_t size_limit, Logger* logger) {
+    PreparedUpload prepared;
+    prepared.temp_path = staged;
+    if (!file_exists(staged)) {
+        return make_error(ErrorCode::FileNotFound, "暂存文件不存在：" + path_to_utf8(staged));
+    }
+
+    prepared.file_name = name.empty() ? path_to_utf8(staged.filename()) : name;
+    if (const Status status = validate_file_name(prepared.file_name); !ok(status)) {
+        return *error_of(status);
+    }
+
+    std::error_code size_code;
+    prepared.size = std::filesystem::file_size(staged, size_code);
+    if (size_code) {
+        return make_error(ErrorCode::StorageError, "无法读取暂存文件大小：" + path_to_utf8(staged));
+    }
+    // 最后一道防线：写它的人本该边写边判（超过就中止，不是写完再看）
+    if (size_limit > 0 && prepared.size > size_limit) {
+        return make_error(ErrorCode::SizeLimitExceeded,
+                          "文件超过上传上限（" + std::to_string(prepared.size) + " > " +
+                              std::to_string(size_limit) + " 字节）");
+    }
+
+    Md5 hash;
+    std::ifstream in(staged, std::ios::binary);
+    if (!in) {
+        return make_error(ErrorCode::StorageError, "无法读取暂存文件：" + path_to_utf8(staged));
+    }
+    std::vector<char> buffer(64 * 1024);
+    while (in) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize got = in.gcount();
+        if (got > 0 && !hash.update(buffer.data(), static_cast<std::size_t>(got))) {
+            return make_error(ErrorCode::Md5Error, "MD5 计算失败：" + path_to_utf8(staged));
+        }
+    }
+    prepared.md5 = hash.finish();
+    if (prepared.md5.empty()) {
+        return make_error(ErrorCode::Md5Error, "MD5 计算失败：" + path_to_utf8(staged));
+    }
+
+    if (logger != nullptr) {
+        logger->info("File", "流式上传已落盘：" + prepared.file_name + "（" +
+                                 std::to_string(prepared.size) + " 字节，" + prepared.md5 + "）");
+    }
+    (void)paths;  // 暂存文件已经在 temp/ 下，路径不需要重新推导
+    return prepared;
+}
 Result<PreparedUpload> prepare_upload(const PathManager& paths, const std::string& raw_source,
                                       const std::string& raw_name, std::uintmax_t size_limit,
                                       Logger* logger) {

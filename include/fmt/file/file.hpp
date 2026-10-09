@@ -79,6 +79,26 @@ Result<PreparedUpload> prepare_upload(const PathManager& paths, const std::strin
                                       const std::string& name, std::uintmax_t size_limit,
                                       Logger* logger);
 
+// 上传第一阶段（**流式版**）：数据已经在 `temp/` 里了（HTTP 流式上传边收边写落下的），
+// 这里只补算大小与 MD5，然后交给 FileService::commit_upload。
+// **全程只有一次移动，不二次拷贝**——这正是大文件（.jar 之类）走流式上传的意义。
+//   staged    : 已经写好的暂存文件（必须在 temp/ 下，名字用 fmt-upload- 前缀）
+//   name      : 用户指定的文件名；为空则取 staged 的文件名
+//   size_limit: 最后一道防线（**写它的人应该边写边判**，这里是兜底）
+Result<PreparedUpload> prepare_staged_upload(const PathManager& paths,
+                                             const std::filesystem::path& staged,
+                                             const std::string& name,
+                                             std::uintmax_t size_limit, Logger* logger);
+
+// 按扩展名猜 MIME（下载与预览共用）；猜不到返回 application/octet-stream。
+std::string content_type_of(const std::string& file_name);
+
+// 预览策略：图片与文本类可以内联预览，返回 MIME；其他类型返回 FMT-701。
+// 参数用 (file_type, file_name) 而不是 FileRecord：HTTP 层手里只有响应的 JSON，
+// 但策略只该有一份，不能在两层各写一遍。
+Result<std::string> preview_content_type(const std::string& file_type,
+                                         const std::string& file_name);
+
 class FileService {
 public:
     FileService(const PathManager& paths, Config& config, Logger* logger);

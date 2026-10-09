@@ -231,23 +231,25 @@ FMT_TEST(Server, File路由与上传) {
 
     fmt::server::HttpServer server;
     FMT_CHECK(fmt::ok(server.start("127.0.0.1", 0, fmt::path_to_utf8(root), app.logger.get(),
-                                   handler, test_verifier())));
+                                   handler, test_verifier(), /*max_upload_size=*/4096)));
     httplib::Client client("127.0.0.1", server.port());
     client.set_default_headers({{"X-FMT-Token", kTestToken}});
 
-    // 空请求体 -> 400 + FMT-001
-    const auto empty_body = client.Post("/api/file", "", "application/json");
-    FMT_CHECK(empty_body != nullptr);
-    if (empty_body != nullptr) {
-        FMT_CHECK_EQ(empty_body->status, 400);
-        FMT_CHECK_EQ(nlohmann::json::parse(empty_body->body)["error"]["code"].get<std::string>(),
-                     std::string("FMT-001"));
+    // 流式上传：请求体就是文件内容（不再要求文件在服务端本地有路径）。
+    // 这里上限传 4096，用来验「边写边判」——HTTP 层收满就中止，不等写完。
+
+    // 没给文件名 -> 400 + FMT-100（FileNameEmpty）
+    const auto no_name = client.Post("/api/file/upload", "hello", "application/octet-stream");
+    FMT_CHECK(no_name != nullptr);
+    if (no_name != nullptr) {
+        FMT_CHECK_EQ(no_name->status, 400);
+        FMT_CHECK_EQ(nlohmann::json::parse(no_name->body)["error"]["code"].get<std::string>(),
+                     std::string("FMT-100"));
     }
 
     // 与 file_id 同形的文件名 -> 400 + FMT-106（不能落到 default 的 500）
-    const nlohmann::json bad_name{{"path", fmt::path_to_utf8(source)},
-                                  {"file_name", "fmt-20261008-0"}};
-    const auto rejected_name = client.Post("/api/file", bad_name.dump(), "application/json");
+    const auto rejected_name =
+        client.Post("/api/file/upload?name=fmt-20261008-0", "hello", "application/octet-stream");
     FMT_CHECK(rejected_name != nullptr);
     if (rejected_name != nullptr) {
         FMT_CHECK_EQ(rejected_name->status, 400);
@@ -256,10 +258,33 @@ FMT_TEST(Server, File路由与上传) {
             std::string("FMT-106"));
     }
 
-    // 上传：CLI 传来源，不传内容
+    // 超过上限 -> 400 + FMT-303，而且暂存文件必须被清掉（不留碎片）
+    const std::string too_big(10 * 1024, 'y');
+    const auto over = client.Post("/api/file/upload?name=big.bin", too_big,
+                                  "application/octet-stream");
+    FMT_CHECK(over != nullptr);
+    if (over != nullptr) {
+        FMT_CHECK_EQ(over->status, 400);
+        FMT_CHECK_EQ(nlohmann::json::parse(over->body)["error"]["code"].get<std::string>(),
+                     std::string("FMT-303"));
+    }
+    {
+        const fmt::PathManager paths(root);
+        std::size_t leftovers = 0;
+        std::error_code code;
+        for (const auto& entry : std::filesystem::directory_iterator(paths.temp(), code)) {
+            if (fmt::path_to_utf8(entry.path().filename()).rfind("fmt-upload-", 0) == 0) {
+                ++leftovers;
+            }
+        }
+        FMT_CHECK_EQ(leftovers, std::size_t{0});
+    }
+
+    // 正常上传（100 字节），文件名走 ?name=
+    const std::string payload(100, 'x');
     std::string file_id;
-    const nlohmann::json body{{"path", fmt::path_to_utf8(source)}, {"file_name", "doc.bin"}};
-    const auto uploaded = client.Post("/api/file", body.dump(), "application/json");
+    const auto uploaded =
+        client.Post("/api/file/upload?name=doc.bin", payload, "application/octet-stream");
     FMT_CHECK(uploaded != nullptr);
     if (uploaded != nullptr) {
         FMT_CHECK_EQ(uploaded->status, 200);
@@ -267,8 +292,28 @@ FMT_TEST(Server, File路由与上传) {
         FMT_CHECK(parsed["ok"].get<bool>());
         file_id = parsed["data"]["file_id"].get<std::string>();
         FMT_CHECK_EQ(parsed["data"]["file_name"].get<std::string>(), std::string("doc.bin"));
+        FMT_CHECK_EQ(parsed["data"]["size"].get<std::size_t>(), payload.size());
     }
     FMT_CHECK(!file_id.empty());
+
+    // 下载：字节必须与原文件一模一样，并且是 attachment
+    const auto downloaded = client.Get("/api/file/" + file_id + "/download");
+    FMT_CHECK(downloaded != nullptr);
+    if (downloaded != nullptr) {
+        FMT_CHECK_EQ(downloaded->status, 200);
+        FMT_CHECK(downloaded->body == payload);
+        FMT_CHECK(downloaded->get_header_value("Content-Disposition").find("attachment") !=
+                  std::string::npos);
+    }
+
+    // 预览：.bin 不在可预览类型里 -> 400 + FMT-701
+    const auto preview = client.Get("/api/file/" + file_id + "/preview");
+    FMT_CHECK(preview != nullptr);
+    if (preview != nullptr) {
+        FMT_CHECK_EQ(preview->status, 400);
+        FMT_CHECK_EQ(nlohmann::json::parse(preview->body)["error"]["code"].get<std::string>(),
+                     std::string("FMT-701"));
+    }
 
     // 列表
     const auto listed = client.Get("/api/file");

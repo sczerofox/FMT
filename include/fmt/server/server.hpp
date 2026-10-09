@@ -4,6 +4,7 @@
 // 调试用。两条入口汇入同一个 service 层，响应信封也是同一个。
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -37,8 +38,11 @@ public:
 
     // 绑定端口并起监听线程。port 传 0 表示让系统分配（测试用）。
     // 绑定失败（端口被占用等）返回错误：调用方记 ERROR 日志，但**不中断**其他功能。
+    // max_upload_size 给流式上传做**边写边判**用（0 = 不限，测试可以这样传）；
+    // 服务端还会在入库前用配置里的值再判一次，所以它偏大也不会放过超限文件。
     Status start(const std::string& host, int port, std::string data_root, Logger* logger,
-                 BusinessHandler handler, TokenVerifier verifier);
+                 BusinessHandler handler, TokenVerifier verifier,
+                 std::uintmax_t max_upload_size = 0);
 
     // 停止监听并等线程结束；可重复调用。
     void stop();

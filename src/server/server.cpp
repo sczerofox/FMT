@@ -15,6 +15,10 @@
 
 #include "fmt/common/envelope.hpp"
 #include "fmt/common/string.hpp"
+#include "fmt/core/path.hpp"
+#include "fmt/core/path_manager.hpp"
+#include "fmt/file/file.hpp"
+#include "fmt/storage/storage.hpp"
 #include "fmt/version.hpp"
 
 namespace fmt::server {
@@ -228,8 +232,162 @@ void respond(httplib::Response& response, const Result<nlohmann::json>& result) 
     response.set_content(dump(envelope_error(error)), kJsonContentType);
 }
 
+// ---- 流式上下行（第 3 步）----
+
+// **早退回调必须先把请求体读干净**：ContentReader 型的处理器不读完，
+// httplib 会认为连接状态不干净而直接断开——客户端拿到的是"没有响应"，
+// 而不是我们精心写的错误码（这个坑踩过一次，测试里钉住了）。
+void drain_reader(const httplib::ContentReader& reader) {
+    reader([](const char*, std::size_t) { return true; });
+}
+
+// 暂存文件名：必须带 fmt- 前缀——服务启动时的清理只收 temp/ 下这种名字，
+// 所以中途断掉留下的碎片下次启动会被收走（清理有 10 分钟年龄保护，不会误删在传的）。
+std::string unique_staged_name() {
+    static std::atomic<unsigned> counter{0};
+    return "fmt-upload-" + std::to_string(GetCurrentProcessId()) + "-" +
+           std::to_string(counter.fetch_add(1)) + ".tmp";
+}
+
+// 从 ?name= 或 Content-Disposition 取上传的文件名（支持 filename*=UTF-8''…）。
+std::string upload_file_name(const httplib::Request& request) {
+    if (request.has_param("name")) {
+        return trim(clean_user_path(request.get_param_value("name")));
+    }
+    if (!request.has_header("Content-Disposition")) {
+        return {};
+    }
+    const std::string value = request.get_header_value("Content-Disposition");
+    const auto strip_quotes = [](std::string text) {
+        text = trim(text);
+        if (!text.empty() && (text.front() == '"' || text.front() == '\'')) {
+            text.erase(0, 1);
+        }
+        if (!text.empty() && (text.back() == '"' || text.back() == '\'')) {
+            text.pop_back();
+        }
+        return text;
+    };
+    const auto up_to_semicolon = [](std::string text) {
+        if (const std::size_t end = text.find(';'); end != std::string::npos) {
+            text = text.substr(0, end);
+        }
+        return text;
+    };
+
+    if (const std::size_t star = value.find("filename*="); star != std::string::npos) {
+        std::string text = strip_quotes(up_to_semicolon(value.substr(star + 10)));
+        // 形如 UTF-8''%E4%B8%AD.txt：去掉字符集与语言两段
+        if (const std::size_t quote = text.find("''"); quote != std::string::npos) {
+            text = text.substr(quote + 2);
+        }
+        return trim(clean_user_path(url_decode(strip_quotes(text))));
+    }
+    if (const std::size_t plain = value.find("filename="); plain != std::string::npos) {
+        return trim(clean_user_path(strip_quotes(up_to_semicolon(value.substr(plain + 9)))));
+    }
+    return {};
+}
+
+// 相对数据根的路径 -> 绝对路径（只认数据根内部已存在的文件）。
+Result<std::filesystem::path> resolve_inside_root(const std::string& root,
+                                                 const std::string& relative) {
+    if (relative.empty()) {
+        return make_error(ErrorCode::StorageError, "记录里没有路径信息");
+    }
+    const std::filesystem::path target = path_from_utf8(root) / path_from_utf8(relative);
+    if (!file_exists(target)) {
+        return make_error(ErrorCode::FileNotFound, "文件数据不存在：" + relative);
+    }
+    return target;
+}
+
+// 流式把文件发出去（**不整块进内存**）。disposition 用 attachment（下载）或 inline（预览）。
+void stream_file(httplib::Response& response, const std::filesystem::path& path,
+                 const std::string& content_type, const char* disposition,
+                 const std::string& file_name) {
+    std::error_code size_code;
+    const std::uintmax_t size = std::filesystem::file_size(path, size_code);
+    if (size_code) {
+        respond(response,
+                make_error(ErrorCode::StorageError, "无法读取文件：" + path_to_utf8(path)));
+        return;
+    }
+    // filename* 用 UTF-8 百分号编码：中文名在任何客户端都能正确落地
+    response.set_header("Content-Disposition",
+                        std::string(disposition) + "; filename*=UTF-8''" + url_encode(file_name));
+    response.set_content_provider(
+        static_cast<std::size_t>(size), content_type,
+        [path, size](std::size_t offset, std::size_t length, httplib::DataSink& sink) -> bool {
+            if (offset >= size) {
+                sink.done();
+                return true;
+            }
+            std::ifstream in(path, std::ios::binary);
+            if (!in) {
+                return false;
+            }
+            in.seekg(static_cast<std::streamoff>(offset));
+            std::vector<char> buffer(length);
+            in.read(buffer.data(), static_cast<std::streamsize>(length));
+            const std::streamsize got = in.gcount();
+            if (got > 0) {
+                sink.write(buffer.data(), static_cast<std::size_t>(got));
+            }
+            return true;
+        });
+}
+
+// 下载与预览共用：先向业务层要记录（里面的 path 是相对数据根的），再流式发出去。
+void register_content_route(httplib::Server* server, const BusinessHandler& handler,
+                            const std::string& data_root, bool preview) {
+    const std::string pattern =
+        std::string(R"(/api/file/([^/]+))") + (preview ? "/preview" : "/download");
+    server->Get(pattern,
+                [handler, data_root, preview](const httplib::Request& request,
+                                              httplib::Response& response) {
+                    if (!handler) {
+                        respond(response, make_error(ErrorCode::ServiceOperationFailed,
+                                                     "HTTP 未接入业务处理"));
+                        return;
+                    }
+                    const Result<nlohmann::json> got =
+                        handler("file.get", args_with_encoded_name(request.matches[1]));
+                    if (!ok(got)) {
+                        respond(response, got);
+                        return;
+                    }
+                    const nlohmann::json& data = std::get<nlohmann::json>(got);
+                    const Result<std::filesystem::path> path =
+                        resolve_inside_root(data_root, data.value("path", std::string{}));
+                    if (!ok(path)) {
+                        respond(response, *error_of(path));
+                        return;
+                    }
+                    const std::string file_name = data.value("file_name", std::string{});
+                    // **下载不受预览策略限制**：任何类型都能下载，MIME 猜不出来就给
+                    // application/octet-stream。只有预览才问"这个类型能不能内联看"——
+                    // 这里一开始写成两者共用预览策略，结果 .bin 的下载被 FMT-701 挡掉了。
+                    if (!preview) {
+                        stream_file(response, std::get<std::filesystem::path>(path),
+                                    content_type_of(file_name), "attachment", file_name);
+                        return;
+                    }
+                    // 预览策略只有一份，在文件模块里（图片与文本类内联，其余 FMT-701）
+                    const Result<std::string> type =
+                        preview_content_type(data.value("file_type", std::string{}), file_name);
+                    if (!ok(type)) {
+                        respond(response, *error_of(type));
+                        return;
+                    }
+                    stream_file(response, std::get<std::filesystem::path>(path),
+                                std::get<std::string>(type), "inline", file_name);
+                });
+}
+
 // 业务路由表见技术文档 12.3；这里只做「路径 -> op + 参数」的翻译。
-void register_business_routes(httplib::Server* server, BusinessHandler handler) {
+void register_business_routes(httplib::Server* server, BusinessHandler handler,
+                               const std::string& data_root, std::uintmax_t upload_limit) {
     const auto run = [handler](const std::string& operation, const nlohmann::json& args,
                                httplib::Response& response) {
         if (!handler) {
@@ -264,14 +422,72 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler) 
     server->Get("/api/file", [run](const httplib::Request&, httplib::Response& response) {
         run("file.list", nlohmann::json::object(), response);
     });
-    server->Post("/api/file", [run](const httplib::Request& request,
-                                    httplib::Response& response) {
-        const Result<nlohmann::json> args = upload_args_from_body(request);
-        if (!ok(args)) {
-            respond(response, *error_of(args));
+    // 上传：**请求体就是文件内容**（流式）。Java / Python 客户端直接推字节流，
+    // 不再要求文件在服务端本地有路径——那对远端客户端没有意义。
+    // 边收边写 temp/、**边判上限**（超了立刻中止并删掉暂存文件），
+    // 落盘后再交给业务层补算 MD5 并入库（一次移动，不二次拷贝）。
+    // 文件名：?name=xxx，或请求头 Content-Disposition 的 filename / filename*。
+    server->Post("/api/file/upload",
+                 [run, data_root, upload_limit](const httplib::Request& request,
+                                                httplib::Response& response,
+                                                const httplib::ContentReader& reader) {
+        const std::string file_name = upload_file_name(request);
+        if (file_name.empty()) {
+            drain_reader(reader);  // 不读完就回，客户端会拿到"没有响应"
+            respond(response,
+                    make_error(ErrorCode::FileNameEmpty,
+                               "流式上传要给文件名：查询串 ?name=xxx，或请求头 "
+                               "Content-Disposition: attachment; filename=\"x.jar\""));
             return;
         }
-        run("file.upload", std::get<nlohmann::json>(args), response);
+
+        // 暂存文件必须在 temp/ 下、且带 fmt- 前缀：服务启动时的清理只收这一种，
+        // 中断留下的碎片下次启动会被收走（10 分钟年龄保护，见 clean_temp_directory）。
+        const std::filesystem::path temp_path =
+            PathManager(path_from_utf8(data_root)).temp() / path_from_utf8(unique_staged_name());
+
+        std::uintmax_t written = 0;
+        bool too_large = false;
+        bool write_failed = false;
+        {
+            std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                respond(response, make_error(ErrorCode::StorageError,
+                                             "无法创建暂存文件：" + path_to_utf8(temp_path)));
+                return;
+            }
+            reader([&](const char* data, std::size_t length) -> bool {
+                if (upload_limit > 0 && written + length > upload_limit) {
+                    too_large = true;
+                    return false;  // 中止接收：剩下的一律不落盘
+                }
+                out.write(data, static_cast<std::streamsize>(length));
+                if (!out) {
+                    write_failed = true;
+                    return false;
+                }
+                written += length;
+                return true;
+            });
+            out.close();
+        }
+
+        if (too_large || write_failed) {
+            std::error_code ignored;
+            std::filesystem::remove(temp_path, ignored);
+            respond(response,
+                    too_large ? make_error(ErrorCode::SizeLimitExceeded,
+                                           "文件超过上传上限（已收 " + std::to_string(written) +
+                                               " 字节，上限 " + std::to_string(upload_limit) +
+                                               " 字节）")
+                              : make_error(ErrorCode::StorageError, "写入暂存文件失败"));
+            return;
+        }
+
+        nlohmann::json args = nlohmann::json::object();
+        args["argv"] =
+            nlohmann::json::array({path_to_utf8(temp_path), file_name});
+        run("file.upload_stream", args, response);
     });
     server->Get(R"(/api/file/([^/]+))",
                 [run](const httplib::Request& request, httplib::Response& response) {
@@ -282,6 +498,40 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler) 
                        // 跨 Bucket 删除要先确认：?dry_run=1 预检、?force=1 执行。
                        run("file.delete", delete_args(request, request.matches[1]), response);
                    });
+
+    // 下载与预览：流式回文件内容。注册顺序无所谓——`([^/]+)` 匹配不到含 `/` 的路径，
+    // 所以 /api/file/<id>/download 不会落到上面那条通用路由上。
+    register_content_route(server, handler, data_root, /*preview=*/false);
+    register_content_route(server, handler, data_root, /*preview=*/true);
+
+    // 公开的分享下载：**唯一不要 token 的接口**（分享链接本身就是凭证）。
+    // 先由业务层记账（有效性 / 文件状态 / 次数，见开发文档 §50 §51），
+    // 记账通过后才把内容流出去——计数写不进去就不放行，避免超发。
+    server->Get(R"(/api/share/([^/]+)/download)",
+                [handler, data_root](const httplib::Request& request,
+                                     httplib::Response& response) {
+                    if (!handler) {
+                        respond(response, make_error(ErrorCode::ServiceOperationFailed,
+                                                     "HTTP 未接入业务处理"));
+                        return;
+                    }
+                    const Result<nlohmann::json> got =
+                        handler("share.download", args_with_encoded_name(request.matches[1]));
+                    if (!ok(got)) {
+                        respond(response, got);
+                        return;
+                    }
+                    const nlohmann::json& data = std::get<nlohmann::json>(got);
+                    const Result<std::filesystem::path> path =
+                        resolve_inside_root(data_root, data.value("path", std::string{}));
+                    if (!ok(path)) {
+                        respond(response, *error_of(path));
+                        return;
+                    }
+                    const std::string file_name = data.value("file_name", std::string{});
+                    stream_file(response, std::get<std::filesystem::path>(path),
+                                content_type_of(file_name), "attachment", file_name);
+                });
 
     // 分享（数据面）。管理接口都要 token —— 认证在 pre-routing 钩子里统一做，
     // 这里不重复判断（“漏给某条路由加认证”正是这类代码最容易出的事故）。
@@ -340,7 +590,8 @@ HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
 HttpServer::~HttpServer() { stop(); }
 
 Status HttpServer::start(const std::string& host, int port, std::string data_root, Logger* logger,
-                         BusinessHandler handler, TokenVerifier verifier) {
+                         BusinessHandler handler, TokenVerifier verifier,
+                         std::uintmax_t max_upload_size) {
     if (impl_->running.load()) {
         return make_error(ErrorCode::InvalidArgument, "HTTP 服务已经在运行");
     }
@@ -392,7 +643,8 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
                        });
 
     // 业务路由：与命名管道共用同一份实现（见 register_business_routes）。
-    register_business_routes(impl_->server.get(), std::move(handler));
+    register_business_routes(impl_->server.get(), std::move(handler),
+                                impl_->state->data_root, max_upload_size);
 
     // 兜底：已经登记的模块里还没实现的操作。
     impl_->server->Get(R"(/api/.*)", [](const httplib::Request& request,

@@ -393,6 +393,46 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
                                     const nlohmann::json& args) {
     FileService files(*context.paths, context.config, context.logger.get());
 
+    if (operation == "file.upload_stream") {
+        // **流式上传的第二段**：数据已经由 HTTP 层边收边写落在 temp/ 里，
+        // 这里补算大小与 MD5 并入库（一次移动，不二次拷贝）。
+        // 文件名由 HTTP 层从 ?name= 或 Content-Disposition 里取出来传进来。
+        const Result<std::string> staged = argument(args, 0, "暂存文件路径");
+        if (!ok(staged)) {
+            return *error_of(staged);
+        }
+        std::string name;
+        if (const Result<std::string> given = argument(args, 1, "文件名"); ok(given)) {
+            name = std::get<std::string>(given);
+        }
+
+        Result<PreparedUpload> prepared =
+            prepare_staged_upload(*context.paths, path_from_utf8(std::get<std::string>(staged)), name,
+                                  context.config.max_upload_size, context.logger.get());
+        if (!ok(prepared)) {
+            // 暂存文件的生命周期到这里为止：失败就地清掉，别留在 temp/ 里。
+            std::error_code ignored;
+            std::filesystem::remove(path_from_utf8(std::get<std::string>(staged)), ignored);
+            return *error_of(prepared);
+        }
+
+        FileService files(*context.paths, context.config, context.logger.get());
+        const Result<FileRecord> record = files.commit_upload(std::get<PreparedUpload>(prepared));
+        if (!ok(record)) {
+            return *error_of(record);  // commit_upload 自己负责删暂存文件
+        }
+        const FileRecord& saved = std::get<FileRecord>(record);
+        nlohmann::json data = nlohmann::json::object();
+        data["file_id"] = saved.file_id;
+        data["file_name"] = saved.file_name;
+        data["size"] = saved.size;
+        data["md5"] = saved.md5;
+        data["extension"] = saved.extension;
+        data["file_type"] = saved.file_type;
+        data["bucket"] = saved.bucket;
+        data["message"] = "流式上传完成：" + saved.file_name + "（" + saved.file_id + "）";
+        return data;
+    }
     if (operation == "file.list") {
         const Result<std::vector<FileRecord>> items = files.list();
         if (!ok(items)) {
@@ -473,6 +513,13 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
         data["size"] = found.size;
         data["md5"] = found.md5;
         data["is_trash"] = found.is_trash;
+
+        // 相对数据根的路径：HTTP 的下载/预览要按它去读文件。
+        // **只给单条查询**，列表不加——用户明确要求列表只输出文件信息。
+        if (const Result<std::filesystem::path> absolute = files.resolve_path(found); ok(absolute)) {
+            data["path"] = relative_path_text(context.paths->root(),
+                                             std::get<std::filesystem::path>(absolute));
+        }
         data["trash_reason"] = found.trash_reason;
 
         const Result<std::filesystem::path> path = files.resolve_path(found);
@@ -813,6 +860,13 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
         data["file_name"] = record.file_name;
         data["size"] = record.size;
         data["md5"] = record.md5;
+        // 相对路径：公开的分享下载端点要按它去读文件（计数已经在上一步记好）
+        FileService files(*context.paths, context.config, context.logger.get());
+        if (const Result<std::filesystem::path> absolute = files.resolve_path(record);
+            ok(absolute)) {
+            data["path"] = relative_path_text(context.paths->root(),
+                                             std::get<std::filesystem::path>(absolute));
+        }
         data["message"] = "下载计数已记账：" + record.file_name;
         return data;
     }
