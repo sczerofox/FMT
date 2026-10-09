@@ -1,5 +1,4 @@
 #include "fmt/service/runtime.hpp"
-
 #include <chrono>
 #include <thread>
 #include <utility>
@@ -10,6 +9,7 @@
 #include "fmt/file/file.hpp"
 #include "fmt/ipc/protocol.hpp"
 #include "fmt/service/commands.hpp"
+#include "fmt/user/user.hpp"
 
 namespace fmt::service {
 namespace {
@@ -315,7 +315,21 @@ void ServerRuntime::restart_http() {
     };
 
     auto created = std::make_unique<server::HttpServer>();
-    const Status started = created->start(host, port, root, logger, std::move(handler));
+
+    // token 校验：HTTP 层不认识账号，把这件事交给服务——只有它拿得到
+    // data/user.json 与 config。找不到用户就返回空串，HTTP 层答 401。
+    server::TokenVerifier verifier = [this](const std::string& token) -> std::string {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (context_ == nullptr) {
+            return {};
+        }
+        UserStore store(*context_->paths, context_->config);
+        const Result<UserRecord> found = store.find_by_token(token);
+        return ok(found) ? std::get<UserRecord>(found).username : std::string{};
+    };
+
+    const Status started =
+        created->start(host, port, root, logger, std::move(handler), std::move(verifier));
     if (!ok(started)) {
         // 端口被占用等：记 ERROR 日志，但**不中断**服务的其他功能。
         if (logger != nullptr) {

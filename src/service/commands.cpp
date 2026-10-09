@@ -10,6 +10,7 @@
 #include "fmt/file/file.hpp"
 #include "fmt/share/share.hpp"
 #include "fmt/trash/trash.hpp"
+#include "fmt/user/user.hpp"
 
 namespace fmt::service {
 namespace {
@@ -441,7 +442,7 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
         nlohmann::json data = nlohmann::json::object();
         data["files"] = std::move(array);
         data["count"] = data["files"].size();
-        data["current_bucket"] = context.config.current_bucket;
+        // **只输出文件的信息**（用户要求）：不再附带 current_bucket 之类的环境字段。
         data["sort"] = sort;
         return data;
     }
@@ -640,6 +641,18 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
         data["size_unit"] = context.config.size_unit;
         data["language"] = context.config.language;
         data["path"] = relative_path_text(context.paths->root(), context.paths->config_file());
+
+        // HTTP 管理接口的访问 token（data/user.json 里那个）。放在这里是因为
+        // 否则用户没有任何办法拿到它——CLI 是这个数据根唯一的管理入口。
+        UserStore store(*context.paths, context.config);
+        if (const Result<UserRecord> user = store.find_by_name(context.config.current_user);
+            ok(user)) {
+            const UserRecord& record = std::get<UserRecord>(user);
+            data["user_id"] = record.user_id;
+            data["token"] = record.token;
+            data["user_created_at"] = record.created_at;
+            data["last_login_at"] = record.last_login_at;
+        }
         return data;
     }
 

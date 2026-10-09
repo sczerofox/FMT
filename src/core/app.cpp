@@ -6,6 +6,7 @@
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/storage/storage.hpp"
+#include "fmt/user/user.hpp"
 
 namespace fmt {
 namespace {
@@ -131,6 +132,15 @@ Result<std::unique_ptr<PathManager>> initialize_root(const std::filesystem::path
         if (const Status status = save_config(*paths, loaded); !ok(status)) {
             return *error_of(status);
         }
+    }
+
+    // 账号：HTTP 管理接口的 token 来自 data/user.json。首次运行在这里建默认用户
+    // （用户名取 current_user，默认 "user"），已存在就原样留着、**不覆盖**。
+    // 初始密码不在这里回报：V1 没有登录接口，真正当凭证用的是 token，
+    // 而 token 可以用 `config list` 读出来。
+    if (const Result<UserRecord> user = UserStore(*paths, loaded).ensure_default(nullptr);
+        !ok(user)) {
+        return *error_of(user);
     }
 
     if (auto server = load_server_config(*paths); !ok(server)) {

@@ -71,6 +71,8 @@ int http_status_for(ErrorCode code) {
             return 409;
         case ErrorCode::RouteNotFound:
             return 404;
+        case ErrorCode::Unauthorized:
+            return 401;  // 缺 token / token 不对
         case ErrorCode::ServiceOperationFailed:
             // 「服务端还没实现这个接口」是 501，不是 500：500 等于说服务器坏了，
             // 而真相是这个功能还没做（share 就属于这一类）。
@@ -90,6 +92,31 @@ nlohmann::json args_with_name(std::string name) {
 
 nlohmann::json args_with_encoded_name(const std::string& encoded) {
     return args_with_name(url_decode(encoded));
+}
+
+// ---- 访问凭证（token）----
+
+// 不需要 token 的路径：只有健康检查与「别人拿分享链接下载」。
+// 分享链接本身就是凭证（share_id 是随机 12 位十六进制），那一步不该再要 token。
+bool is_public_path(const std::string& path) {
+    if (path == "/api/ping") {
+        return true;
+    }
+    return starts_with(path, "/api/share/") && ends_with(path, "/download");
+}
+
+// 接受两种写法：`X-FMT-Token: <token>` 与 `Authorization: Bearer <token>`。
+std::string header_token(const httplib::Request& request) {
+    if (request.has_header("X-FMT-Token")) {
+        return trim(request.get_header_value("X-FMT-Token"));
+    }
+    if (request.has_header("Authorization")) {
+        const std::string value = request.get_header_value("Authorization");
+        if (starts_with(value, "Bearer ")) {
+            return trim(value.substr(7));
+        }
+    }
+    return {};
 }
 
 // 请求体：接受 {"name":"工作"}，也接受与管道一致的 {"argv":["工作"]}。
@@ -213,31 +240,6 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler) 
         respond(response, handler(operation, args));
     };
 
-    server->Get("/api/bucket", [run](const httplib::Request&, httplib::Response& response) {
-        run("bucket.list", nlohmann::json::object(), response);
-    });
-    server->Post("/api/bucket", [run](const httplib::Request& request,
-                                      httplib::Response& response) {
-        const Result<nlohmann::json> args = args_from_body(request);
-        if (!ok(args)) {
-            respond(response, *error_of(args));
-            return;
-        }
-        run("bucket.create", std::get<nlohmann::json>(args), response);
-    });
-    server->Post(R"(/api/bucket/([^/]+)/use)",
-                 [run](const httplib::Request& request, httplib::Response& response) {
-                     run("bucket.use", args_with_encoded_name(request.matches[1]), response);
-                 });
-    server->Get(R"(/api/bucket/([^/]+))",
-                [run](const httplib::Request& request, httplib::Response& response) {
-                    run("bucket.get", args_with_encoded_name(request.matches[1]), response);
-                });
-    server->Delete(R"(/api/bucket/([^/]+))",
-                   [run](const httplib::Request& request, httplib::Response& response) {
-                       run("bucket.delete", args_with_encoded_name(request.matches[1]), response);
-                   });
-
     // 回收站（桶级）：GET /api/trash 列条目、POST /api/trash/<名字>/restore 回退。
     server->Get("/api/trash", [run](const httplib::Request&, httplib::Response& response) {
         run("trash.list", nlohmann::json::object(), response);
@@ -280,6 +282,46 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler) 
                        // 跨 Bucket 删除要先确认：?dry_run=1 预检、?force=1 执行。
                        run("file.delete", delete_args(request, request.matches[1]), response);
                    });
+
+    // 分享（数据面）。管理接口都要 token —— 认证在 pre-routing 钩子里统一做，
+    // 这里不重复判断（“漏给某条路由加认证”正是这类代码最容易出的事故）。
+    // 「别人拿分享链接下载」是唯一公开的一条，属于流式下载，下一步做。
+    server->Post("/api/share", [run](const httplib::Request& request,
+                                     httplib::Response& response) {
+        // 请求体：{"file_id": "fmt-20261009-0"}
+        nlohmann::json args = nlohmann::json::object();
+        if (!request.body.empty()) {
+            try {
+                const nlohmann::json body = nlohmann::json::parse(request.body);
+                const std::string file_id =
+                    body.is_object() ? body.value("file_id", std::string{}) : std::string{};
+                if (!file_id.empty()) {
+                    args["argv"] = nlohmann::json::array({file_id});
+                }
+            } catch (const nlohmann::json::exception&) {
+                respond(response, make_error(ErrorCode::JsonParseError, "请求体不是合法 JSON"));
+                return;
+            }
+        }
+        run("share.create", args, response);
+    });
+    server->Get("/api/share", [run](const httplib::Request& request,
+                                    httplib::Response& response) {
+        // 查询串：?file_id=fmt-20261009-0
+        nlohmann::json args = nlohmann::json::object();
+        if (request.has_param("file_id")) {
+            args["argv"] = nlohmann::json::array({request.get_param_value("file_id")});
+        }
+        run("share.list", args, response);
+    });
+    server->Get(R"(/api/share/([^/]+))",
+                [run](const httplib::Request& request, httplib::Response& response) {
+                    run("share.get", args_with_encoded_name(request.matches[1]), response);
+                });
+    server->Delete(R"(/api/share/([^/]+))",
+                   [run](const httplib::Request& request, httplib::Response& response) {
+                       run("share.delete", args_with_encoded_name(request.matches[1]), response);
+                   });
 }
 
 }  // namespace
@@ -298,7 +340,7 @@ HttpServer::HttpServer() : impl_(std::make_unique<Impl>()) {}
 HttpServer::~HttpServer() { stop(); }
 
 Status HttpServer::start(const std::string& host, int port, std::string data_root, Logger* logger,
-                         BusinessHandler handler) {
+                         BusinessHandler handler, TokenVerifier verifier) {
     if (impl_->running.load()) {
         return make_error(ErrorCode::InvalidArgument, "HTTP 服务已经在运行");
     }
@@ -308,6 +350,31 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
     impl_->state->logger = logger;
 
     impl_->server = std::make_unique<httplib::Server>();
+
+    // **认证只有这一处**：路由之前的钩子。放在这里而不是每个路由里，
+    // 是因为「漏给某条路由加认证」正是这类代码最容易出的事故。
+    // 没有注入校验器时**一律拒绝**（默认关着），免得哪天忘了注入就裸奔。
+    impl_->server->set_pre_routing_handler(
+        [verifier](const httplib::Request& request,
+                   httplib::Response& response) -> httplib::Server::HandlerResponse {
+            if (!starts_with(request.path, "/api/") || is_public_path(request.path)) {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            const std::string token = header_token(request);
+            const std::string username =
+                (verifier && !token.empty()) ? verifier(token) : std::string{};
+            if (!username.empty()) {
+                return httplib::Server::HandlerResponse::Unhandled;
+            }
+            response.status = 401;
+            response.set_content(
+                dump(envelope_error(make_error(
+                    ErrorCode::Unauthorized,
+                    "缺少或无效的访问 token：请求头用 X-FMT-Token: <token>，"
+                    "或 Authorization: Bearer <token>（token 在 data/user.json 里）"))),
+                kJsonContentType);
+            return httplib::Server::HandlerResponse::Handled;
+        });
 
     impl_->server->Get("/api/ping", [](const httplib::Request&, httplib::Response& response) {
         response.set_content(dump(envelope_ok(nlohmann::json::object())), kJsonContentType);
@@ -334,11 +401,12 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
         //   已知模块但还没实现（例如 /api/share/...）→ 404? 不：**501** Not Implemented
         //   完全没这个路径（例如打错字）            → **404** Not Found
         const std::string& path = request.path;
+        // 注意：**bucket 不在里面**。用户明确不要 HTTP 桶接口（桶由 CLI 管），
+        // 所以 /api/bucket 走 404「没有这个接口」，而不是 501「还没实现」。
         const bool known_module =
-            starts_with(path, "/api/bucket") || starts_with(path, "/api/file") ||
-            starts_with(path, "/api/trash") || starts_with(path, "/api/share") ||
-            starts_with(path, "/api/config") || starts_with(path, "/api/server") ||
-            starts_with(path, "/api/preview");
+            starts_with(path, "/api/file") || starts_with(path, "/api/trash") ||
+            starts_with(path, "/api/share") || starts_with(path, "/api/config") ||
+            starts_with(path, "/api/server") || starts_with(path, "/api/preview");
         if (known_module) {
             response.status = 501;
             response.set_content(

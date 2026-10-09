@@ -16,15 +16,37 @@
 #include "fmt_test.hpp"
 #include "temp_dir.hpp"
 
+namespace {
+
+// 测试用的固定 token。HTTP 层要求注入校验器（没注入一律 401），
+// 这里给一个只认这一个 token 的校验器；测 401 的用例会显式不带它。
+constexpr const char* kTestToken = "test-token-0123456789abcdef";
+
+fmt::server::TokenVerifier test_verifier() {
+    return [](const std::string& token) -> std::string {
+        return token == kTestToken ? std::string("user") : std::string{};
+    };
+}
+
+// 默认带上 token 头的客户端（每个请求都带，省得每处手写）
+httplib::Client test_client(const fmt::server::HttpServer& server) {
+    httplib::Client client("127.0.0.1", server.port());
+    client.set_default_headers({{"X-FMT-Token", kTestToken}});
+    client.set_default_headers({{"X-FMT-Token", kTestToken}});
+    return client;
+}
+
+}  // namespace
 FMT_TEST(Server, 启动监听并应答状态) {
     fmt::server::HttpServer server;
     // 端口传 0：让系统分配一个空闲端口，测试不会撞上 4122 被占。
-    const fmt::Status started = server.start("127.0.0.1", 0, R"(D:\FMT)", nullptr);
+    const fmt::Status started = server.start("127.0.0.1", 0, R"(D:\FMT)", nullptr, {}, test_verifier());
     FMT_CHECK(fmt::ok(started));
     FMT_CHECK(server.running());
     FMT_CHECK(server.port() > 0);
 
     httplib::Client client("127.0.0.1", server.port());
+    client.set_default_headers({{"X-FMT-Token", kTestToken}});
     const auto response = client.Get("/api/status");
     FMT_CHECK(response != nullptr);
     if (response != nullptr) {
@@ -41,9 +63,10 @@ FMT_TEST(Server, 启动监听并应答状态) {
 
 FMT_TEST(Server, 未知路由返回错误信封) {
     fmt::server::HttpServer server;
-    FMT_CHECK(fmt::ok(server.start("127.0.0.1", 0, R"(C:\FMT)", nullptr)));
+    FMT_CHECK(fmt::ok(server.start("127.0.0.1", 0, R"(C:\FMT)", nullptr, {}, test_verifier())));
 
     httplib::Client client("127.0.0.1", server.port());
+    client.set_default_headers({{"X-FMT-Token", kTestToken}});
 
     // 已知模块但没这个接口 → **501 Not Implemented**
     //（原来是 500，等于说「服务器坏了」；而这只是「这个接口没做」）
@@ -90,183 +113,66 @@ FMT_TEST(Server, 绑不上地址时返回错误而不是崩溃) {
     // 10.255.255.1 不是本机地址，绑不上。
     // 不用「同端口再绑一次」来测：Windows 的 SO_REUSEADDR 允许重复绑定同一端口
     // （与 Linux 语义相反），那样测不出失败路径。
-    const fmt::Status failed = server.start("10.255.255.1", 4122, R"(D:\FMT)", nullptr);
+    const fmt::Status failed = server.start("10.255.255.1", 4122, R"(D:\FMT)", nullptr, {}, test_verifier());
     FMT_CHECK(!fmt::ok(failed));
     FMT_CHECK(fmt::error_of(failed)->code == fmt::ErrorCode::ServiceOperationFailed);
     FMT_CHECK(!server.running());
     FMT_CHECK_EQ(server.port(), 0);
 }
 
-FMT_TEST(Server, Bucket路由与状态码) {
-    fmt_test::TempDir temp("server-bucket");
-    const auto root = temp / "FMT";
-
-    auto context = fmt::initialize_service_context(root);
-    FMT_CHECK(fmt::ok(context));
-    fmt::AppContext& app = *std::get<std::unique_ptr<fmt::AppContext>>(context);
-
-    // HTTP 与管道共用这一份业务实现
-    auto handler = [&app](const std::string& operation, const nlohmann::json& args) {
-        return fmt::service::execute_business(app, operation, args);
-    };
-
+FMT_TEST(Server, 管理接口要token且桶路由已下线) {
+    fmt_test::TempDir temp("server-auth");
+    const auto root = temp / "root";
     fmt::server::HttpServer server;
-    FMT_CHECK(fmt::ok(server.start("127.0.0.1", 0, fmt::path_to_utf8(root), app.logger.get(),
-                                   handler)));
-    httplib::Client client("127.0.0.1", server.port());
+    FMT_CHECK(fmt::ok(server.start("127.0.0.1", 0, fmt::path_to_utf8(root), nullptr, {}, test_verifier())));
 
-    // 创建
-    const auto created = client.Post("/api/bucket", R"({"name":"工作"})", "application/json");
-    FMT_CHECK(created != nullptr);
-    if (created != nullptr) {
-        FMT_CHECK_EQ(created->status, 200);
-        const nlohmann::json body = nlohmann::json::parse(created->body);
-        FMT_CHECK(body["ok"].get<bool>());
-        FMT_CHECK_EQ(body["data"]["bucket"].get<std::string>(), std::string("工作"));
-    }
-
-    // 列表
-    const auto listed = client.Get("/api/bucket");
-    FMT_CHECK(listed != nullptr);
-    if (listed != nullptr) {
-        FMT_CHECK_EQ(listed->status, 200);
-        const nlohmann::json body = nlohmann::json::parse(listed->body);
-        FMT_CHECK_EQ(body["data"]["buckets"].size(), std::size_t{1});
-    }
-
-    // 路径参数里的中文：客户端编码，服务端解码
-    const auto one = client.Get("/api/bucket/" + fmt::url_encode("工作"));
-    FMT_CHECK(one != nullptr);
-    if (one != nullptr) {
-        FMT_CHECK_EQ(one->status, 200);
-        const nlohmann::json body = nlohmann::json::parse(one->body);
-        FMT_CHECK_EQ(body["data"]["bucket"].get<std::string>(), std::string("工作"));
-        FMT_CHECK(body["data"]["is_current"].get<bool>());
-    }
-
-    // 不存在 -> 404 + FMT-200
-    const auto missing = client.Get("/api/bucket/nope");
-    FMT_CHECK(missing != nullptr);
-    if (missing != nullptr) {
-        FMT_CHECK_EQ(missing->status, 404);
-        FMT_CHECK_EQ(nlohmann::json::parse(missing->body)["error"]["code"].get<std::string>(),
-                     std::string("FMT-200"));
-    }
-
-    // 名称非法 -> 400 + FMT-202
-    const auto bad = client.Post("/api/bucket", R"({"name":"a/b"})", "application/json");
-    FMT_CHECK(bad != nullptr);
-    if (bad != nullptr) {
-        FMT_CHECK_EQ(bad->status, 400);
-        FMT_CHECK_EQ(nlohmann::json::parse(bad->body)["error"]["code"].get<std::string>(),
-                     std::string("FMT-202"));
-    }
-
-    // use
-    const auto used =
-        client.Post("/api/bucket/" + fmt::url_encode("工作") + "/use", "", "application/json");
-    FMT_CHECK(used != nullptr);
-    if (used != nullptr) {
-        FMT_CHECK_EQ(used->status, 200);
-    }
-
-    // delete
-    std::string trashed;
-    const auto removed = client.Delete("/api/bucket/" + fmt::url_encode("工作"));
-    FMT_CHECK(removed != nullptr);
-    if (removed != nullptr) {
-        FMT_CHECK_EQ(removed->status, 200);
-        const nlohmann::json body = nlohmann::json::parse(removed->body);
-        FMT_CHECK(body["ok"].get<bool>());
-        FMT_CHECK_EQ(body["data"]["moved_to"].get<std::string>().rfind("trash/", 0), std::size_t{0});
-        // 回收站里的名字一律带时间戳
-        trashed = body["data"]["trashed_name"].get<std::string>();
-        FMT_CHECK_EQ(trashed.rfind("工作_", 0), std::size_t{0});
-    }
-
-    // 回收站：GET /api/trash
-    const auto trash = client.Get("/api/trash");
-    FMT_CHECK(trash != nullptr);
-    if (trash != nullptr) {
-        FMT_CHECK_EQ(trash->status, 200);
-        const nlohmann::json body = nlohmann::json::parse(trash->body);
-        FMT_CHECK_EQ(body["data"]["entries"].size(), std::size_t{1});
-        FMT_CHECK_EQ(body["data"]["entries"][0].value("type", std::string{}), std::string("bucket"));
-        FMT_CHECK_EQ(body["data"]["entries"][0].value("name", std::string{}),
-                     std::string("工作"));
-    }
-
-    // POST /api/trash/<名字>/restore：回退后桶回到 repository
-    if (!trashed.empty()) {
-        const auto restored =
-            client.Post("/api/trash/" + fmt::url_encode(trashed) + "/restore", "", "application/json");
-        FMT_CHECK(restored != nullptr);
-        if (restored != nullptr) {
-            FMT_CHECK_EQ(restored->status, 200);
-            const nlohmann::json body = nlohmann::json::parse(restored->body);
-            FMT_CHECK_EQ(body["data"]["entry"].value("name", std::string{}), std::string("工作"));
+    // ① 不带 token：管理接口一律 401 + FMT-018
+    {
+        httplib::Client anonymous("127.0.0.1", server.port());
+        const auto response = anonymous.Get("/api/file");
+        FMT_CHECK(response != nullptr);
+        if (response != nullptr) {
+            FMT_CHECK_EQ(response->status, 401);
+            const nlohmann::json body = nlohmann::json::parse(response->body);
+            FMT_CHECK_EQ(body["error"]["code"].get<std::string>(), std::string("FMT-018"));
         }
     }
-    const auto back = client.Get("/api/bucket/" + fmt::url_encode("工作"));
-    FMT_CHECK(back != nullptr);
-    if (back != nullptr) {
-        FMT_CHECK_EQ(back->status, 200);
+
+    // ② token 不对：同样 401
+    {
+        httplib::Client wrong("127.0.0.1", server.port());
+        wrong.set_default_headers({{"X-FMT-Token", "not-the-token"}});
+        const auto response = wrong.Get("/api/file");
+        FMT_CHECK(response != nullptr && response->status == 401);
     }
 
-    // 再删一次，测 trash get 与永久删除（DELETE 需要显式 force）
-    const auto removed_again = client.Delete("/api/bucket/" + fmt::url_encode("工作"));
-    FMT_CHECK(removed_again != nullptr);
-    std::string second;
-    if (removed_again != nullptr && removed_again->status == 200) {
-        second = nlohmann::json::parse(removed_again->body)["data"]["trashed_name"]
-                     .get<std::string>();
+    // ③ Authorization: Bearer 也要认
+    {
+        httplib::Client bearer("127.0.0.1", server.port());
+        bearer.set_default_headers({{"Authorization", std::string("Bearer ") + kTestToken}});
+        const auto response = bearer.Get("/api/status");
+        FMT_CHECK(response != nullptr && response->status == 200);
     }
-    FMT_CHECK(!second.empty());
 
-    if (!second.empty()) {
-        const auto detail = client.Get("/api/trash/" + fmt::url_encode(second));
-        FMT_CHECK(detail != nullptr);
-        if (detail != nullptr) {
-            FMT_CHECK_EQ(detail->status, 200);
-            const nlohmann::json body = nlohmann::json::parse(detail->body);
-            FMT_CHECK_EQ(body["data"]["entry"].value("name", std::string{}), std::string("工作"));
-            FMT_CHECK(body["data"]["entry"].value("present", false));
-        }
+    // ④ 健康检查不需要 token（唯一的公开读接口）
+    {
+        httplib::Client anonymous("127.0.0.1", server.port());
+        const auto response = anonymous.Get("/api/ping");
+        FMT_CHECK(response != nullptr && response->status == 200);
+    }
 
-        // 预检：?dry_run=1 要把要永久删掉的东西说清楚，且不改数据
-        const auto plan = client.Delete("/api/trash/" + fmt::url_encode(second) + "?dry_run=1");
-        FMT_CHECK(plan != nullptr);
-        if (plan != nullptr) {
-            FMT_CHECK_EQ(plan->status, 200);
-            const nlohmann::json body = nlohmann::json::parse(plan->body);
-            FMT_CHECK(body["data"]["needs_confirm"].get<bool>());
-            FMT_CHECK_EQ(body["data"]["entry"].value("name", std::string{}), std::string("工作"));
-            FMT_CHECK(body["data"]["entry"].contains("files"));
-        }
-
-        // 没确认 -> 400 + FMT-016（需要显式确认）
-        const auto refused = client.Delete("/api/trash/" + fmt::url_encode(second));
-        FMT_CHECK(refused != nullptr);
-        if (refused != nullptr) {
-            FMT_CHECK_EQ(refused->status, 400);
-            FMT_CHECK_EQ(
-                nlohmann::json::parse(refused->body)["error"]["code"].get<std::string>(),
-                std::string("FMT-016"));
-        }
-
-        // ?force=1 -> 真的删掉
-        const auto purged = client.Delete("/api/trash/" + fmt::url_encode(second) + "?force=1");
-        FMT_CHECK(purged != nullptr);
-        if (purged != nullptr) {
-            FMT_CHECK_EQ(purged->status, 200);
-        }
-
-        const auto empty_trash = client.Get("/api/trash");
-        FMT_CHECK(empty_trash != nullptr);
-        if (empty_trash != nullptr) {
-            FMT_CHECK_EQ(
-                nlohmann::json::parse(empty_trash->body)["data"]["entries"].size(),
-                std::size_t{0});
+    // ⑤ 桶接口已下线（用户明确不要 HTTP 桶接口）：404「没有这个接口」，不是 501
+    {
+        httplib::Client client("127.0.0.1", server.port());
+        client.set_default_headers({{"X-FMT-Token", kTestToken}});
+        for (const char* path : {"/api/bucket", "/api/bucket/x"}) {
+            const auto response = client.Get(path);
+            FMT_CHECK(response != nullptr);
+            if (response != nullptr) {
+                FMT_CHECK_EQ(response->status, 404);
+                const nlohmann::json body = nlohmann::json::parse(response->body);
+                FMT_CHECK_EQ(body["error"]["code"].get<std::string>(), std::string("FMT-017"));
+            }
         }
     }
 
@@ -325,8 +231,9 @@ FMT_TEST(Server, File路由与上传) {
 
     fmt::server::HttpServer server;
     FMT_CHECK(fmt::ok(server.start("127.0.0.1", 0, fmt::path_to_utf8(root), app.logger.get(),
-                                   handler)));
+                                   handler, test_verifier())));
     httplib::Client client("127.0.0.1", server.port());
+    client.set_default_headers({{"X-FMT-Token", kTestToken}});
 
     // 空请求体 -> 400 + FMT-001
     const auto empty_body = client.Post("/api/file", "", "application/json");

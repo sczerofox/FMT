@@ -21,6 +21,12 @@ namespace fmt::server {
 using BusinessHandler =
     std::function<Result<nlohmann::json>(const std::string& operation, const nlohmann::json& args)>;
 
+// token 校验器：传进来的 token 有效就返回**用户名**，无效返回空串。
+// 由服务的运行体注入（它才拿得到 data/user.json 与 config）。
+// **默认拒绝**：没注入校验器时，管理接口一律 401——HTTP 层不认识账号，
+// 但它必须默认是关着的，免得哪天忘了注入就变成裸奔。
+using TokenVerifier = std::function<std::string(const std::string& token)>;
+
 class HttpServer {
 public:
     HttpServer();
@@ -32,7 +38,7 @@ public:
     // 绑定端口并起监听线程。port 传 0 表示让系统分配（测试用）。
     // 绑定失败（端口被占用等）返回错误：调用方记 ERROR 日志，但**不中断**其他功能。
     Status start(const std::string& host, int port, std::string data_root, Logger* logger,
-                 BusinessHandler handler = {});
+                 BusinessHandler handler, TokenVerifier verifier);
 
     // 停止监听并等线程结束；可重复调用。
     void stop();
