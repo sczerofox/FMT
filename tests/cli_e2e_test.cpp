@@ -176,8 +176,19 @@ public:
         runtime_ = std::make_unique<fmt::service::ServerRuntime>(deploy_, temp_.path() / "state");
         FMT_CHECK(fmt::ok(runtime_->start()));
         runner_ = std::thread([this] { runtime_->run(); });
-        // CLI 侧的 connect_waiting 会重试，所以这里只需要给 accept 循环一点时间起来
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // 等 accept 循环**真的**开始监听再交出去。原来只 sleep 300ms：机器一忙，
+        // 第一条命令就撞上「还没起来」，表现成「没出现确认提示」这种看起来像功能
+        // 坏了的抖动（本机实测偶发过一次），很难查。
+        for (int attempt = 0; attempt < 100; ++attempt) {
+            fmt::Result<fmt::ipc::PipeClient> probe =
+                fmt::ipc::PipeClient::connect(100, pipe_.c_str());
+            if (fmt::ok(probe)) {
+                return;  // 连上就说明在监听了（这次连接不带请求，服务端会当作断开继续）
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        FMT_CHECK(false);  // 5 秒还起不来：就地失败，别让它变成后面的诡异现象
     }
 
     ~E2eFixture() {

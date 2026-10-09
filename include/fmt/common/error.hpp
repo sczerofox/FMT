@@ -36,6 +36,7 @@ enum class ErrorCode : int {
     ConsistencyError = 15,         // 数据一致性异常         退出码 6
     ConfirmRequired = 16,          // 该操作需要显式确认     退出码 2
     RouteNotFound = 17,            // 没有这个接口（HTTP 404）退出码 3
+    Unauthorized = 18,             // 缺少或无效的访问 token（HTTP 401）退出码 5
 
     // ---- FMT-1xx 文件名校验 ----
     FileNameEmpty = 100,           // 文件名为空             退出码 2
