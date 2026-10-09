@@ -36,7 +36,7 @@ struct ServerConfig {
 
     int version = kVersion;
     bool enabled = false;  // 默认关闭；安装流程在启用网络服务时置为 true
-    std::string host = "127.0.0.1";
+    std::string host = "localhost";  // 只监听本机；用户要求写 localhost 而不是 127.0.0.1
     int port = 4122;
 };
 

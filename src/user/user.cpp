@@ -71,13 +71,7 @@ UserRecord from_json(const nlohmann::json& item) {
     record.created_at = item.value("created_at", std::string{});
     record.updated_at = item.value("updated_at", std::string{});
     record.last_login_at = item.value("last_login_at", std::string{});
-    if (const auto buckets = item.find("buckets"); buckets != item.end() && buckets->is_array()) {
-        for (const nlohmann::json& name : *buckets) {
-            if (name.is_string()) {
-                record.buckets.push_back(name.get<std::string>());
-            }
-        }
-    }
+    // 老文件里的 "buckets" 一律**忽略**：桶以 repository/<user>/ 下的真实目录为准。
     return record;
 }
 
@@ -88,7 +82,6 @@ nlohmann::json to_json(const UserRecord& record) {
     item["password_hash"] = record.password_hash;
     item["password_salt"] = record.password_salt;
     item["token"] = record.token;
-    item["buckets"] = record.buckets;
     item["current_bucket"] = record.current_bucket;
     item["created_at"] = record.created_at;
     item["updated_at"] = record.updated_at;
@@ -195,7 +188,17 @@ Result<UserRecord> UserStore::ensure_default(std::string* created_password) {
         config_.current_user.empty() ? std::string("user") : config_.current_user;
     for (const UserRecord& existing : users) {
         if (existing.username == wanted) {
-            return existing;  // 已经建过：**不覆盖**（token 与密码都不动）
+            // 已经建过：**不覆盖**（token 与密码都不动）。
+            // 顺手做一次性迁移：老文件里那份 "buckets" 副本删掉（用户要求），
+            // 桶以 repository/<user>/ 下的真实目录为准。只在文件里还有它时才写，
+            // 免得每次启动都白写一遍。
+            if (Result<std::string> raw = read_text_file(paths_.user_data());
+                ok(raw) && std::get<std::string>(raw).find("\"buckets\"") != std::string::npos) {
+                if (const Status saved = save(users); !ok(saved)) {
+                    return *error_of(saved);
+                }
+            }
+            return existing;
         }
     }
 
@@ -212,16 +215,9 @@ Result<UserRecord> UserStore::ensure_default(std::string* created_password) {
         return make_error(ErrorCode::StorageError, "无法生成默认用户的凭证（CSPRNG 失败）");
     }
 
-    // 桶快照：写记录时刷一次（运行时权威仍是 config.json 与磁盘目录）
+    // current_bucket 只是快照（运行时权威是 config.json）。
+    // **桶列表不存副本**：以 repository/<user>/ 下的真实目录为准（用户要求）。
     created.current_bucket = config_.current_bucket;
-    std::error_code code;
-    const std::filesystem::path base = paths_.repository() / path_from_utf8(created.username);
-    for (const auto& entry : std::filesystem::directory_iterator(base, code)) {
-        std::error_code type_code;
-        if (entry.is_directory(type_code)) {
-            created.buckets.push_back(path_to_utf8(entry.path().filename()));
-        }
-    }
 
     users.push_back(created);
     if (const Status saved = save(users); !ok(saved)) {
@@ -277,7 +273,7 @@ Result<bool> UserStore::verify_password(std::string_view username, std::string_v
     return !computed.empty() && constant_time_equal(computed, record.password_hash);
 }
 
-Status UserStore::refresh_snapshot(std::string_view username) {
+Status UserStore::refresh_current_bucket(std::string_view username) {
     Result<std::vector<UserRecord>> loaded = load();
     if (!ok(loaded)) {
         return *error_of(loaded);
@@ -291,15 +287,6 @@ Status UserStore::refresh_snapshot(std::string_view username) {
         return make_error(ErrorCode::FileNotFound, "用户不存在：" + std::string(username));
     }
 
-    found->buckets.clear();
-    std::error_code code;
-    const std::filesystem::path base = paths_.repository() / path_from_utf8(found->username);
-    for (const auto& entry : std::filesystem::directory_iterator(base, code)) {
-        std::error_code type_code;
-        if (entry.is_directory(type_code)) {
-            found->buckets.push_back(path_to_utf8(entry.path().filename()));
-        }
-    }
     found->current_bucket = config_.current_bucket;
     found->updated_at = local_datetime_iso();
     return save(users);

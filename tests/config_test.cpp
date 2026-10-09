@@ -102,7 +102,7 @@ FMT_TEST(Config, 服务配置默认值) {
     const auto server = fmt::load_server_config(paths);
     FMT_CHECK(fmt::ok(server));
     FMT_CHECK_EQ(std::get<fmt::ServerConfig>(server).enabled, false);
-    FMT_CHECK_EQ(std::get<fmt::ServerConfig>(server).host, std::string("127.0.0.1"));
+    FMT_CHECK_EQ(std::get<fmt::ServerConfig>(server).host, std::string("localhost"));
     FMT_CHECK_EQ(std::get<fmt::ServerConfig>(server).port, 4122);
 
     fmt::ServerConfig enabled;
@@ -114,5 +114,5 @@ FMT_TEST(Config, 服务配置默认值) {
     FMT_CHECK(fmt::ok(reloaded));
     FMT_CHECK_EQ(std::get<fmt::ServerConfig>(reloaded).enabled, true);
     FMT_CHECK_EQ(std::get<fmt::ServerConfig>(reloaded).port, 4123);
-    FMT_CHECK_EQ(std::get<fmt::ServerConfig>(reloaded).host, std::string("127.0.0.1"));
+    FMT_CHECK_EQ(std::get<fmt::ServerConfig>(reloaded).host, std::string("localhost"));
 }

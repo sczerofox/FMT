@@ -11,7 +11,6 @@
 //         "password_hash": "<PBKDF2-SHA256 的十六进制>",
 //         "password_salt": "<16 字节随机盐的十六进制>",
 //         "token": "<32 位十六进制，**永久有效**>",
-//         "buckets": ["lazy"],          // 快照：写记录时刷新
 //         "current_bucket": "lazy",     // 快照：config.json 才是运行时权威
 //         "created_at": "2026-10-09T20:00:00",
 //         "updated_at": "…",
@@ -22,11 +21,11 @@
 //
 // 三条口径：
 //   * **密码只存哈希**（PBKDF2-SHA256 + 每用户随机盐）。文件里永远看不到明文；
-//     初始密码在创建默认用户时写进日志**一次**，之后改不了（V1 没有改密命令）。
+//     初始密码在创建默认用户时生成，V1 没有登录接口，所以拿不到也不影响。
 //   * **token 是管理接口的凭证**：默认永久有效（用户明确要求），随机 32 位十六进制。
-//   * `buckets` / `current_bucket` 只是**快照**：运行时权威仍是 `config.json`
-//     （`current_bucket`）与 `repository/<user>/` 下的目录。写记录时顺手刷新，
-//     免得变成第二份事实来源。
+//   * **没有「桶列表」字段**：桶以磁盘上真实存在的 `repository/<user>/<bucket>/`
+//     为准（用户要求删掉这份副本——第二份事实来源迟早会对不上）。
+//     `current_bucket` 保留（以后可能有用），但它也只是快照，运行时权威是 config.json。
 #pragma once
 
 #include <cstdint>
@@ -48,7 +47,6 @@ struct UserRecord {
     std::string password_hash;
     std::string password_salt;
     std::string token;
-    std::vector<std::string> buckets;
     std::string current_bucket;
     std::string created_at;
     std::string updated_at;
@@ -81,11 +79,11 @@ public:
     // 校验密码（常量时间比较哈希）。
     Result<bool> verify_password(std::string_view username, std::string_view password) const;
 
-    // 记一次登录：刷新 last_login_at / buckets / current_bucket 快照。
+    // 记一次登录：刷新 last_login_at 与 current_bucket 快照。
     Status record_login(std::string_view username);
 
-    // 刷新某个用户的桶快照（桶列表与当前桶）。桶名从 repository/<user>/ 下扫。
-    Status refresh_snapshot(std::string_view username);
+    // 刷新 current_bucket 快照（桶列表不存副本，以 repository/<user>/ 下的真实目录为准）。
+    Status refresh_current_bucket(std::string_view username);
 
 private:
     const PathManager& paths_;
