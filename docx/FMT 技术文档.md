@@ -3,7 +3,8 @@
 > 项目：FMT（Windows 文件管理系统）
 > 版本：V1
 > 文档状态：**已按 2026-10 架构重构同步**（单一 `fmt.exe` 三形态、CLI 走命名管道、
-> service 五命令 + 四条动作命令 UAC 提权（`status` 查询不提权）、数据根由 CLI 声明、
+> service **六条子命令**（`install` / `uninstall` / `start` / `stop` / **`reinstall`** / `status`；
+> 除 `status` 外都提权，`reinstall` 提交 `c573f14` 起正式化）、数据根由 CLI 声明、
 > Service 与 CLI 共用同一套幂等初始化规则）
 > 分支：`arch-restart`｜平台：Windows x64｜语言：C++17｜构建：CMake + Ninja + MSVC
 > 产物：`fmt.exe`（单文件，三种形态）
@@ -2515,14 +2516,46 @@ public:
 `finish_download` 成功后才真正 `download_count + 1`；失败或中断则释放预占。
 这样最大 20 次时不会出现 21 次。
 
-**实现状态（提交 `188e85d`）：整组尚未实现。** 源码里没有 `src/share/`、
-`share.json` 也没有任何读写代码；`share.*` 四个 op 只是被 `is_known_business()`
-的前缀表认得（`share.` 在列表里），所以打过去拿到的是
-`FMT-602 ServiceOperationFailed`「操作尚未实现：share.create」——
-**不是**「未知操作」的 `FMT-001`。CLI 侧命令总览里 `share` 是「尚未实现」那一组的
-唯一一行（11.4），`/api/share` 四条路由同样是设计约定（12.3.2）。
-`share create / get / list / delete` 与 20 次限制、过期、下载计数都属于**阶段 5 剩下
-的 Share 部分**（开发文档第 46～51、105 节）。
+**实现状态（提交 `d5779db`：数据面已落地，HTTP 下载端点未做）**
+
+```text
+模块      include/fmt/share/share.hpp + src/share/share.cpp + CMake（**真实存在**）
+存储      data/share.json = {version:1, shares:[{share_id, file_id,
+          max_download_count, download_count, expire_time, is_valid}]}
+          expire_time 为空 = JSON 里写 null = **不过期**
+share_id  **12 位随机十六进制**，来自 **BCryptGenRandom**（不是 std::mt19937 ✗——
+          伪随机可预测，当访问凭证不合格；3.x 的库表本来就指定了这个系统调用）
+          创建时撞号就重摇（最多 16 次）；**生成失败当错误返回**，绝不退化成可预测 id
+默认值    max_download_count = 20、expire_time = 现在 + 7 天
+          （开发文档第 16 节原来只写了 20；7 天来自本文档 7.2
+            「20 次 + 7 天 = 7 天内最多下载 20 次」。**两个条件相互独立**，
+            谁先到谁生效。一个文件可以有多个 share，各自独立计数）
+share get **如实报状态**（开发文档第 49 节）：未知 id 才是真错误 FMT-500（退出码 3）；
+          「已过期 / 次数用尽 / 已撤销 / 关联文件在回收站」都是成功返回 + 状态
+          （state 字段 + available 布尔 + message），不伪装成「从未存在」
+          检查顺序：有效性 → 文件存在 → 不在回收站 → **过期 → 次数**
+          （开发文档 §50 的流程图把次数写在过期前面，**以 §49 为准**）
+          expire_time 解析失败（被手工改坏）按**已过期**处理（安全侧默认可拒）
+          撤销（is_valid=false）映射到 FMT-500；**撤销是删记录**，
+          所以 delete 之后再 get 就是 FMT-500
+中心约束  create 要求文件属于当前用户且**不在回收站**，否则 FMT-503；
+          文件进回收站后它的 share **立刻不可用**（FMT-503），**也阻断新的 create**
+          （开发文档第 50 节）
+新增 op   **share.download**（管道可用，将来的 HTTP 下载端点也走它）：
+          register_download() 在**业务锁内**一次完成「全部检查 + 计数 +1 + 落盘」，
+          所以开发文档第 51 节的「19 + 两次 = 21」不可能发生；
+          **计数写不进去就拒绝这次下载**（不放行，否则会超发）
+CLI       四条命令都能用；打印分支**必须排在「单条文件信息」之前**——分享数据里
+          也带 file_id 与 size，否则会被当成文件详情打出来（11.4）
+HTTP      **一个路由都没加**（用户决定）：`/api/share` 四条仍是设计约定，
+          等用户定开放哪几个接口（12.3.2、18.38）
+```
+
+> **原口径「整组尚未实现、`src/share/` 不存在、打过去是 `FMT-602`」已作废**（提交 `d5779db`）。
+> 现在 `FMT-602` 只对应两件事：`server.*` 这个空壳，以及**未实现的 HTTP 路由**（12.5 的 501）。
+> `begin_download` / `finish_download` 那对接口**没有照原样实现**：改成单个
+> `register_download()` 在业务锁内一次做完（上面的「新增 op」），
+> 原因是「预占名额 + 事后 +1」会把状态拆到两个时刻，不如一次落盘干净。
 
 ### 10.4 TrashService（**提交 `0fc242b` 起真实存在**）
 
@@ -2825,14 +2858,16 @@ fmt.exe
 │             只收 `file_id` 扩成两种，与 `get` 同一套定位规则。注意 `upload` 有第二个
 │             **可选**的文件名参数，来源可以是 http:// URL 或本机路径，见 10.2）
 ├── share   create <file_id> | get <share_id> | list <file_id> | delete <share_id>
-│           （**整组尚未实现**，`share.*` 返回 FMT-602，10.3）
+│           （**数据面已落地**：提交 d5779db；HTTP 下载端点未做，10.3、18.38）
 ├── trash   list | get <标识> | restore <标识> | delete <标识>
 │           （**两级都已落地**：桶级 list / restore 阶段 4、get / delete 提交 4fee290；
 │             文件级读取侧提交 0fc242b；标识可以是 file_id / 回收站目录名 / 原名，
 │             list 会标出 [文件] 还是 [桶]；delete / restore 有预检与确认，10.4、11.15）
 ├── config  get | set --user <name> | set --bucket <name>
 │           （尚未实现）
-└── service install | uninstall | start | stop | status
+└── service install | uninstall | start | stop | reinstall | status
+            （**六条子命令**：提交 c573f14 起 reinstall 从引导内部用法变成正式命令；
+              除 status 外每条都提权，11.4 / 13.8.2）
 ```
 
 `file delete` / `share delete` / `bucket delete` 是**业务命令**（走管道，删除语义是移入
@@ -2866,9 +2901,13 @@ Trash），与 `service uninstall` 完全不同层次，不要混用「删除」
 用户同意之后才把 `args.force` 置 `true` 发真实请求（**提交 `711da4c`，11.15**）。
 `file` 组的四条**已经在提交 `188e85d` 落地**（原口径「`file` / `share` / `config` 同规则，
 但尚未落地，现在返回 `FMT-602`」里的 `file` 部分**已作废**）；
-`share` / `config` 仍尚未落地、现在返回 `FMT-602`；
-`trash` 的**桶级四条已经全部落地**——原口径「只有桶级的一半落地，`trash.get` / `trash.delete`
-仍是 `FMT-602`」**已作废**（提交 `4fee290`）。
+**提交 `674d0b0` 起 `trash empty` 与 `config list/set` 也已落地**、
+**提交 `d5779db` 起 `share` 四条落地**——于是原口径「`share` / `config` 仍尚未落地、
+现在返回 `FMT-602`」**已作废**：`FMT-602` 现在只对应 `server.*` 这个空壳与
+**未实现的 HTTP 路由**（12.5 的 501）。
+另：`file list --sort <key>` 的 `--sort`、`trash delete/empty` 等的 `--yes`/`-y`
+都是 **CLI 本地开关**，不进 `argv`（`--sort` 单独放进 `args.sort`，`674d0b0`）；
+`trash` 的**桶级四条与文件级都在**——原口径「只有桶级的一半落地」**已作废**（提交 `4fee290`）。
 参数形状的完整说明见 12.3.2.1 与 13.9.3。
 
 ### 11.4 命令帮助
@@ -2886,21 +2925,26 @@ help [组]             交互循环内同上（交互里也接受 --help 这个�
 
 ```text
 可用命令：
-  (service)  install  uninstall  start  stop  status
+  (service)  install  uninstall  start  stop  reinstall  status
   (bucket)   create  list  get  use  delete
   (file)     upload  list  get  delete
-  (trash)    list  get  restore  delete
+  (trash)    list  get  restore  delete  empty
+  (share)    create  get  list  delete
+  (config)   list  set
   (help)     help [命令]
   (version)  version                打印版本与构建日期
   (exit)     exit  quit
 
 业务命令（服务端尚未实现，现在会返回 FMT-602）：
-  (share)    create  get  list  delete
+  (server)   （`server.*` 是唯一还剩的空壳；原口径写 `(share)` 已作废）
 ```
 
-`(file) upload list get delete` 在提交 `188e85d` 落地后移进了「可用命令」组
-（顺序就是源码 `print_command_list()` 里的顺序：service → bucket → file → trash →
-help → **version** → exit），**「尚未实现」组只剩 `(share)` 一行**。
+`(file) upload list get delete` 在提交 `188e85d` 落地后移进了「可用命令」组；
+**提交 `674d0b0` 起 `trash` 多了 `empty`、新增 `(config) list set`**，
+**提交 `d5779db` 起 `(share)` 也移进「可用命令」组**——「尚未实现」组里
+**只剩 `(server)` 这个空壳**（原口径「只剩 `(share)` 一行」已作废）。
+顺序就是源码 `print_command_list()` 里的顺序：service → bucket → file → trash → share →
+config → help → **version** → exit。
 
 **`help version` 的正文（提交 `d108c80`，照源码抄）**：
 
@@ -2914,7 +2958,7 @@ version —— 打印程序名、版本与构建日期
 
 **`help <组>` 打印该组详情。** 当前支持 `service` / `bucket` / `file` / `share` /
 `trash` / `help` / `exit`（`quit` 等同 `exit`；**提交 `d108c80` 起多了 `version`**）。
-`help service` 的输出：
+`help service` 的输出（**提交 `c573f14` 起多出 `reinstall` 那一段**）：
 
 ```text
 service —— Windows 服务管理
@@ -2923,11 +2967,25 @@ service —— Windows 服务管理
              不删除 repository / trash / config / data / log / temp
   start      启动服务；需要管理员权限
   stop       停止服务；需要管理员权限
+  reinstall  一次 UAC 里做完「卸载 → 按**当前这个 exe** 重新安装并启动」；
+             需要管理员权限。两个用途：
+               ① 用新 exe 更新服务——直接运行**新 exe** 的这条命令即可，
+                  它会先停掉旧宿主（解开文件占用）、再指向自己并启动；
+               ② 修复宿主 exe 被移动或删除。
+             **业务数据一个都不动**（repository / trash / config / data / log）。
+             注意：宿主会变成「你运行的那一份 exe」；数据根仍由连上来的
+             CLI 声明（见窗口横幅上的「数据根：…」）。
   status     查询服务状态；不需要管理员权限
 
 说明：启动类型为自动启动，运行账户为 LocalSystem；异常退出由 Windows
       服务恢复策略自动重启（第一次 5 秒、第二次 10 秒、之后 30 秒）。
 ```
+
+> **service 子命令是六条**（提交 `c573f14`）：`install` / `uninstall` / `start` / `stop` /
+> **`reinstall`** / `status`，其中**除 `status` 外每条都提权**。用法提示行是
+> `用法：service install | uninstall | start | stop | reinstall | status`（两处都是）。
+> **原口径「文档冻结的是四条命令」「`reinstall` 只在引导流程内部使用」已作废**——
+> 它本来就是提权副本的 operation（13.8.2），本轮把它接线给用户（13.8.4 有完整语义）。
 
 四组业务命令的详情里原本都要注明「服务端尚未实现，现在返回 FMT-602」——因为管道 op
 还没落地时，敲下去拿到的是 `FMT-602`，不注明会让人以为是参数写错了。
@@ -3020,7 +3078,12 @@ file —— 文件（当前用户在当前 Bucket 里的文件）
 > `delete` 那行的「只能写、还不能从 trash 查回」与实现一致：文件级条目已经写进
 > `trash.json`、文件也在 `trash/<用户>/.files/…` 下，但 `trash list` 目前只列桶级条目
 > （10.4、18.19）。
-> `help share` 仍写着「服务端尚未实现，现在返回 FMT-602」，与实况一致。
+> **提交 `674d0b0` / `d5779db` 之后 `help` 又变了四处**（照源码抄见 11.4 与开发文档第 68 节）：
+> ① `help file` 的 `list` 行多了 `--sort name|size|id`，`delete` 那行的
+> 「只能写、还不能从 trash 查回」换成「之后用 `trash list` / `trash restore` 找回来」；
+> ② `help trash` 多了 `empty` 一段；③ 新增 `help config`；
+> ④ `help share` 换成「数据面已落地、HTTP 下载端点还没做」的正文。
+> 原口径「`help share` 仍写着『服务端尚未实现』」**已作废**（10.3、18.37、18.38）。
 >
 > **提交 `9c3d2cb` 又改了三处**：`upload` 追加「文件名不能与文件标识同形
 > （fmt-YYYYMMDD-N）……属保留形状（FMT-106）」两行（9.1、9.3）；`get` 那行改成
@@ -4114,9 +4177,14 @@ HTTP 状态码（12.5）与简短文本。CLI 不访问它们，只把链接打�
 > **路由本身没有动**——`src/server/server.cpp` 两条都还是 `R"(/api/file/([^/]+))"` +
 > `args_with_encoded_name()`（`url_decode` 之后装进 `args.argv`），只是语义放宽了。
 >
-> 剩下的 `/api/share`（四条）与 `/api/config`（两条）仍按阶段 6、7 落地时细化
-> ——**现在打到它们会返回 `FMT-602`**（`share.*` 走了 `is_known_business()` 的前缀表
-> 但没有任何实现，10.3）。`/api/file` 这一行不再属于「还没落地」的范围。
+> 剩下的 `/api/share`（四条）与 `/api/config`（两条）**仍是设计约定，一个路由都没加**
+> （提交 `d5779db` / `674d0b0` 之后的口径）：
+> `share` **数据面已完成**（10.3、18.38）、`config list/set` 也已完成（18.37），
+> 但 **HTTP 入口现在按用户决定是关闭的**，接口等用户定开放哪几个再一起做；
+> `trash empty` 同理——**`DELETE /api/trash`（清空）没有加**。
+> 现在打到这些路径会落到兜底路由：已知模块下没这个接口 → **501 + `FMT-602`**（12.5）。
+> 原口径「打到它们会返回 `FMT-602`，因为 `share.*` 没有实现」**已作废**——
+> 现在 `FMT-602` 只表示「这个接口还没做」，不再表示「模块没实现」。
 
 **`service *` 没有、也不会有 HTTP 路由**：它操作的是 SCM，与服务进程内的业务无关，
 且服务可能尚未安装/运行。见 13.8。
@@ -4325,7 +4393,7 @@ V1 只实现图片，其他类型待后续扩展。
 | 400 | `FMT-001` **`FMT-016`** `FMT-012` `FMT-014` `FMT-100` `FMT-101` `FMT-102` `FMT-103` `FMT-104` **`FMT-106`** `FMT-202` `FMT-300` `FMT-303` `FMT-700` `FMT-701` |
 | 403 | `FMT-004` `FMT-501` `FMT-502` `FMT-503` |
 | 404 | `FMT-002` `FMT-200` `FMT-400` `FMT-500` `FMT-305` `FMT-402` **`FMT-017`** |
-| 409 | `FMT-003` `FMT-105` `FMT-201` `FMT-203` `FMT-304` `FMT-401` |
+| 409 | `FMT-003` `FMT-105` `FMT-201` `FMT-203`(保留未用) `FMT-304` `FMT-401` | 冲突（已存在、重名、仍被引用；**`FMT-203 BucketInUse` 保留、V1 未使用**——没有代码会产生它，见 12.5 下方的说明） |
 | 500 | 其余（JSON / 配置 / 存储 / IO 等） |
 | **501** | **`FMT-602 ServiceOperationFailed`**（提交 `4ddb515` 起：它表示「接口尚未实现」，原来是落 `default: 500`） |
 
@@ -5191,6 +5259,12 @@ operation ∈ install | uninstall | start | stop | reinstall
 其中 `reinstall` = 先卸载（**服务未安装时忽略该错误**）再安装并启动，用于「服务宿主 exe
 已丢失、需要重新指向当前目录」的场景（4.8 节表格第三行），**一次 UAC 做完**。
 
+**提交 `c573f14` 起 `reinstall` 不再是「引导流程内部用法」，而是用户能敲的正式命令**：
+`is_user_service_command()` 加入它（该函数从匿名命名空间移到 `cli.hpp`，便于用例钉住），
+两处用法提示、命令总览、`help service` 正文都跟着更新。于是
+**「用户能敲的 service 子命令」=「提权副本的 operation」+ `status`**（六条；上面那五种提权，
+`status` 查询不提权）。三个「不变」与「为什么这是更新 exe 的正确路径」见 13.8.4。
+
 ```cpp
 // 0) 先确保 <数据根>\temp 存在；建不出来就退回 %TEMP% 并记一行 WARN（见 4.2）
 //    提权副本在写结果文件前也会自己 ensure 一次目录，它有权限，所以调用方只读时仍能建出来
@@ -5359,6 +5433,40 @@ CloseHandle(sei.hProcess);
 | 服务不存在（start / stop / uninstall） | `OpenServiceW` 失败，`ERROR_SERVICE_DOES_NOT_EXIST` | `FMT-601 ServiceNotInstalled` / 退出码 8 |
 | `reinstall` 时服务不存在 | `OpenServiceW` 失败，`ERROR_SERVICE_DOES_NOT_EXIST` | **忽略**卸载阶段的这个错误，继续安装并启动（不是失败） |
 
+**`service reinstall` 的语义、三个「不变」与更新路径（提交 `c573f14` 起是正式命令）**：
+
+`reinstall` 是**唯一一条会同时「卸载 + 安装 + 启动」**的子命令，实现就是提权副本里那段：
+
+```cpp
+} else if (operation == "reinstall") {
+    const Status removed = service::uninstall();          // 未安装也当作可继续
+    const bool removable = ok(removed) || error_of(removed)->code == ErrorCode::ServiceNotInstalled;
+    status = removable ? service::install(path_to_utf8(executable_path()), true) : removed;
+}
+```
+
+```text
+① 业务数据不变     uninstall() 只 DeleteService，**明确不删** repository / trash / config /
+                   data / log / temp（service.cpp 里那句注释就是这条口径）——
+                   桶、文件、回收站、配置全部原样
+② service.json 不变 卸载**不删**状态目录，所以 C:\ProgramData\FMT\service.json 里的
+                   current_root 保留——重装后数据根**仍是原来那个**，
+                   直到某个 CLI 连上来重新声明
+③ 数据根仍由 CLI 声明   与「宿主 exe 是谁」无关；窗口横幅上的「数据根：…」（11.9）
+                   与连接那一刻的换根提示（13.10、18.33）照旧生效
+
+为什么这是「更新 exe」的正确路径（原来用户要 uninstall → install，两次 UAC）：
+  服务在跑时旧宿主 exe 被占用，直接覆盖会失败；reinstall 先停掉已注册的宿主
+  （解开占用），再把服务注册指向**你运行的那一份** exe 并启动。
+  于是**不需要先把新 exe 复制过去**，也**只要一次 UAC**。
+  宿主 exe 被移动或删除时同理（4.8 节表格第三行的修复路径就是它）。
+
+实测（2026-10-09，对已安装服务）：服务已停止时 → exit 0、服务 RUNNING、
+  宿主 = 执行它的那份 exe、数据根仍是 D:/Data/Temp/JMT/fmt、桶/文件/回收站全未变；
+  服务正在运行时 → exit 0、宿主 PID 2088 → 9212（换成新进程）、STATE 仍 RUNNING、
+  业务命令正常（完整记录见 18.34）。
+```
+
 **父进程的输入锁**：提权期间父进程在 `WaitForSingleObject`（以及随后的读结果文件），
 不应响应 `Ctrl+C` 之外的交互。
 `Ctrl+C` → 记一次中断 → 终止子进程 → 退出码 1。
@@ -5384,6 +5492,7 @@ CloseHandle(sei.hProcess);
 
 ```text
 管道名：\\.\pipe\fmt.control（服务端监听，多实例）
+        —— 提交 a340d1e 起**可被环境变量 FMT_PIPE 覆盖**（见下）
 打开模式：PIPE_ACCESS_DUPLEX
 类型/读模式/等待：PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT
 最大实例：PIPE_UNLIMITED_INSTANCES
@@ -5397,6 +5506,34 @@ CreateNamedPipeW(L"\\\\.\\pipe\\fmt.control",
     PIPE_UNLIMITED_INSTANCES, 64 * 1024, 64 * 1024,
     0, &sa);                                  // sa 见 13.9.2
 ConnectNamedPipe(hPipe, nullptr);             // 每个实例一次
+```
+
+**管道名可被 `FMT_PIPE` 覆盖（提交 `a340d1e`，端到端测试的隔离前提）**：
+
+```cpp
+// include/fmt/ipc/pipe.hpp
+inline constexpr wchar_t kPipeName[] = L"\\\\.\\pipe\\fmt.control";
+std::wstring pipe_name();     // 环境变量 FMT_PIPE 非空时用它，否则返回 kPipeName
+```
+
+```text
+实现      src/ipc/pipe.cpp 的 pipe_name()：GetEnvironmentVariableW(L"FMT_PIPE", …)，
+          取到非空值就用它；取不到、为空都回默认名
+使用点    ① ServerRuntime::run() 的 accept 循环（循环外算一次，不每轮查环境）
+          ② CLI 的 ensure_connected() 连接处
+线上行为不变   真服务由 SCM 启动、不会带这个变量，所以默认名照旧是
+          \\.\pipe\fmt.control；CLI 不带变量时也连默认名
+
+为什么留这个口子（端到端冒烟测试的前提，tests/cli_e2e_test.cpp）
+  端到端测试要在同一台机器上再起一个进程内服务，而真服务通常正占着默认管道名。
+  不换名字的话：要么测试服务起不来（名被占），要么更糟——把命令打到用户的真服务上、
+  动到真数据。测试进程设好 FMT_PIPE，它自己起的服务与它拉起的 fmt.exe 子进程都用
+  同一个名字，于是与真服务完全隔离（实测见 18.35）。
+
+安全边界    这是本机同一用户范围内的名字覆盖，不改变 DACL / MIC 那套
+          （13.9.2 不变：管道仍然只授权交互用户、仍然降中完整性标签）。
+          服务侧的变量来自 SCM 的环境，不受交互用户环境影响；谁能设 FMT_PIPE
+          谁本来就能连那条管道，所以没有扩大权限面。
 ```
 
 **阶段 4 的实况：`PIPE_UNLIMITED_INSTANCES` 只是创建参数，服务端一次只 accept 一条连接。**
@@ -5832,8 +5969,8 @@ V1 **不实现**异步日志、日志线程、日志队列、日志压缩、日�
 
 ```text
 FMT_ROOT/log/
-├── fmt.log        全部日志
-└── error.log      仅 ERROR 级
+├── fmt.log        全部日志（超过 5 MB 轮转成 fmt.log.1，只留一代，14.6）
+└── error.log      仅 ERROR 级（同样轮转）
 
 FMT_ROOT/temp/     临时文件，随时可以清空（既不是业务数据、也不是日志，见 4.2）
 ```
@@ -5922,6 +6059,31 @@ public:
 HTTP 请求（方法、路径、状态码）
 数据一致性问题
 ```
+
+### 14.6 轮转（提交 `821aba3`）
+
+```text
+上限      fmt.log 超过 **5 MB** 轮转成 fmt.log.1（**只留一代**）；error.log 同理。
+          Logger::Options::max_log_bytes：**0 表示不轮转**（测试与需要完整日志的场景）；
+          默认 kDefaultMaxLogBytes = 5 * 1024 * 1024。
+前置条件  日志**每行开-写-关**（append_line()），不再长期持有 ofstream。
+          两个进程（CLI 与服务）共用同一个文件：长期开着的句柄既会**挡住改名**，
+          也会让另一个进程继续往**已改名**的文件里写。没有这一步，轮转做不成
+          ——所以这是轮转的前置条件，不是顺手改的（14.2）。
+检查节奏  每写 **64 行**检查一次大小（kRotationCheckInterval）。不用时间节流：
+          写入频率差异大，按行计数既便宜又确定，**测试也能预期**。
+          改名失败（另一个进程正好在写）**不报错**，下一次检查再试。
+轮转之后  在**新文件**里写一行说明：「日志超过 N 字节，已轮转：fmt.log -> fmt.log.1」
+          ——用户翻日志能看到断点。
+打开时    仍然验一次可写（写空串）✓：日志写不了要**立刻报错**，
+          而不是等第一条日志静默丢掉。
+```
+
+**口径对齐**：`error.log` **仅 ERROR 级**（14.3、开发文档第 65 节）——`logger.hpp` 的头注释
+原来写着「WARN 也进 `error.log`」，**与这条口径冲突**：作者一度照注释改了代码，
+**被既有用例当场抓住**（`Logger.写入两个文件且ERROR单独成文件` 断言 `error.log` 只有 1 行），
+于是改回代码、修掉注释。同时修掉的还有「只有 Service 打开日志文件」那句旧话
+（CLI 早就往同一个 `fmt.log` 追加了，见 14.2）。提交 `821aba3`，用例见 18.36。
 
 ---
 
@@ -6245,25 +6407,33 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 > `fmt_test.cpp`，`FMT_TEST(suite, 名称)` / `FMT_CHECK_EQ` 宏，**零第三方依赖、可完全离线构建**，
 > 断言失败继续跑下一个用例），并在 `tests/CMakeLists.txt` 里用 `add_test(NAME fmt_tests …)`
 > 接进 CTest——所以「不写自动化测试」这条**只对 Catch2 那种形态成立**：不引外部框架，
-> 但模块行为仍有单元测试兜底。当前 **146 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
+> 但模块行为仍有单元测试兜底。当前 **154 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
 `HttpClient.*` + 提交 `0ad9efc` 新增 2 条 `File.*` + 提交 `5bf2c1f` 新增 2 条 `File.*`
 与 1 条 `Bucket.*` + **提交 `9c3d2cb` 新增 5 条** + **提交 `0fc242b` 新增 4 条** +
 **提交 `a9af276` 新增 2 条** + **提交 `2c841c8` / `5b316b3` 各新增 1 条** +
-**提交 `d108c80` 新增 1 条**：
+**提交 `d108c80` / `bb7a40f` / `c573f14` 各新增 1 条** +
+**提交 `a340d1e` 新增 3 条** + **提交 `821aba3` 新增 2 条** +
+**提交 `674d0b0` / `d5779db` 各新增 1 条**：
 `Trash.文件级条目能列出并回退`、`Trash.回退遇同名冲突要拦住`、
 `Trash.随桶删除的文件不能单独回退`、`Trash.永久删除文件级条目`、
 `String.清理粘贴带进来的路径污染`、`File.粘贴路径里的不可见字符会被清掉`、
 `Cli.位置参数的信封形状`、`Storage.两个写者同时写同一个文件不会互相踩`、
-`Cli.版本文本只有一个来源`、`Cli.数据根切换提示要把两个根都说清楚`
+`Cli.版本文本只有一个来源`、`Cli.数据根切换提示要把两个根都说清楚`、
+`Cli.service子命令集合`、`CliE2e.核心链路走真实exe与真实管道`、
+`CliE2e.交互式确认答n不删答y才删`、`Ipc.管道名可被FMT_PIPE覆盖`、
+`Logger.超过上限会轮转出一代`、`Logger.上限为零时不轮转`、
+`Service.列表排序配置与清空回收站`、`Service.分享的创建查看列出撤销与计数`
 （另有既有用例追加断言或改口径：`File.列表与查询` 的大写 file_id、`File.软删除进回收站`
 改断言 `file.json` 且断言 `trash.json` 保持空、`Service.管道能执行Bucket命令`、
 `Service.破坏性操作先预检再确认`、`Service.管道能上传与操作文件`、
 `Service.启动时清理temp里的遗留临时文件`（改成「新的留着、旧的清掉」）、
 `Server.Bucket路由与状态码`、`Server.File路由与上传`；
-见 17.2.1 与 18.19、18.21、18.22、18.23、18.24、18.25、18.27、18.28、18.29、18.31、18.32），
+见 17.2.1 与 18.19、18.21、18.22、18.23、18.24、18.25、18.27、18.28、18.29、18.31、18.32、18.33、18.34、18.35、18.36、18.37、18.38），
 桶级回收站的用例见 18.17。**计数走过的台阶：118 → 124 → 126 → 129（`5bf2c1f`）
 → 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→ 142（`a9af276`）
-→ 143（`2c841c8`）→ 144（`5b316b3`，`8f0fd5c` 只补断言不变）→ 145（`d108c80`）**。
+→ 143（`2c841c8`）→ 144（`5b316b3`，`8f0fd5c` 只补断言不变）→ 145（`d108c80`）
+→ 146（`bb7a40f`）→ 147（`c573f14`）→ 150（`a340d1e`）→ 152（`821aba3`）
+→ 153（`674d0b0`）→ **154（`d5779db`）**。
 > 端到端实测仍然是「真的对了」的最终判据（17.4 的硬标准不变）。
 >
 > **运行器的两条可观测性设计（提交 `a2b6cd1`，逐行照源码）**：
@@ -6396,7 +6566,7 @@ log/fmt.log                                         有对应的上传记录
 |---|---|---|
 | 1 | 项目骨架：CMake、Ninja、MSVC、`fmt.exe`、manifest(`asInvoker`)、`--help`/`--version`、`wmain` 入口分发骨架 | ✅ 完成 |
 | 2 | 基础层：`common`（Error/Result/Time/String/Path/Logger）+ `config` + `storage` + `core` 根解析与幂等初始化（**`ensure_root`/`check_root` 由 Service 与 CLI 共用**；损坏 JSON 只报告不重置） | ✅ 完成 |
-| 3 | **通道与服务**：`service`（SCM 五命令 `install`/`uninstall`/`start`/`stop`/`status` + 查询接口 `query_status()`/`query_state()`/`last_start_failure()`（13.4.2）+ 按 `dwWaitHint` 自适应的落定等待（13.4.3）+ Recovery + `ServiceMain` 状态机 + 失败编号上报 `dwServiceSpecificExitCode` + `service.json`）+ `ipc`（命名管道帧、DACL、MIC、hello 的 `switched`/`previous_root` 回执）+ `cli`（管道客户端、单实例、UAC 提权引导、双击幂等体检与补齐、落定判定与 reinstall 兜底、交互循环） | ✅ 完成 |
+| 3 | **通道与服务**：`service`（**六条子命令** `install`/`uninstall`/`start`/`stop`/**`reinstall`**/`status`（`reinstall` 提交 `c573f14` 起正式化） + 查询接口 `query_status()`/`query_state()`/`last_start_failure()`（13.4.2）+ 按 `dwWaitHint` 自适应的落定等待（13.4.3）+ Recovery + `ServiceMain` 状态机 + 失败编号上报 `dwServiceSpecificExitCode` + `service.json`）+ `ipc`（命名管道帧、DACL、MIC、hello 的 `switched`/`previous_root` 回执）+ `cli`（管道客户端、单实例、UAC 提权引导、双击幂等体检与补齐、落定判定与 reinstall 兜底、交互循环） | ✅ 完成 |
 | 4 | Bucket：create / list / get / use / delete，`current_bucket` 逻辑；`common/validation` 名称校验；两条入口（管道 + HTTP）打通；**Bucket 删除/回退的回收站形状**（目录名一律带时间戳、`trash/<user>/.original` 是桶级身份唯一权威、回退整单判定 `FMT-401`、`file.json` 增加 `trash_reason`）与桶级 `trash list` / `get` / `restore` / `delete`（`get` / `delete` 提交 `4fee290`，永久删除要 `force` 确认且只清 `trash_reason="bucket"` 的记录）；文件级条目落点定为 `trash/<user>/.files/<bucket>/YYYY/MM/DD/` | ✅ 完成（commit 32249ea；回收站形状 c2d545d；`.files` 落点与 `trash get` / `delete` 见 `4fee290`，明细见 18.15、**18.17**） |
 | 5 | File / Upload / Trash / Share：`file.json`、`file_id`、上传（本机 + URL）、**文件级** trash（桶级四条已在阶段 4 全部落地）、share 下载计数；阶段 7 补**文件级** `trash get` / 永久删除与**文件级**部分恢复 | 🟡 **`file` 部分已完成，且 https 可用**（提交 `188e85d` + `a2b6cd1` + `0ad9efc`），`share` 未开始：四条命令 `file upload <来源> [文件名]` / `file list` / `file get <file_id\|文件名>` / `file delete <file_id\|文件名>` 全部落地（上传两段式、MD5 去重、重名拒绝、软删除写文件级 trash 条目；`file delete` 的参数在 `0ad9efc` 扩成两种，定位与 `file get` 一致）；**上传来源 `http://` 与 `https://` 都支持**——下载走 `common/http_client`（WinHTTP + Schannel，不用 OpenSSL、不分发 DLL，`a2b6cd1`），明细见 **18.19 与 18.20**；**文件级 trash 的读取侧（list/get/restore/delete）与 `share` 整组仍未实现**，前者属阶段 7、后者仍在阶段 5 待做。「https 不支持」**不再是已知限制** |
 
@@ -6482,7 +6652,7 @@ log/fmt.log                                         有对应的上传记录
 > | `common/net` HTTP 客户端 | **删除** CLI 用途；只保留 URL 下载（12.1） |
 > | `api` 路由常量 + JSON 编解码 | 保留（浏览器侧），管道另有 `ipc` 帧与 `op` 表（13.9） |
 > | `server` 路由注册 + 信封编码 | 保留，但服务对象改为浏览器（12.3.2） |
-> | `service` install/start/stop/delete/status | **重写**：命令改为五条 `install` / `uninstall` / `start` / `stop` / `status`（旧 `delete` 更名 `uninstall`）；`status` 是**用户可见的第五条命令、不提权**（13.4.1），不是「双击流程内部调用」；新增 `ServiceMain` 状态机与失败编号上报 `dwServiceSpecificExitCode`（13.2.3）、`service.json`、Recovery 细节（13.3～13.7） |
+> | `service` install/start/stop/delete/status | **重写**：命令改为**六条子命令** `install` / `uninstall` / `start` / `stop` / `reinstall` / `status`（旧 `delete` 更名 `uninstall`；`reinstall` 提交 `c573f14` 起从引导内部用法变成正式命令，**除 `status` 外每条都提权**）；`status` 是**查询命令、不提权**（13.4.1），不是「双击流程内部调用」；新增 `ServiceMain` 状态机与失败编号上报 `dwServiceSpecificExitCode`（13.2.3）、`service.json`、Recovery 细节（13.3～13.7） |
 > | `cli` 命令解析 + HTTP 执行 | **重写**：解析保留，执行改为管道客户端 + UAC 提权引导 + 交互循环（第 11 节） |
 
 实测：`fmt.exe` 依赖为 `ADVAPI32.dll`、`WS2_32.dll`、`KERNEL32.dll`、`SHELL32.dll`（全部为系统组件），**无第三方 DLL**。
@@ -6858,8 +7028,8 @@ HTTP（浏览器/调试）        → GET /api/bucket 返回信封 {ok:true,data
 | 事项 | 现状 |
 |---|---|
 | `refresh_current_bucket()` 接线 | **已接线（运行时生效）**：`ServerRuntime` 在服务启动（`start()`）与数据根切换（`apply_root()`，hello 触发的那条路径）时于业务锁下调用，失效置空、有效不动，失败只记 WARN。单测覆盖两种情况（10.1、开发文档第 61 节） |
-| `FMT-203 BucketInUse` | `bucket delete` 目前不会返回它——V1 允许删除仍有文件的 Bucket（数据一并进回收站） |
-| `help bucket` / `help trash` 文案 | **已同步（提交 `8a5e554`；`c2d545d` 追加 trash；`4fee290` 补 `get` / `delete`）**：命令总览把 `(bucket)` 与 `(trash) list get restore delete` 移进「可用命令」组、「尚未实现」组只剩 `(file)` / `(share)`（原来补的那行 `(trash) get delete` **已删掉**），`help bucket` / `help trash` 写明各子命令的真实行为（第一个自动成为当前 / `use` 只改 `current_bucket` / `delete` 移入回收站且当前置空不自动切换 / `restore` 整单判定 / `get` 报条目详情 / `delete` 永久删除且要 `--yes`），不再出现与实际不符的「尚未实现」（11.4、11.14）。**提交 `188e85d` 之后再进一格**：`(file) upload list get delete` 也进了「可用命令」组、该组**只剩 `(share)`**，`help file` 的正文同步（11.4、18.19） |
+| `FMT-203 BucketInUse` | **保留（V1 未使用）**——提交 `674d0b0` 起口径写死：`bucket delete` 不会返回它（V1 允许删除仍有文件的 Bucket，数据一并进回收站），**没有任何代码会产生它**；原本设想的场景被 `FMT-401` / `FMT-402` / `FMT-016` 覆盖 |
+| `help bucket` / `help trash` 文案 | **已同步（提交 `8a5e554`；`c2d545d` 追加 trash；`4fee290` 补 `get` / `delete`）**：命令总览把 `(bucket)` 与 `(trash) list get restore delete` 移进「可用命令」组、「尚未实现」组只剩 `(file)` / `(share)`（原来补的那行 `(trash) get delete` **已删掉**），`help bucket` / `help trash` 写明各子命令的真实行为（第一个自动成为当前 / `use` 只改 `current_bucket` / `delete` 移入回收站且当前置空不自动切换 / `restore` 整单判定 / `get` 报条目详情 / `delete` 永久删除且要 `--yes`），不再出现与实际不符的「尚未实现」（11.4、11.14）。**提交 `188e85d` 之后再进一格**：`(file) upload list get delete` 也进了「可用命令」组、该组**只剩 `(share)`**，`help file` 的正文同步（11.4、18.19）。**提交 `674d0b0` / `d5779db` 收官**：`(trash)` 多 `empty`、新增 `(config) list set`、**`(share)` 也进「可用命令」组**——「尚未实现」组只剩 `(server)` 这个空壳，`help share` 换成数据面正文（11.4、18.37、18.38） |
 | Bucket 级回收站的恢复 | **已在阶段 4 落地（提交 `c2d545d`）**：`trash list` / `trash restore` + `trash/<user>/.original`，回退为整单判定（见 18.17）。旧记录里「属于阶段 5、只保证数据躺在 `trash/<user>/<bucket>/` 且 `trash.json` 有据可查」的说法已作废 |
 | Bucket 级回收站的详情与永久删除 | **已在阶段 4 收尾落地（提交 `4fee290`）**：`trash get`（`{trashed, original, deleted_at, present, path, files, bytes}`，索引有目录没了只报 `present=false`，孤儿目录也能按目录名查到）与 `trash delete`（永久删除，必须显式确认；顺序为「目录 → `trash_reason="bucket"` 的 file.json 记录 → `.original`」，文件级记录绝不动）。详见 18.18 |
 | 文件级 Trash | **两级都已落地**（桶级 `4fee290`、文件级 `0fc242b`）：`TrashService` 把 `file.json`（文件级，含 `deleted_at`）与 `.original`（桶级）合成一份 `TrashEntry` 视图，`trash list` 标出 `[文件]` / `[桶]`，`get` / `restore` / `delete` 两级通用（10.4、18.25）。**原口径「写入侧已落地、读取侧属阶段 7、软删除的文件看不到也恢复不了」「`file delete` 会写 `trash.json` 文件级条目」都已作废**：`trash.json` 不再写入，只做只读兼容（7.3.1） |
@@ -8121,6 +8291,254 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 
 ---
 
+### 18.34 `service reinstall` 正式化（commit `c573f14`）
+
+`c573f14`「feat(cli): expose service reinstall」。**147 个用例全绿**（146 + 新增 1 条）。
+
+```text
+事实    reinstall **本来就有**——提权副本的 operation（13.8.2），双击引导内部用它
+        （13.12「宿主 exe 已丢失」的修复路径）。本轮**只做接线**：
+        一次 UAC 内「卸载（先停服务、解开旧 exe 的文件占用）→ 按**当前这个 exe**
+        重新注册 → 启动」。
+
+接线    src/cli/cli.cpp + include/fmt/cli/cli.hpp：
+        ① is_user_service_command() 加入 reinstall —— 这个谓词原本在匿名命名空间里
+           （注释还写着「reinstall 是引导流程内部使用的，不在命令集里，文档冻结的是四条」），
+           现在**移到 cli.hpp 声明**，便于用例钉住；
+        ② 两处用法提示都改成
+             用法：service install | uninstall | start | stop | reinstall | status
+           （交互循环一处、一次性 dispatch 一处）；
+        ③ print_command_list() 的 service 那一行加上 reinstall；
+        ④ help service 正文新增 reinstall 一整段（11.4 照源码抄）。
+
+口径    **service 子命令是六条** install / uninstall / start / stop / reinstall / status，
+        其中**除 status 外每条都提权**。
+        原口径「service 只有四条命令」「文档冻结的是四条」「reinstall 只在引导流程内部
+        使用」**均已作废**（保留在注记里）。
+
+三个「不变」（13.8.4 有完整版）：
+        ① 业务数据不变 —— uninstall() 只 DeleteService，不删
+           repository / trash / config / data / log / temp；
+        ② C:\ProgramData\FMT\service.json 不变 —— 卸载不删状态目录，current_root 保留，
+           重装后数据根仍是原来那个，直到某个 CLI 连上来重新声明；
+        ③ 数据根仍由 CLI 声明，与「宿主 exe 是谁」无关（11.9 的横幅、13.10 的换根提示照旧）。
+
+为什么是「更新 exe」的正确路径：
+        服务在跑时旧宿主 exe 被占用、无法覆盖；reinstall 先停旧宿主解开占用，再把注册
+        指向**你运行的那一份**新 exe——**不需要先复制，也只要一次 UAC**。
+        宿主 exe 被移动或删除时同理（4.8 节表格第三行 / 13.8.4）。
+
+用例    Cli.service子命令集合（tests/cli_test.cpp）：断言 is_user_service_command() 对
+        install / uninstall / start / stop / reinstall 为真；对 status、空串、Install
+        （大小写不同）、乱写的词为假。**命令集合第一次有断言**——它决定「敲了什么会被
+        当成什么」，所以把它从匿名命名空间搬到头文件里专门钉住。
+
+实测（2026-10-09，对已安装服务）
+        服务已停止时：service reinstall → exit 0；服务 RUNNING；宿主 = 执行它的那份 exe；
+                      数据根仍是 D:/Data/Temp/JMT/fmt；桶 / 文件 / 回收站全部未变
+        服务正在运行时：service reinstall → exit 0；宿主 PID 2088 → 9212（换成新进程）；
+                      STATE 仍 RUNNING；业务命令正常
+```
+
+---
+
+### 18.35 端到端冒烟测试：真实 exe 走真实管道（commit `a340d1e`）
+
+`a340d1e`「test(cli): drive the real exe over the real pipe」。**150 个用例全绿，全量约 17 秒**
+（端到端部分约 5 秒）。这是本工程**第一次让真实 `fmt.exe` 走用户走的路**。
+
+```text
+为什么要它（与 18.28 同源）
+  `file delete a7.jpg` 弹「Debug Error! abort() has been called」那次崩溃，是从
+  **全绿的单元测试**里漏出去的：单元测试直接调业务层、**按服务端期望的形状拼请求**，
+  而 CLI 拼的是另一种形状（把 dry_run 挂在位置参数数组上 → type_error.305 → abort()）。
+  让 CLI 自己造请求，是唯一能让这类 bug 现形的方法。
+  而且那次崩溃的代码路径对**所有破坏性操作都生效**——所以本套件里第一个
+  `file delete` 用例就会当场失败（不是靠运气覆盖到的）。
+
+做法（tests/cli_e2e_test.cpp，套件名 CliE2e）
+  ① 进程内起 ServerRuntime（用自己的管道名，见下）
+  ② 把 fmt.exe **复制到临时数据根**——因为「数据根 = CLI 所在目录」，
+     不复制的话真实 exe 会把服务的数据根指到自己所在目录
+  ③ CreateProcessW 拉起**真实 exe**、喂 stdin、把 stdout+stderr 合并收下来
+  ④ 断言**退出码**与**用户看到的文字**（而不是内部结构）
+
+隔离（本套件能在这台机器上跑的前提）
+  FMT_PIPE 覆盖管道名（13.9.1）：测试进程设好它，自己起的服务与拉起的 CLI 子进程
+  都用同一个私有名字 → 与**正在运行的真服务**完全隔离，真服务的桶、文件、
+  回收站一个都不动。
+
+覆盖（用例表见 17.2 的「自动化回归测试」一节）
+  version（本地命令）/ bucket create WORK（小写归一 + 提示）/ bucket list /
+  file upload（本地路径）/ 同内容 FMT-304 / 同名不同内容 FMT-105 /
+  file get 按名与按 id / 不存在 FMT-002 / file delete → trash list（含 [文件]）→
+  trash get（含「回收站路径」）→ trash restore /
+  跨桶删除无 --yes → FMT-016 且随后确认文件仍在、带 --yes → 成功且消息带「Bucket：work」/
+  永久删除无 --yes → FMT-016（含「不可恢复」）、带 --yes → 成功 /
+  删桶：空桶直接成功（仍打印「只能整体恢复」）、非空桶无 --yes → FMT-016 /
+  **交互式确认**：喂 n → 「确认执行？」+「已取消」且文件仍在；喂 y → 不再出现「已取消」
+  且条目进了回收站（此前完全没有自动化覆盖）
+
+实测（2026-10-09，对已安装且**正在运行**的真服务）
+  跑 CliE2e 前：服务运行中，数据根 D:/Data/Temp/JMT/fmt
+  跑 CliE2e  ：2/2 通过
+  跑 CliE2e 后：服务仍运行中、数据根不变；桶 lazy、2 个文件、回收站里 a7.jpg —— **完全未变**
+  全量        ：150 项通过，17.3 秒，无残留进程与临时目录
+```
+
+---
+
+### 18.36 日志轮转（commit `821aba3`）
+
+`821aba3`「feat(logger): rotate the log file instead of growing for ever」。
+**152 个用例全绿**（150 + 新增 2 条）。
+
+```text
+背景    fmt.log 原来**无上限追加**：服务跑几周就一直长。现在超过 5 MB 轮转成 fmt.log.1
+        （**只留一代**），error.log 同理。
+
+为什么现在才可能做到轮转
+  日志原来长期持有 ofstream **✗**——CLI 与服务共用同一个文件，句柄一直开着既会挡住
+  改名，也会让另一个进程继续往已改名的文件里写。现在改成**每行开-写-关**
+  （append_line()），改名才有可能成功。**这是轮转的前置条件，不是顺手改的。**
+
+检查节奏
+  每写 **64 行**检查一次大小（kRotationCheckInterval）。不用时间节流：写入频率差异大，
+  按行计数既便宜又确定，**测试也能预期**。改名失败（另一个进程正好在写）**不报错**，
+  下一次检查再试。
+
+轮转后
+  在**新文件**里写一行说明：「日志超过 N 字节，已轮转：fmt.log -> fmt.log.1」——
+  用户翻日志能看到断点。
+
+配置    Logger::Options::max_log_bytes：**0 表示不轮转**（测试与需要完整日志的场景）；
+        默认 kDefaultMaxLogBytes = 5 * 1024 * 1024（5 MB）。
+打开时  仍然验一次可写（写空串）✓：日志写不了要**立刻报错**，而不是等第一条日志静默丢掉。
+
+顺带修掉头文件两处过时说法（与 §65 / 本文档 14.2、14.3 对齐）
+  ① include/fmt/common/logger.hpp 原写「**只有 Service 打开日志文件**；CLI 用
+     console_only()」——**早已不是这样**：CLI 也往同一个 <数据根>/log/fmt.log 追加
+     （这正是「日志跟着用户敲的命令走」那条口径）。已改。
+  ② 原写「WARN 也进 error.log」——**与 §65 冲突**：§65 写的是 error.log **仅 ERROR 级**。
+     作者一开始照头文件改了代码，**被既有测试当场抓住**
+     （Logger.写入两个文件且ERROR单独成文件 断言 error.log 只有 1 行），
+     于是改回代码、修掉头文件那张表。**口径以「仅 ERROR 级」为准**（14.3、开发文档 §65）。
+
+用例    Logger.超过上限会轮转出一代（上限设 1 KB，写 400 行 → 断言 fmt.log.1 存在、
+        两代都非空、新文件里有「轮转」说明行）；
+        Logger.上限为零时不轮转（写 200 行 → 没有 .1，200 行全在一个文件里）。
+```
+
+---
+
+### 18.37 零碎三项：`trash empty`、`file list --sort`、`config list`/`set`（commit `674d0b0`）
+
+`674d0b0`「feat: empty the trash, sort the file list, and manage config from the window」。
+**153 个用例全绿**（152 + 新增 1 条）。三件事原来都**没有 CLI 入口**。
+
+```text
+① trash empty —— 一次清空回收站的两级条目
+   语义     文件级 + 桶级一次全删，永久删除、不可恢复
+   形状     与其它破坏性操作一致：dry_run 预检回
+            {files, buckets, bytes, needs_confirm, blocked:false, message}
+            缺 force → FMT-016；CLI 侧 --yes 或窗口里答 y
+   空回收站 needs_confirm = false，**直接成功返回（0 项）**，不打扰用户
+   消息     预检「永久删除回收站里的全部 N 项（x 个文件、y 个桶，共 SIZE），不可恢复」
+            执行「已清空回收站：x 个文件、y 个桶，共释放 SIZE」
+   实现要点 ① **每删一项都重新 list 一遍**——删掉一项后其余条目的索引/路径会变，
+               用旧列表接着删会大面积失败
+            ② **先删文件级、再删桶级**（避免「条目没了、数据还在」的孤儿）
+            ③ 单条失败**跳过并记日志**，不卡死整个清空；kMaxRounds 兜底防死循环
+   HTTP     **路由没有加**（DELETE /api/trash）——HTTP 入口现在按用户决定是关闭的，
+            先不加，等那批「简单接口」一起做（12.3.2）
+
+② file list --sort name|size|id
+   默认     **name**（不区分大小写；同名用 file_id 保证稳定）
+   size     size 大的在前
+   id       入库顺序（file_id 里的日期+序号天然递增）
+   乱写     → **FMT-001**（「排序方式只能是 name / size / id，收到：<key>」），
+            **不静默按默认排**
+   响应     data 里新增 sort 字段，回显实际用的排序方式
+   CLI      --sort 是**本地开关**（不进 argv），单独放进 args.sort
+   顺带修   help file 里 delete 那行原写「文件级回收站目前只能写、还不能从 trash 查回，
+            待阶段 7」——早就不是了，已改成「之后用 trash list / trash restore 找回来」
+
+③ config list / config set max_upload_size <大小>
+   list     返回 current_user / current_bucket / max_upload_size / size_unit /
+            language / path；CLI 打成标签行（不吐 JSON）
+   set      **只让改 max_upload_size**：其余只读 → FMT-001
+            「V1 只能改 max_upload_size（其余只读）：<key>」
+            理由：它是唯一需要按机器/网络调整的值；size_unit / language 目前没有
+            对应行为，current_bucket 走 bucket use
+   大小写法 纯字节 10485760，或 10MB / 512KB / 1GB（1KB = 1024 字节）；
+            下限 1KB、上限 100GB（兜溢出）；非法值一律 FMT-001
+   落盘     走 save_config；**落盘失败回滚内存里的值**并返回错误
+   帮助     新增 help config（11.4 照源码抄）；命令总览加
+            (trash) … empty 与 (config) list set 两行
+
+④ FMT-203 BucketInUse：**保留（V1 未使用）**
+   原本设想用于「桶仍被引用」，但实际路径分别由 FMT-401（回退冲突）、
+   FMT-402（原桶已删）、FMT-016（删非空桶要确认）覆盖，**没有产生它的代码**。
+   编号语义冻结、**不删行**，但也不要假装它会被返回（附录 A / 12.5 已注明）。
+
+实测（2026-10-09，对已安装服务）
+  file list --sort size        → 3.71MB 的在前、127.13KB 在后
+  file list --sort nonsense    → FMT-001「排序方式只能是 name / size / id，收到：nonsense」
+  config list                  → 标签行（配置文件 / 当前用户 / 当前 Bucket / 上传上限 /
+                                 大小单位 / 语言）
+  config set max_upload_size 50MB → 「已改为 52428800 字节（50MB）」（与原值相同，等于不改）
+  config set current_user other   → FMT-001「V1 只能改 max_upload_size」
+  trash empty（不带 --yes）      → FMT-016 + 「永久删除回收站里的全部 1 项
+                                 （1 个文件、0 个桶，共 112.04KB），不可恢复」
+  trash list                   → a7.jpg 仍在（**故意只跑预检，不动真数据**）
+```
+
+---
+
+### 18.38 share 数据面（commit `d5779db`）
+
+`d5779db`「feat(share): the share data plane」。**154 个用例全绿**（153 + 新增 1 条）。
+Share 是最后一个「背后什么都没有」的业务模块，这一轮做的是**数据那一半**——
+**HTTP 下载端点按用户决定推迟**。实现跟着开发文档第 16、46～51 节走。
+
+```text
+模块 / 存储   src/share/（share.hpp / share.cpp + CMake）；
+              data/share.json = {version:1, shares:[{share_id, file_id,
+              max_download_count, download_count, expire_time, is_valid}]}
+              expire_time 为空 = JSON 里写 null = 不过期
+share_id      **12 位随机十六进制**，来自 BCryptGenRandom —— **id 就是凭证**，
+              可预测的 id 会让任何人猜出链接（不是 std::mt19937 ✗）
+              撞号重摇（最多 16 次）；生成失败当错误返回
+默认值        max_download_count = 20、expire_time = 现在 + 7 天（两个条件相互独立）
+share get     如实报状态：未知 id 才是真错误 FMT-500（退出码 3）；
+              「已过期 / 次数用尽 / 已撤销 / 关联文件在回收站」都是成功 + 状态
+              （state / available / message），不伪装成不存在
+              检查顺序：有效性 → 文件存在 → 不在回收站 → 过期 → 次数（按开发文档 §49；
+              §50 的流程图把次数写在过期前面，以 §49 为准）
+center 约束   create 要求文件属当前用户且不在回收站（否则 FMT-503）；
+              文件进回收站 → 它的 share 立刻不可用（FMT-503）+ 阻断新的 create（§50）
+share.download**新 op**（管道可用；将来的 HTTP 下载端点也走它）：
+              register_download() 在**业务锁内**一次完成「全部检查 + 计数 +1 + 落盘」，
+              所以 §51 的「19 + 两次 = 21」不可能发生；计数写不进去就**拒绝这次下载**
+CLI           四条命令可用；打印分支**排在「单条文件信息」之前**（分享数据里也带
+              file_id 与 size，否则会被当成文件详情）；命令总览里 share 从
+              「服务端尚未实现」移进「可用命令」；help share 换成 11.4 那份
+HTTP          **一个路由都没加**（用户决定）——等用户定开放哪几个接口（12.3.2）
+另：两个原本拿 share.list / share.create 当「尚未实现」例子的旧用例，改成用
+    **server.nosuch**（server.* 是唯一还剩的空壳）
+
+实测（2026-10-09，对已安装服务）
+  file get asdva.jpg          → fmt-20261008-0
+  share create fmt-20261008-0 → share_id eaaecc6869ab，0/20，到期 2026-10-16T20:24:52
+  share get eaaecc6869ab      → 状态：可用
+  share list fmt-20261008-0   → 「eaaecc6869ab  0/20  可用  到期 …」共 1 条
+  share delete eaaecc6869ab   → 已撤销
+  share get eaaecc6869ab      → FMT-500 分享不存在（退出码 3）
+  file list / trash list      → 与测试前一致（真实文件与回收站未受影响）
+```
+
+---
+
 ## 19. 待决事项
 
 ### 19.1 本次重构引入的待决事项
@@ -8132,7 +8550,7 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 | 两个不同的数据根 | CLI 所在目录（声明值）与服务宿主 exe 所在目录（无 CLI 连接时的回退值）可能不同。是否需要一条「服务启动后马上规范化为记录值」的规则，避免「服务自启 → 用宿主目录 → 第一个 CLI 连上 → 又切一次」的抖动，待定。注意这种切换现在会**显式可见**：hello 回执 `switched=true` 且 CLI **在 stderr 打印换根提示**（提交 `8f2fbc5`）并记一行日志「数据根切换：旧 -> 新」；横幅另常驻一行「数据根：…」（11.9） |
 | 多 CLI 窗口 | 单实例（11.11）保证同时只有一个数据根，因此根切换不需要按连接隔离。若将来放开多窗口，需要重新设计「一个当前根」的语义 |
 | `service.json` 的字段集 | 现定 `version` / `current_root` / `binary_path` / `installed_at`。是否需要记录「上次正常停止时间」等诊断字段待定 |
-| `--elevated` 的参数形状 | **已定稿**：`fmt.exe --elevated <operation> --result "<结果文件绝对路径>"`，`operation ∈ install / uninstall / start / stop / reinstall`（13.8.2），**`status` 不在其中**（它不提权，见 13.4.1）。是否再为某个 op 携带附加参数（如 install 时指定 root）仍待定 |
+| `--elevated` 的参数形状 | **已定稿**：`fmt.exe --elevated <operation> --result "<结果文件绝对路径>"`，`operation ∈ install / uninstall / start / stop / reinstall`（13.8.2），**`status` 不在其中**（它不提权，见 13.4.1）。**提交 `c573f14` 起这五个 op 里除 `status` 外全部对用户可见**（`reinstall` 从「引导流程内部用法」提升为正式命令）：用户能敲的 service 子命令 = 这五个 + `status` = **六条**（13.8.2、13.8.4）。是否再为某个 op 携带附加参数（如 install 时指定 root）仍待定 |
 | 管道 `op` 的完整清单 | **阶段 4 已冻结 `bucket.*`**：`bucket.create` / `bucket.list` / `bucket.get` / `bucket.use` / `bucket.delete`，位置参数统一放 `args.argv`（13.9.3、12.3.2.1）。**桶级 `trash.*` 也已冻结**：`trash.list` / `trash.get` / `trash.restore` / `trash.delete`（`get` / `delete` 提交 `4fee290`；`trash.delete` 额外要求 `args.force == true`，18.18）。**提交 `188e85d` 冻结 `file.*` 四种**：`file.upload`（`args.argv = [来源]` 或 `[来源, 文件名]`）、`file.list`（无参数）、`file.get`（`[file_id 或 文件名]`）、`file.delete`（`[file_id 或 文件名]`——提交 `0ad9efc` 起与 `get` 同形，**不需要 `force`**），18.19、18.21。仍待定的只剩 `share.*` 与 `config.*`。`hello` 的**响应**字段已定：`root` + `switched` +（切换时）`previous_root` |
 | 长耗时命令的超时值 | **已定并落地（提交 `a2b6cd1`，从「未决」改为「已知边界 + 现有缓解」）**：普通命令仍是 `ipc::kCommandTimeoutMs = 30000`；**`file.upload` 单独用 `ipc::kUploadTimeoutMs = 30 * 60 * 1000`（30 分钟）**，CLI 侧 `run_business_command()` 按 `operation == "file.upload"` 选值（`src/cli/cli.cpp:651`）。CLI 等待超时时会额外打印：「提示：等待服务响应超时。服务端可能仍在处理，稍后用 file list 确认；也可以查看 log/fmt.log。」**残余风险（如实保留）**：30 分钟上限本身仍会出现「用户看到超时、服务端其实还在下载甚至已经提交入库」，只是窗口从 30 秒拉长到 30 分钟且**这一次用户被告知了**。彻底的解法仍是进度/长任务语义（18.16 B 的完整形态），V1 不做 |
 
@@ -8147,7 +8565,8 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 | `version` 字段与兼容 | `service.json` 沿用「未知版本直接拒绝」的策略，还是允许忽略未知字段待定 |
 | 双击引导「等待落定」的具体时长 | **已定稿，从待决清单移出**：不写死时长，改为**按 SCM 的 `dwWaitHint` 自适应**——每轮查询把 `dwWaitHint` 夹在 100 ms – 2000 ms 之间作为下次间隔，兜底上限 30 秒，状态一旦不是等待类就立即结束（13.4.3）。理由是写死 8 秒在慢机器上会把「还在启动」误判成「启动失败」，白弹一次解决不了问题的 UAC 重装。判定用的错误码集合也已冻结（13.2.3）。「仍没起」时是否再多试一次 `reinstall` 仍待实测后定 |
 | `service status` 输出是否要机器可读格式 | **已定稿，从待决清单移出**：**V1 不做 `--json`，也不预留参数名**。机器可读通道是**命令退出码**（`0` 成功；未安装 `FMT-601` → `8`；查询失败 → `8`），人类可读通道是那几行文本（11.6、13.4.1）。需要结构化字段（如 `wait_hint_ms`）时再加 |
-| **`server.json` 的 `enabled` 由谁打开（真机实测暴露的缺口，2026-10-09，尚未修）** | **实况**：`ServerConfig::enabled` 默认 `false`，而**全仓库没有任何代码把它置为 `true`**（`git grep 'enabled = true'` 在 `src/` 零命中；唯一一次是 `tests/config_test.cpp`），安装流程不碰 `config/server.json`，CLI 也没有命令能开 → 装好的服务在 `127.0.0.1:4122` **根本不监听**，浏览器入口打不开（CLI 不受影响，它走管道）。手动把 `enabled` 改成 `true` 并重启服务后，HTTP 入口**完全正常**（ping / status / bucket / file / trash 全通）。**可选做法（未定，等用户拍）**：① 让安装流程按 5.2 的原文把 `enabled` 置为 `true`（实现那句一直没落地的话）；② 加一条 CLI 命令（如 `config http on` / `config set enabled true`）显式打开。**注意**：`config.*` 整组本身也还没实现（`FMT-602`），所以做法 ② 会把 `config` 组的一部分提前。见 5.2、12.1 |
+| **`server.json` 的 `enabled` 由谁打开（真机实测暴露的缺口，2026-10-09，尚未修）** | **实况**：`ServerConfig::enabled` 默认 `false`，而**全仓库没有任何代码把它置为 `true`**（`git grep 'enabled = true'` 在 `src/` 零命中；唯一一次是 `tests/config_test.cpp`），安装流程不碰 `config/server.json`，CLI 也没有命令能开 → 装好的服务在 `127.0.0.1:4122` **根本不监听**，浏览器入口打不开（CLI 不受影响，它走管道）。手动把 `enabled` 改成 `true` 并重启服务后，HTTP 入口**完全正常**（ping / status / bucket / file / trash 全通）。**可选做法（未定，等用户拍）**：① 让安装流程按 5.2 的原文把 `enabled` 置为 `true`（实现那句一直没落地的话）；② 加一条 CLI 命令（如 `config http on` / `config set enabled true`）显式打开。**提交 `674d0b0` 起 `config list/set` 已实现**（但 `set` 只让改 `max_upload_size`），所以做法 ② 已经近在手边。见 5.2、12.1、18.37 |
+| **HTTP 开放哪几个接口（用户决定，未定）** | 提交 `d5779db` 之后业务侧几乎都就绪了，但 **HTTP 入口按用户决定仍关闭**（`enabled` 缺口见上一行）。明确**没加**的路由：`/api/share` 四条（share 数据面已完成）、`DELETE /api/trash`（清空）、`/api/config` 两条（`config list/set` 已完成）。等用户定「先开哪几个简单接口」再一起做（12.3.2、18.37、18.38） |
 
 ### 19.2 上一次实现遗留的待决事项（仍然有效）
 
@@ -8157,7 +8576,7 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 | 首次使用的用户与 Bucket | 开发文档第 93 节旧文要求「提示用户先设置」；**阶段 4 已按需求原文落地**：`current_user` 为空时由 `initialize_root` 自动补占位名 **`user`**（不是旧记录的 `default`），随即写回 `config.json`，用户第一条命令就能成功。**Bucket 不再自动创建**：`current_bucket` 为空时由用户的 `bucket create` 决定（第一个桶自动成为当前，第 28 节），文件类命令才返回 `FMT-305`。`FMT-604` 只在用户被显式清空时出现 |
 | `file delete` 与 Bucket 删除的元数据标记 | 两处必须共用同一套「移入 Trash + 置 `is_trash` + 写 `trash_reason`」逻辑。**Bucket 侧已实现**（`BucketService::set_bucket_files_trash_flag`，只动 `user`+`bucket` 匹配、`is_trash` 原本为 false 的记录，写 `trash_reason="bucket"`；回退时只翻回 `"bucket"` 的那些）；`file delete` 落地时写 `trash_reason="file"` 并复用同一判定（7.1、18.17） |
 | 大小显示 | `size_unit` 默认 `MB`，于是 27 字节显示成 `0MB`。是否改成默认 `AUTO` 待定（`common/size` 已支持 `AUTO`） |
-| 日志轮转 | V1 不做轮转；单文件上限与轮转规则留待后续 |
+| 日志轮转 | **已实现，从待决清单移出（提交 `821aba3`，见 14.6、18.36）**：`fmt.log` 超过 **5 MB** 轮转成 `fmt.log.1`（**只留一代**），`error.log` 同理；**0 表示不轮转**（`Logger::Options::max_log_bytes`）。原口径「V1 不做轮转；单文件上限与轮转规则留待后续」**已作废** |
 | Bucket Trash 元数据结构 | **阶段 4 已定稿（形状随后在 `c2d545d` 改为 `.original`），从待决清单移出**：权威是 `trash/<user>/.original` 的 `{version:1,buckets:[{trashed,original,deleted_at}]}`，**没有 `file_id`**；回收站目录名一律带删除时间戳（同秒冲突加 `_2`）；`data/trash.json` 不再记桶级条目（旧的 `type:"bucket"` 作废），它只服务阶段 5 起的文件级条目（7.3.2、18.17） |
 | 最大上传大小默认值 | 现取 50 MB，硬编码在 `file/service.cpp` 的 `kMaxUploadSize`，尚未接到 `config.max_upload_size` |
 | HTTPS（**本行已作废，见下方更正**） | ~~需要 OpenSSL，会引入 DLL，V1 不支持；`file upload <https://...>` 返回 `UrlInvalid`~~ |
@@ -8165,7 +8584,7 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 | 旧 `paths::` 自由函数 | 仍保留 `executable_path` / `root` 等自由函数供启动阶段使用，与 `PathManager` 并存；后续可考虑收敛，但 `root()` 必须保留（它要先于 PathManager 存在） |
 | `text::join` 的使用纪律 | 凡是用用户输入拼接路径，必须经 `common/text`。这条纪律目前靠代码审查保证，没有编译期强制 |
 | `AppContext` 的指针持有纪律 | `paths` 与 `logger` 都必须 `unique_ptr` 持有，因为业务服务保存它们的引用。这条约束靠注释说明，没有编译期强制——改动 `AppContext` 成员时容易踩回去 |
-| 自动化回归测试 | **口径已变**：本分支阶段 2 起有了一套**自研最小运行器**（`tests/fmt_test.hpp`，`FMT_TEST` / `FMT_CHECK_EQ`，零第三方依赖、可离线构建，`add_test(NAME fmt_tests …)` 接进 CTest），当前 **145 个用例、全绿**（上一轮 118 个，
+| 自动化回归测试 | **口径已变**：本分支阶段 2 起有了一套**自研最小运行器**（`tests/fmt_test.hpp`，`FMT_TEST` / `FMT_CHECK_EQ`，零第三方依赖、可离线构建，`add_test(NAME fmt_tests …)` 接进 CTest），当前 **152 个用例、全绿**（上一轮 118 个，
 提交 `a2b6cd1` 又新增 6 条 `HttpClient.*`，见 17.2、17.2.1、18.18、18.19、18.20；
 提交 `0ad9efc` 再新增 2 条 `File.*`，见 18.21；提交 `5bf2c1f` 再新增 2 条 `File.*`
 与 1 条 `Bucket.*`，见 18.22；提交 `9c3d2cb` 再新增 5 条，见 18.23；
@@ -8178,8 +8597,33 @@ with 501」，**144 个用例全绿**（只改实现与既有用例，没有新�
 `Service.启动时清理temp里的遗留临时文件` 改成「新的留着、旧的清掉」（144），见 18.29；
 提交 `8f0fd5c` 只补断言（144 不变），见 18.30；提交 `4ddb515` 只改实现与既有用例
 （144 不变），见 18.31；提交 `d108c80` 新增 `Cli.版本文本只有一个来源`（145），见 18.32；
-提交 `bb7a40f` 新增 `Cli.数据根切换提示要把两个根都说清楚`（**146**），见 18.33）。
+提交 `bb7a40f` 新增 `Cli.数据根切换提示要把两个根都说清楚`（146），见 18.33；
+提交 `c573f14` 新增 `Cli.service子命令集合`（147），见 18.34；
+提交 `a340d1e` 新增 3 条（**150**：`CliE2e.核心链路走真实exe与真实管道`、
+`CliE2e.交互式确认答n不删答y才删`〔新文件 `tests/cli_e2e_test.cpp`〕、
+`Ipc.管道名可被FMT_PIPE覆盖`），见 18.35；
+提交 `821aba3` 新增 2 条 `Logger.*`（152），见 18.36；
+提交 `674d0b0` 新增 `Service.列表排序配置与清空回收站`（**153**），见 18.37；
+提交 `d5779db` 新增 `Service.分享的创建查看列出撤销与计数`（**154**），见 18.38）。
+**端到端冒烟测试（提交 `a340d1e`，`tests/cli_e2e_test.cpp`，套件名 `CliE2e`）**：
+进程内起 `ServerRuntime`（用 `FMT_PIPE` 私有管道名，13.9.1）→ 把 `fmt.exe` **复制到临时数据根**
+（「数据根 = CLI 所在目录」）→ `CreateProcessW` 拉起**真实 exe**、喂 stdin、合并收
+stdout+stderr → 断言**退出码与用户看到的文字**。两条用例的覆盖面：
+`CliE2e.核心链路走真实exe与真实管道`（version / `bucket create WORK` 小写归一 + 提示 / list /
+upload / `FMT-304` / `FMT-105` / `file get` 按名与按 id / `FMT-002` / `file delete` →
+`trash list`（含 `[文件]`）→ `trash get`（含「回收站路径」）→ `trash restore` /
+跨桶删除无 `--yes` → `FMT-016` 且**文件仍在**、带 `--yes` → 成功且消息带「Bucket：work」/
+永久删除无 `--yes` → `FMT-016`（含「不可恢复」）、带 `--yes` → 成功 /
+删桶：空桶直接成功（仍打印「只能整体恢复」）、非空桶无 `--yes` → `FMT-016`）、
+`CliE2e.交互式确认答n不删答y才删`（喂 `n` → 「确认执行？」+「已取消」且文件仍在；
+喂 `y` → 不再出现「已取消」且条目进了回收站）。**为什么必须有它**：`file delete` 弹
+`abort()` 那次崩溃，**单元测试全绿却没挡住**——测试直接调业务层、自己拼请求形状，
+而 CLI 拼的是另一种形状；**只有真实 exe 走一遍用户走的路，这类回归才会当场露出来**
+（那次崩溃对**所有破坏性操作都生效**，所以本套件第一个 `file delete` 用例就会失败）。
+**耗时**：全量约 **17 秒**（端到端部分约 5 秒）——它会拉起子进程，比纯单元测试慢，
+但仍在十几秒量级。
 **仍然没有的**是「上传 →
-列表 → 下载 → 分享」这条**跨模块链路**的自动化：它依旧靠端到端实测，若后续要补自动化，优先补这一段，而不是再堆各模块的孤立用例（提交 `188e85d` 补上了管道与 HTTP 两条
-「上传 → 列表 → 查询 → 软删除」的端到端用例，但**没有**覆盖下载与分享） |
+列表 → 下载 → 分享」这条**跨模块链路**的完整自动化：下载与分享两段仍靠端到端实测
+（`a340d1e` 已把「上传 → 列表 → 查询 → 软删除 → 回收站 → 确认」这段补上了；
+`188e85d` 那两条端到端用例是**进程内**调用的，不是真实 exe） |
 

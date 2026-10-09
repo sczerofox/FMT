@@ -470,6 +470,27 @@ ID（第 27 节）。加载规则见第 10 节：**字段缺失或类型不符�
 上述「检查 → 加载 → 校验」流程在 **Service 形态**中执行；CLI 形态不加载配置、不创建配置目录、
 也不写配置文件，只把命令经命名管道交给服务（见第 76 节、第 91～94 节）。
 
+**`config list` / `config set max_upload_size <大小>`（提交 `674d0b0` 新增）**：
+
+```text
+config.list   返回 current_user / current_bucket / max_upload_size / size_unit /
+              language / path；CLI 打成标签行（不吐 JSON）：
+                配置文件：config/config.json
+                当前用户：user
+                当前 Bucket：lazy
+                上传上限：50MB（52428800 字节）
+                大小单位：MB    语言：zh-CN
+config.set    **只让改 max_upload_size**（其余只读）：
+                其它 key → FMT-001「V1 只能改 max_upload_size（其余只读）：<key>」
+              理由：它是唯一需要按机器/网络调整的值；size_unit / language 目前没有
+              对应行为，current_bucket 走 bucket use
+大小写法      纯字节 10485760，或 10MB / 512KB / 1GB（1KB = 1024 字节）；
+              下限 1KB、上限 100GB（兜溢出）；非法值一律 FMT-001
+落盘          走 save_config（第 11 节那套 .tmp 原子替换）；
+              **落盘失败回滚内存里的值**并返回错误
+op            config.* 两种：config.list / config.set（管道与将来的 HTTP 路由共用）
+```
+
 ---
 
 # 11. 配置保存
@@ -801,7 +822,17 @@ V1 暂定：
 
 ```text
 max_download_count = 20
+expire_time        = 现在 + 7 天（提交 d5779db 定下；本文档原来只写了 20，
+                     7 天来自 FMT 技术文档.md 第 7.2 节「20 次 + 7 天 = 7 天内最多下载 20 次」）
 ```
+
+**提交 `d5779db` 起本模块已落地（数据面）**：`src/share/` 真实存在，
+`data/share.json` 的形状就是上面那张表（`version:1` + `shares[]`）；
+`share_id` = **12 位随机十六进制**（`BCryptGenRandom`，见第 48 节）；
+`expire_time` 为空 = JSON 里写 `null` = **不过期**；
+**两个条件相互独立**（7 天内**或者** 20 次以内，谁先到谁生效）；
+一个文件可以有**多个** share，各自独立计数。
+**HTTP 下载端点还没做**（用户决定先不加接口，见 `FMT 技术文档.md` 第 12.3、18.38 节）。
 
 ---
 
@@ -1708,10 +1739,12 @@ current_bucket = ""
 
 一律带时间戳 + `.original` 记原名，两件事各自独立，谁都不会被覆盖，也不会认错身份。
 
-`FMT-203 BucketInUse`（「仍被引用，不能删除」）在当前实现里**不会由 `bucket delete` 返回**：
+`FMT-203 BucketInUse`（「仍被引用，不能删除」）**保留（V1 未使用）**——提交 `674d0b0`
+之后口径写死为这一句：**当前没有任何代码会产生它**。
 V1 允许删除仍有文件的 Bucket（数据一并移入回收站，文件记录标记 `is_trash` 并写
-`trash_reason="bucket"`）。该编号保留给
-以后「有 Share 引用等场景」的语义，不改变已有含义。
+`trash_reason="bucket"`）。原本设想它用于「桶仍被引用」，但实际路径分别被
+**`FMT-401`（回退冲突）**、**`FMT-402`（原桶已删）**、**`FMT-016`（删非空桶要确认）**
+覆盖了，所以没有产生它的代码。**编号语义冻结、不删行**，但也**不要假装它会被返回**。
 
 ---
 
@@ -2583,12 +2616,19 @@ is_trash = true
 
 Trash 单独查询。
 
-**实现（提交 `188e85d`，`FileService::list()`）**：
+**实现（提交 `188e85d`，`FileService::list()`；**排序在提交 `674d0b0` 扩成三种**）**：
 
 ```text
 作用域    record.user == current_user && record.bucket == current_bucket && !record.is_trash
-排序      按 file_id 升序（= 入库顺序：同一天是 N 递增，跨天按日期字符串也天然有序）
+排序      file list --sort name|size|id（提交 674d0b0）：
+            name（**默认**）  按文件名，**不区分大小写**；同名用 file_id 保证稳定
+            size             size 大的在前
+            id               入库顺序（file_id 里的日期+序号天然递增）
+          乱写（不是这三个）→ **FMT-001**，不静默按默认排
+          响应里新增 sort 字段，回显实际用的排序方式
+          CLI 侧：--sort 是**本地开关**（不进 argv），单独放进 args.sort
 前置      current_user 为空 → FMT-604 NoCurrentUser；current_bucket 为空 → FMT-305 NoCurrentBucket
+原口径    重排前固定「按 file_id 升序」——它现在只是 id 这一种（默认换成 name）
 ```
 
 服务端 `data`（管道与 HTTP 完全相同，第 12.3.2.1 节）：
@@ -3023,6 +3063,17 @@ Share ID 必须：
 
 Share ID 可以作为外部访问凭证。
 
+**提交 `d5779db` 的实现（照源码）**：
+
+```text
+形状     12 位随机十六进制（例如 eaaecc6869ab）
+来源     BCryptGenRandom（Windows CNG 系统调用）——不是 std::mt19937 ✗：
+         伪随机可预测，当访问凭证不合格；FMT 技术文档.md 第 3.x 节库表本来
+         就指定了这个系统调用
+撞号     创建时撞号就重摇，最多 16 次
+失败     生成失败**当错误返回**，绝不退化成可预测 id、也不退化成递增数字
+```
+
 ---
 
 # 49. Share Get
@@ -3051,6 +3102,25 @@ Share 是否过期
 
 而不是伪装成从未存在。
 
+**提交 `d5779db` 的实现（如实报状态）**：
+
+```text
+未知 share_id            → **真错误 FMT-500（退出码 3）**「分享不存在」
+存在但不可用（四种）      → **成功返回 + 状态**，不伪装成「从未存在」：
+   已过期 / 次数用尽 / 已撤销 / 关联文件在回收站
+响应形状                 state 字段（可用 / 已过期 / 次数用尽 / 已撤销 /
+                        关联文件不可用）+ available 布尔 + message
+expire_time 解析失败     （被手工改坏）按**已过期**处理——安全侧默认可拒
+撤销（is_valid=false）   映射到 FMT-500；**撤销是删记录**，
+                        所以 share delete 之后再 get 就是 FMT-500
+
+检查顺序（按本节 §49，提交 d5779db 就是按这个顺序写的）：
+    有效性 → 文件存在 → 文件不在回收站 → **过期 → 次数**
+注意：§50 下面那段流程图把「次数」写在「过期」前面，与本节的列表顺序**不一致**；
+      提交 d5779db 取本节（§49）的顺序：**先过期、再次数**。
+      两者只影响「同时过期且次数用尽」时报哪个状态，实现以 §49 为准。
+```
+
 ---
 
 # 50. Share Access
@@ -3074,6 +3144,19 @@ Share
 ```
 
 Share 不得绕过 File 状态。
+
+**提交 `d5779db` 的落地（本节是 share 模块的中心约束）**：
+
+```text
+create   要求文件属于当前用户、且**不在回收站**，否则 FMT-503
+回收站   文件进回收站后，它的 share **立刻不可用**（FMT-503，状态「关联文件不可用」），
+         并且**阻断新的 create**
+下载     register_download() 在**业务锁内**一次完成「全部检查 + 计数 +1 + 落盘」——
+         所以第 51 节那个「19 + 两次 = 21」不可能发生
+         计数写不进去就**拒绝这次下载**（不放行，否则会超发）
+HTTP     下载端点还没做（用户决定），但 op 已就绪：share.download
+         （管道可用，将来的 HTTP 下载端点也走它）
+```
 
 ---
 
@@ -3114,6 +3197,10 @@ Request B
 
 必须具备原子性/并发保护。
 
+**提交 `d5779db` 的实现**：`register_download()` 在**业务锁内**一次完成
+「全部检查 + 计数 +1 + 落盘」，因此「19 + 两次 = 21」不可能发生；
+**计数写不进去就拒绝这次下载**（不放行——否则会超发）。
+
 ---
 
 # 52. Trash Service
@@ -3125,6 +3212,25 @@ trash list
 trash get
 trash restore
 trash delete
+trash empty
+```
+
+**`trash empty`（提交 `674d0b0` 新增）：一次清空回收站的两级条目**：
+
+```text
+语义       文件级 + 桶级**一次全删**，永久删除、不可恢复
+形状       与其它破坏性操作一致：dry_run 预检回
+           {files, buckets, bytes, needs_confirm, blocked:false, message}
+           缺 force → FMT-016；CLI 侧 --yes 或窗口里答 y
+空回收站   needs_confirm = false，**直接成功返回（0 项）**，不打扰用户
+消息       预检「永久删除回收站里的全部 N 项（x 个文件、y 个桶，共 SIZE），不可恢复」
+           执行「已清空回收站：x 个文件、y 个桶，共释放 SIZE」
+实现要点   ① **每删一项都重新 list 一遍**——删掉一项后其余条目的索引/路径会变，
+              用旧列表接着删会大面积失败
+           ② **先删文件级、再删桶级**（避免「条目没了、数据还在」的孤儿）
+           ③ 单条失败**跳过并记日志**，不卡死整个清空；kMaxRounds 兜底防死循环
+HTTP       路由**没有加**（DELETE /api/trash）——HTTP 入口现在按用户决定是关闭的，
+           先不加，等那批「简单接口」一起做（FMT 技术文档.md 第 12.3 节有注明）
 ```
 
 **阶段状态（提交 `0fc242b` 之后：两级都可用）**：`trash` 组原本整组排在阶段 7，
@@ -3987,11 +4093,31 @@ ERROR
 
 ```text
 FMT_ROOT/log/
-├── fmt.log        全部日志
-└── error.log      仅 ERROR 级
+├── fmt.log        全部日志（超过 5 MB 轮转成 fmt.log.1，只留一代）
+└── error.log      仅 ERROR 级（同样轮转）
 ```
 
 不放入 `data/`，因为日志不是业务数据。
+
+**日志轮转（提交 `821aba3`，原来「V1 不做轮转」的口径已作废）**：
+
+```text
+上限       超过 5 MB 轮转成 fmt.log.1，**只留一代**；error.log 同理。
+           0 表示不轮转（Logger::Options::max_log_bytes，
+           默认 kDefaultMaxLogBytes = 5 * 1024 * 1024）。
+前置条件   日志**每行开-写-关**（append_line()），不再长期持有 ofstream。
+           两个进程（CLI 与服务）共用同一个文件：长期开着的句柄既会挡住改名，
+           也会让另一个进程继续往已改名的文件里写——没有这一步，轮转做不成。
+检查节奏   每写 **64 行**检查一次大小（kRotationCheckInterval）。不用时间节流：
+           写入频率差异大，按行计数既便宜又确定，**测试也能预期**。
+           改名失败（另一个进程正好在写）不报错，下一次检查再试。
+轮转之后   在新文件里写一行说明：「日志超过 N 字节，已轮转：fmt.log -> fmt.log.1」，
+           用户翻日志能看到断点。
+打开时     仍然验一次可写（写空串）✓：写不了要立刻报错，而不是等第一条日志静默丢掉。
+用例       Logger.超过上限会轮转出一代（上限 1 KB、写 400 行 → .1 存在、两代都非空、
+           新文件里有「轮转」说明行）；Logger.上限为零时不轮转（写 200 行 → 没有 .1）
+（`FMT 技术文档.md` 第 14.2、14.6、18.36 节）
+```
 
 每行格式：
 
@@ -4011,8 +4137,15 @@ FMT_ROOT/log/
 > **控制台负责用户交互和重要异常；日志文件负责完整运行记录。**
 
 **CLI 与 Service 追加同一个日志文件**：两个进程都以「追加」方式打开同一份
-`<数据根>/log/fmt.log`（`error.log` 仅 ERROR 级，同样追加），一次一行写入；
+`<数据根>/log/fmt.log`（`error.log` **仅 ERROR 级**，同样追加），一次一行写入
+（**每行开-写-关**，这也正是轮转能做成的前提，见上）；
 MSVC 文件流是共享模式，因此不再存在「两个进程争抢同一日志文件」的问题。
+
+> **`error.log` 的口径是「仅 ERROR 级」**（提交 `821aba3` 顺带对齐）：`logger.hpp` 的
+> 头注释原来写着「WARN 也进 `error.log`」，与本节口径**冲突**；作者一度照注释改了代码，
+> **被既有用例当场抓住**（`Logger.写入两个文件且ERROR单独成文件` 断言 `error.log` 只有
+> 1 行），于是改回代码、修掉注释。**以本节为准：WARN 只进 `fmt.log`。**
+> 同时修掉的还有「只有 Service 打开日志文件」那句旧话（下面这段旧口径本来就已经作废）。
 
 旧口径是「只有 Service 写日志文件，CLI 只输出控制台」，已被推翻。理由看 `service stop`
 最清楚：用户在 CLI 里敲下这条命令，服务随即被停掉，于是这次操作在日志里**一个字都没有**
@@ -4156,21 +4289,30 @@ fmt.exe help <组>          该组详情
 help / help <组>           交互循环内同上（--help 在交互里是 help 的别名）
 ```
 
-`help`（不带参数）只列命令、不加描述（**提交 `d108c80` 起多了 `(version)` 一行**）：
+`help`（不带参数）只列命令、不加描述（**提交 `d108c80` 起多了 `(version)` 一行；
+**提交 `674d0b0` 起 `trash` 多了 `empty`、新增 `(config) list set`，
+`(share)` 从「尚未实现」组移进「可用命令」组**）：
 
 ```text
 可用命令：
   (service)  install  uninstall  start  stop  reinstall  status
   (bucket)   create  list  get  use  delete
   (file)     upload  list  get  delete
-  (trash)    list  get  restore  delete
+  (trash)    list  get  restore  delete  empty
+  (share)    create  get  list  delete
+  (config)   list  set
   (help)     help [命令]
   (version)  version                打印版本与构建日期
   (exit)     exit  quit
 
 业务命令（服务端尚未实现，现在会返回 FMT-602）：
-  (share)    create  get  list  delete
+  (server)   （`server.*` 是唯一还剩的空壳；原口径写 `(share)` 已作废）
 ```
+
+> **`FMT-602` 现在只对应两件事**（提交 `d5779db`）：`server.*` 这个空壳，
+> 以及**未实现的 HTTP 路由**（兜底路由的 501，见第 82 节）。
+> 原口径「share 未实现、返回 FMT-602」**已作废**。
+
 
 **`help version` 的正文（提交 `d108c80`，照源码抄）**：
 
@@ -4290,6 +4432,9 @@ trash —— 回收站（两类条目：文件级 [文件] 与桶级 [桶]，都
                    交互窗口里会先说明要删什么、再问一次；
                    一次性命令必须加 --yes，例如
                    fmt.exe trash delete lazy-fox_20261008012233 --yes
+  empty            **清空整个回收站，不可恢复**：两级条目一次全删。
+                   同样先说明「几项、多少」再问一次；一次性命令加 --yes。
+                   （提交 674d0b0 新增；**空回收站不打扰**：直接成功返回 0 项）
 
 标识可以是 file_id（文件）、回收站里的目录名（桶）或原名；
 命中多条会报候选，请用 file_id 或完整的回收站名指定。
@@ -4316,11 +4461,12 @@ file —— 文件（当前用户在当前 Bucket 里的文件）
                            不重复入库。大小上限取 config.json 的 max_upload_size。
                            文件名不能与文件标识同形（fmt-YYYYMMDD-N）：
                            那会和 file_id 混淆，属保留形状（FMT-106）。
-  list                     列出当前 Bucket 的正常文件
+  list [--sort name|size|id]  列出当前 Bucket 的正常文件；默认按名字，
+                           size 大的在前，id 是入库顺序
   get <file_id|文件名>     按文件名只查正常文件；按 file_id 连回收站里的
                            也查得到（带 is_trash 与 trash_path）
-  delete <file_id|文件名>  软删除进回收站，file_id 不变
-                           （文件级回收站目前只能写、还不能从 trash 查回，待阶段 7）
+  delete <file_id|文件名>  软删除进回收站，file_id 不变；之后用
+                           trash list / trash restore 找回来
 
 文件落在 repository/<用户>/<Bucket>/YYYY/MM/DD/ 下；上传先写 temp/，
 校验（大小上限、MD5、文件名）通过后才移动入库。
@@ -4330,9 +4476,11 @@ file —— 文件（当前用户在当前 Bucket 里的文件）
 
 > **上面这块被改过四处，已照新源码抄**：`delete` 那两行在提交 `0ad9efc` 从
 > 「`delete <file_id>` 软删除进回收站，`file_id` 不变（可用 trash 查回）」改成现在这样
-> ——`delete` 与 `get` 一样同时收 `file_id` 和文件名；「可用 trash 查回」这句本来就是
-> 跑在实现前面的说法，现在换成实况「只能写、还不能从 trash 查回，待阶段 7」
-> （第 43、53.2、104 节）。`upload` 两行与末行则是 `a2b6cd1` 之后改的：
+> ——`delete` 与 `get` 一样同时收 `file_id` 和文件名；
+> **提交 `674d0b0` 又把括号里那句「文件级回收站目前只能写、还不能从 trash 查回，待阶段 7」
+> 换成「之后用 trash list / trash restore 找回来」**——两级读取侧早在 `0fc242b` 就落地了，
+> 那句早就过时（第 43、53.2、104 节）。`list` 那行也是 `674d0b0` 改的：
+> 多了 `--sort name|size|id`（第 42、43 节）。`upload` 两行与末行则是 `a2b6cd1` 之后改的：
 > 原来的「v1 不支持 https（需要 OpenSSL）；同时只支持 http」与行为相反，
 > 现在源码写的是 `http://` 或 `https://`、「大小上限取 config.json 的 max_upload_size」、
 > 末行「网络下载走系统组件（WinHTTP + Schannel），支持 https，不需要 OpenSSL」。
@@ -4345,9 +4493,31 @@ file —— 文件（当前用户在当前 Bucket 里的文件）
 > （第 41、42 节）。**按名字定位的比较在提交 `5bf2c1f` 起不区分大小写**（第 38、43 节），
 > `help` 正文到 `9c3d2cb` 才写明这一点。
 >
-> `share` 那组的帮助仍写着「服务端尚未实现，现在返回 FMT-602」，与实况一致
-> （第 105 节）。
->
+> `share` 那组的帮助**原来**写着「服务端尚未实现，现在返回 FMT-602」——**提交 `d5779db`
+> 起 share 数据面已落地**，命令总览里 `(share)` 移进「可用命令」组、`help share` 换成下面
+> 这份正文（照源码抄，第 16、46～51、105 节）：
+
+```text
+share —— 分享（把**正常**文件开放成一条可撤销的链接）
+  create <file_id>    创建分享：默认 20 次、7 天过期；返回 share_id
+  get <share_id>      查看：如实报告状态（可用 / 已过期 / 次数用尽 /
+                      已撤销 / 关联文件在回收站），不伪装成不存在
+  list <file_id>      列出某个文件的所有分享（最近创建的在前）
+  delete <share_id>   撤销分享（删记录）
+```
+
+> **`help config`（提交 `674d0b0` 新增，照源码抄）**：
+
+```text
+config —— 配置（config/config.json）
+  list                       看当前生效的配置
+  set max_upload_size <大小>  改上传大小上限；大小可写 10485760，
+                             也可写 10MB / 512KB / 1GB（1KB = 1024 字节）
+
+V1 只让改 max_upload_size：它是唯一需要按机器/网络情况调整的值，
+其余项（current_user / size_unit / language）只读。
+```
+
 > **原「⚠ 残留不一致」注记到此结清**：那条说的是 `a2b6cd1` 没有清理 `help file` 里的
 > https 旧文案（当时源码里确实还写着「v1 不支持 https」）。后续提交已经把那两句改掉了，
 > 现在源码与行为一致（`FMT 技术文档.md` 第 11.4、18.20 节同注）。
@@ -4356,8 +4526,9 @@ file —— 文件（当前用户在当前 Bucket 里的文件）
 `help` / `--help` 全程**不提权、不连服务、不写日志**。
 
 `service` 命令**不带 `--` 前缀**：旧写法 `fmt.exe --service install` 作废；
-service 有 `install` / `uninstall` / `start` / `stop` / `status` 五条，**没有 pause，也没有 delete**
-（旧 `delete` 已更名为 `uninstall`）；其中 `status` 是查询命令，不提权、不弹 UAC。
+service 有 `install` / `uninstall` / `start` / `stop` / **`reinstall`** / `status` 六条，
+**没有 pause，也没有 delete**（旧 `delete` 已更名为 `uninstall`）；
+其中 `status` 是查询命令，不提权、不弹 UAC，其余每条都提权。
 帮助文本里必须列出 `status`，见第 70 节、第 95 节。
 
 帮助内容应该：
@@ -5891,9 +6062,11 @@ fmt> trash delete lazy-fox_20261008012233        ← 服务端侧的兜底（任
 > **提交 `188e85d` 再同步一次**：`(file) upload list get delete` 也移进「可用命令」组
 > （命令总览的顺序是 service → bucket → file → trash → help → exit），
 > 「尚未实现」组**只剩 `(share)` 一行**，`help file` 的正文照源码写进第 68 节
-> （不含「尚未实现」字样）；`help share` 仍注明「服务端尚未实现，现在返回 FMT-602」，
-> 与实况一致。上面的「只有 `file` / `share` 两组」是**阶段 4 收尾时**的原话，
-> 现在只对 `share` 一组成立。
+> （不含「尚未实现」字样）。上面的「只有 `file` / `share` 两组」是**阶段 4 收尾时**的原话；
+> **提交 `674d0b0` / `d5779db` 之后连 `share` 也落地了**：命令总览里 `(share)` 移进
+> 「可用命令」组、「尚未实现」组只剩 `(server)` 这个空壳，`help share` 换成
+> 「数据面已落地、HTTP 下载端点还没做」的正文（第 68 节）。
+> 原口径「`help share` 仍注明『服务端尚未实现，现在返回 FMT-602』，与实况一致」**已作废**。
 
 ---
 
@@ -7277,6 +7450,46 @@ V2
     才会当场露出来**（那次崩溃对所有破坏性操作都生效，所以第一个 `file delete`
     用例就会失败）。全量约 17 秒（端到端约 5 秒），比纯单元测试慢但仍可每次跑
     （第 109 节、`FMT 技术文档.md` 第 13.9.1、17.2、18.35 节）
+59. 日志要轮转（提交 `821aba3`）：`fmt.log` 超过 **5 MB** 轮转成 `fmt.log.1`
+    （**只留一代**），`error.log` 同理；**0 表示不轮转**（`Logger::Options::max_log_bytes`，
+    默认 5 MB）。**前置条件是「每行开-写-关」**（`append_line()`）：两个进程共用同一个
+    日志文件，长期持有的 `ofstream` 既会挡住改名、也会让另一个进程继续往已改名的文件里写。
+    每写 **64 行**检查一次大小（不用时间节流：按行计数既便宜又确定，测试也能预期）；
+    改名失败（另一个进程正好在写）不报错，下一次再试；轮转后在新文件里写一行说明。
+    打开时仍验一次可写（写空串）。**口径对齐**：`error.log` **仅 ERROR 级**——
+    `logger.hpp` 原来写「WARN 也进 `error.log`」，与第 65 节冲突，被既有用例
+    `Logger.写入两个文件且ERROR单独成文件` 当场抓住后改回代码、修掉注释
+    （第 65 节、`FMT 技术文档.md` 第 14.2、14.6、18.36 节）
+60. `trash empty` 一次清空两级（提交 `674d0b0`）：dry_run 预检回
+    {files, buckets, bytes, needs_confirm, blocked:false, message}；缺 force → FMT-016；
+    CLI 侧 `--yes` 或窗口答 `y`；**空回收站 needs_confirm = false、直接成功返回 0 项**。
+    **每删一项都重新 list 一遍**（删掉一项后其余条目的索引/路径会变，用旧列表接着删会
+    大面积失败）；**先删文件级、再删桶级**（避免「条目没了、数据还在」的孤儿）；
+    单条失败**跳过并记日志**，不卡死整个清空，kMaxRounds 兜底防死循环。
+    **HTTP 路由没有加**（`DELETE /api/trash`）：HTTP 入口现在按用户决定是关闭的，
+    先不加，等那批「简单接口」一起做（第 52 节、`FMT 技术文档.md` 第 12.3 节）
+61. `file list --sort name|size|id`（提交 `674d0b0`）：**默认 name**（不区分大小写，
+    同名用 file_id 保证稳定）；size 大的在前；id 是入库顺序。
+    **乱写 → FMT-001**，不静默按默认排；响应新增 `sort` 字段回显实际排序；
+    CLI 侧 `--sort` 是**本地开关**（不进 argv），单独放进 `args.sort`（第 42 节）
+62. `config list` / `config set max_upload_size <大小>`（提交 `674d0b0`）：
+    list 返回 current_user / current_bucket / max_upload_size / size_unit / language /
+    path，CLI 打成标签行；set **只让改 max_upload_size**（其余只读 → FMT-001
+    「V1 只能改 max_upload_size（其余只读）：<key>」）。大小写法：纯字节或
+    10MB / 512KB / 1GB（1KB = 1024 字节），下限 1KB、上限 100GB；非法值 FMT-001。
+    落盘走 save_config，**落盘失败回滚内存里的值**并返回错误（第 10 节）
+63. `share` 数据面已落地（提交 `d5779db`）：`src/share/` 真实存在，
+    `share create/get/list/delete` 可用，**HTTP 下载端点还没做**（用户决定）。
+    `share_id` = **12 位随机十六进制**（`BCryptGenRandom`，撞号重摇最多 16 次，
+    生成失败当错误返回——绝不退化成可预测 id）；默认 **20 次 + 7 天**（两个条件
+    **相互独立**）；`share get` **如实报状态**：未知 id 才是真错误 `FMT-500`，
+    「已过期 / 次数用尽 / 已撤销 / 关联文件在回收站」都是**成功 + 状态**，
+    不伪装成不存在；检查顺序按第 49 节：有效性 → 文件存在 → 不在回收站 →
+    **过期 → 次数**（第 50 节那段流程图把次数写在过期前面，**以第 49 节为准**）；
+    `expire_time` 解析失败按**已过期**处理。`share.download` 是新增 op：
+    `register_download()` 在**业务锁内**一次完成「全部检查 + 计数 +1 + 落盘」，
+    **计数写不进去就拒绝这次下载**。原口径「share 未实现、返回 FMT-602」**已作废**
+    ——`FMT-602` 现在只对应 `server.*` 与**未实现的 HTTP 路由**（第 16、46～51 节）
 
 ```
 
@@ -7907,6 +8120,35 @@ pipe」）**：
 （`FMT 技术文档.md` 第 13.9.1、13.9.2、13.9.3、17.2、18.35 节）
 ```
 
+**日志轮转并入的决策（提交 `821aba3`「feat(logger): rotate the log file instead of
+growing for ever」）**：
+
+```text
+背景：fmt.log 原来**无上限追加**（服务跑几周就一直长）。现在超过 5 MB 轮转成 fmt.log.1
+      （**只留一代**），error.log 同理。
+为什么现在才可能：日志原来长期持有 ofstream ✗——CLI 与服务共用同一个文件，句柄一直
+      开着既会挡住改名，也会让另一个进程继续往已改名的文件里写。现在改成**每行开-写-关**
+      （append_line()），改名才有可能成功。**这是轮转的前置条件，不是顺手改的。**
+检查节奏：每写 **64 行**检查一次大小（kRotationCheckInterval）。不用时间节流：写入
+      频率差异大，按行计数既便宜又确定，测试也能预期。改名失败（另一个进程正好在写）
+      **不报错**，下一次检查再试。
+轮转之后：在**新文件**里写一行说明「日志超过 N 字节，已轮转：fmt.log -> fmt.log.1」，
+      用户翻日志能看到断点。
+配置：Logger::Options::max_log_bytes，**0 表示不轮转**（测试与需要完整日志的场景）；
+      默认 kDefaultMaxLogBytes = 5 * 1024 * 1024。
+打开时：仍然验一次可写（写空串）✓——写不了要立刻报错，而不是等第一条日志静默丢掉。
+顺带修掉头文件两处过时说法（与第 65 节/技术文档 14.2、14.3 对齐）：
+  ① 「只有 Service 打开日志文件；CLI 用 console_only()」——早已不是这样：CLI 也往
+     同一个 <数据根>/log/fmt.log 追加（「日志跟着用户敲的命令走」）。
+  ② 「WARN 也进 error.log」——与第 65 节冲突（error.log **仅 ERROR 级**）。作者一开始
+     照头文件改了代码，**被既有测试当场抓住**（Logger.写入两个文件且ERROR单独成文件
+     断言 error.log 只有 1 行），于是改回代码、修掉头文件那张表。
+测试：150 → **152 项全绿**。新增 Logger.超过上限会轮转出一代（上限 1 KB、写 400 行 →
+      .1 存在、两代都非空、新文件里有「轮转」说明行）、Logger.上限为零时不轮转
+      （写 200 行 → 没有 .1，200 行全在一个文件里）。
+（`FMT 技术文档.md` 第 14.2、14.6、19.1、18.36 节）
+```
+
 > **实测风险 → 已被提交 `8f2fbc5` 处理（2026-10-09）**：做 `version` 测试时在**构建目录**里
 > 跑了交互模式，CLI 按设计把**自己所在目录**声明为数据根，于是服务的数据根被切到了构建目录
 > （日志里是 `[Main] 数据根切换: D:/Data/CLionProjects/FMT/cmake-build-debug/bin
@@ -8067,8 +8309,9 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 > **测试计数走过的台阶**：118（`188e85d`）→ 124（`a2b6cd1`）→ 126（`0ad9efc`）→
 > 129（`5bf2c1f`）→ 134（`9c3d2cb`）→ 136（`711da4c`）→ 140（`0fc242b`）→
 > 142（`a9af276`）→ 143（`2c841c8`）→ 144（`5b316b3`）→ 144（`8f0fd5c` 只补断言，
-> 计数不变）→ 145（`d108c80`）→ 146（`bb7a40f`）→ 147（`c573f14`）→ **150（`a340d1e`）**。
-> 第 109、112、125 节已按 150 更新。
+> 计数不变）→ 145（`d108c80`）→ 146（`bb7a40f`）→ 147（`c573f14`）→ 150（`a340d1e`）→
+> 152（`821aba3`）→ 153（`674d0b0`）→ **154（`d5779db`）**。
+> 第 109、112、125 节已按 154 更新。
 
 后续开发过程中，如果发现：
 
