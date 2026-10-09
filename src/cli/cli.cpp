@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -196,8 +197,12 @@ bool print_command_help(const std::string& topic) {
             "                           不重复入库。大小上限取 config.json 的 max_upload_size。\n"
             "                           文件名不能与文件标识同形（fmt-YYYYMMDD-N）：\n"
             "                           那会和 file_id 混淆，属保留形状（FMT-106）。\n"
-            "  list [--sort name|size|id]  列出当前 Bucket 的正常文件；默认按名字，\n"
-            "                           size 大的在前，id 是入库顺序\n"
+            "  list [--sort name|size|id] [--search 关键字] [--page N --page-size M]\n"
+            "                           列出当前 Bucket 的正常文件；默认按名字，\n"
+            "                           size 大的在前，id 是入库顺序。\n"
+            "                           --search 按文件名/file_id 做不区分大小写的子串匹配；\n"
+            "                           --page-size 给了才分页（0 = 一次给全），\n"
+            "                           顺序固定为「过滤 -> 排序 -> 分页」，翻页不会漏或重。\n"
             "  get <file_id|文件名>     按文件名只查正常文件；按 file_id 连回收站里的\n"
             "                           也查得到（带 is_trash 与 trash_path）\n"
             "  delete <file_id|文件名>  软删除进回收站，file_id 不变；之后用\n"
@@ -696,12 +701,25 @@ void print_business_data(const nlohmann::json& data) {
     }
 
     // 文件列表：files: [{file_id, file_name, size}, …]
+    // 有 total 就用它（分页时 items->size() 只是本页条数，说"共 N"会骗人）。
     if (const auto items = data.find("files"); items != data.end() && items->is_array()) {
         for (const nlohmann::json& item : *items) {
             std::printf("  %s  %s\n", item.value("file_name", std::string{}).c_str(),
                         format_size(item.value("size", std::uintmax_t{0})).c_str());
         }
-        std::printf("共 %zu 个文件\n", items->size());
+        const std::size_t total = data.value("total", items->size());
+        if (data.value("search", std::string{}).empty()) {
+            std::printf("共 %zu 个文件", total);
+        } else {
+            std::printf("匹配「%s」共 %zu 个文件", data.value("search", std::string{}).c_str(),
+                        total);
+        }
+        const int page_size = data.value("page_size", 0);
+        if (page_size > 0) {
+            std::printf("（第 %d/%d 页，本页 %zu 条）", data.value("page", 1),
+                        data.value("total_pages", 0), items->size());
+        }
+        std::printf("\n");
         return;
     }
 
@@ -891,6 +909,9 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     nlohmann::json arguments = nlohmann::json::array();
     bool confirmed = false;
     std::string sort_key;
+    std::string search_key;
+    int page = 0;
+    int page_size = 0;
     for (std::size_t i = 2; i < parts.size(); ++i) {
         if (parts[i] == "--yes" || parts[i] == "-y") {
             confirmed = true;
@@ -898,6 +919,18 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
         }
         if (parts[i] == "--sort" && i + 1 < parts.size()) {
             sort_key = parts[++i];
+            continue;
+        }
+        if ((parts[i] == "--search" || parts[i] == "-s") && i + 1 < parts.size()) {
+            search_key = parts[++i];
+            continue;
+        }
+        if (parts[i] == "--page" && i + 1 < parts.size()) {
+            page = std::atoi(parts[++i].c_str());
+            continue;
+        }
+        if (parts[i] == "--page-size" && i + 1 < parts.size()) {
+            page_size = std::atoi(parts[++i].c_str());
             continue;
         }
         arguments.push_back(parts[i]);
@@ -932,6 +965,15 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     request.args = argument_envelope(arguments, /*dry_run=*/false, confirmed || destructive);
     if (!sort_key.empty()) {
         request.args["sort"] = sort_key;  // file list --sort name|size|id
+    }
+    if (!search_key.empty()) {
+        request.args["search"] = search_key;  // file list --search 关键字
+    }
+    if (page > 0) {
+        request.args["page"] = page;  // file list --page 2 --page-size 20
+    }
+    if (page_size > 0) {
+        request.args["page_size"] = page_size;
     }
 
     log_info("Cli", "命令 " + operation + " 已发送（id " + std::to_string(request.id) + "）");

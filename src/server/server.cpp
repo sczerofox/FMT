@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -419,8 +420,30 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler,
                    });
 
     // 文件（阶段 5）：upload 是长任务，服务端会走两段式（下载在锁外、登记在锁内）。
-    server->Get("/api/file", [run](const httplib::Request&, httplib::Response& response) {
-        run("file.list", nlohmann::json::object(), response);
+    server->Get("/api/file", [run](const httplib::Request& request,
+                                   httplib::Response& response) {
+        // 查询串里的开关要**透给业务层**：?search=&sort=&page=&page_size=
+        //（忘记透传过一次：接口看着有分页参数，实际一直按默认值跑）
+        nlohmann::json args = nlohmann::json::object();
+        for (const char* key : {"search", "sort"}) {
+            if (request.has_param(key)) {
+                args[key] = request.get_param_value(key);
+            }
+        }
+        for (const char* key : {"page", "page_size"}) {
+            if (!request.has_param(key)) {
+                continue;
+            }
+            const std::string raw = request.get_param_value(key);
+            char* end = nullptr;
+            const long value = std::strtol(raw.c_str(), &end, 10);
+            if (!raw.empty() && end != nullptr && *end == '\0') {
+                args[key] = static_cast<int>(value);
+            } else {
+                args[key] = raw;  // 非法数字原样带过去，让业务层报 FMT-001（别在这里悄悄吞掉）
+            }
+        }
+        run("file.list", args, response);
     });
     // 上传：**请求体就是文件内容**（流式）。Java / Python 客户端直接推字节流，
     // 不再要求文件在服务端本地有路径——那对远端客户端没有意义。

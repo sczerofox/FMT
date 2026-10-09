@@ -1,5 +1,7 @@
 #include "fmt/service/commands.hpp"
 
+#include <algorithm>
+#include <cstddef>
 #include <string>
 #include <utility>
 #include <vector>
@@ -14,6 +16,42 @@
 
 namespace fmt::service {
 namespace {
+
+
+// 分页上限：一次最多 1000 条。不设上限的话，page_size 写个天文数字就等于
+// 让服务端一次吐几十万个文件。
+constexpr int kMaxPageSize = 1000;
+
+// 从 args 里取一个整数开关。
+// **不能直接用 args.value<int>()**：类型不匹配时 nlohmann 会抛 type_error，
+// 而在服务端抛异常等于 500（历史上还因此 abort 过一次）。
+// 另外 args 本身可能是 null（请求没带信封）：find/value 在非对象上同样会抛，
+// 所以第一件事是确认它是个对象。
+Result<int> int_arg(const nlohmann::json& args, const char* key, int fallback) {
+    if (!args.is_object()) {
+        return fallback;
+    }
+    const auto found = args.find(key);
+    if (found == args.end() || found->is_null()) {
+        return fallback;
+    }
+    if (!found->is_number_integer()) {
+        return make_error(ErrorCode::InvalidArgument, std::string(key) + " 必须是整数");
+    }
+    return found->get<int>();
+}
+
+// 取一个字符串开关：不是对象 / 没有这个键 / 类型不对，一律按缺省，绝不抛异常。
+std::string text_arg(const nlohmann::json& args, const char* key, const std::string& fallback) {
+    if (!args.is_object()) {
+        return fallback;
+    }
+    const auto found = args.find(key);
+    if (found == args.end() || !found->is_string()) {
+        return fallback;
+    }
+    return found->get<std::string>();
+}
 
 // 取第 index 个位置参数；缺失或类型不对都算参数错误（FMT-001）。
 Result<std::string> argument(const nlohmann::json& args, std::size_t index, const char* what) {
@@ -440,9 +478,26 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
         }
         std::vector<FileRecord> records = std::get<std::vector<FileRecord>>(items);
 
+        // ---- 搜索（先过滤）----
+        // 关键字按**不区分大小写的子串**匹配文件名，也匹配 file_id
+        //（file_id 是用户手里常有的东西，能搜到省一次 get）。
+        const std::string search = trim(text_arg(args, "search", std::string{}));
+        if (!search.empty()) {
+            const std::string needle = to_lower(search);
+            records.erase(std::remove_if(records.begin(), records.end(),
+                                         [&needle](const FileRecord& record) {
+                                             return to_lower(record.file_name).find(needle) ==
+                                                        std::string::npos &&
+                                                    to_lower(record.file_id).find(needle) ==
+                                                        std::string::npos;
+                                         }),
+                          records.end());
+        }
+        const std::size_t total = records.size();
+
         // 排序：默认按名字（不区分大小写，同级用 file_id 保证稳定）；
         // size 大的在前；id 就是入库顺序（file_id 里的日期+序号天然递增）。
-        const std::string sort = args.value("sort", std::string("name"));
+        const std::string sort = text_arg(args, "sort", std::string("name"));
         if (sort == "name") {
             std::sort(records.begin(), records.end(),
                       [](const FileRecord& left, const FileRecord& right) {
@@ -466,9 +521,50 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
                               "排序方式只能是 name / size / id，收到：" + sort);
         }
 
+        // ---- 分页（**必须排在排序之后**）----
+        // 顺序是：过滤 -> 排序 -> 切片。排序与切片之间不能有随机性，否则翻页
+        // 会漏文件或重复（同一个文件在两页里各出现一次，是最典型的分页 bug）。
+        //   page_size 缺省或 0 = 不分页（保持老行为，一次给全，只是多回 total）
+        //   page 从 1 开始；给了 page_size 才分页
+        const Result<int> page = int_arg(args, "page", 1);
+        if (!ok(page)) {
+            return *error_of(page);
+        }
+        const Result<int> page_size = int_arg(args, "page_size", 0);
+        if (!ok(page_size)) {
+            return *error_of(page_size);
+        }
+        const int wanted_page = std::get<int>(page);
+        const int wanted_size = std::get<int>(page_size);
+        if (wanted_page < 1) {
+            return make_error(ErrorCode::InvalidArgument, "page 从 1 开始，收到：" +
+                                                              std::to_string(wanted_page));
+        }
+        if (wanted_size < 0 || wanted_size > kMaxPageSize) {
+            return make_error(ErrorCode::InvalidArgument,
+                              "page_size 只能是 0（不分页）到 " + std::to_string(kMaxPageSize) +
+                                  "，收到：" + std::to_string(wanted_size));
+        }
+
+        std::vector<FileRecord> page_records;
+        std::size_t total_pages = 0;
+        if (wanted_size > 0) {
+            total_pages = (total + static_cast<std::size_t>(wanted_size) - 1) /
+                          static_cast<std::size_t>(wanted_size);
+            const std::size_t begin =
+                static_cast<std::size_t>(wanted_page - 1) * static_cast<std::size_t>(wanted_size);
+            if (begin < total) {  // 超出末页就是空页，不是错误
+                const std::size_t end = std::min(total, begin + static_cast<std::size_t>(wanted_size));
+                page_records.assign(records.begin() + static_cast<std::ptrdiff_t>(begin),
+                                    records.begin() + static_cast<std::ptrdiff_t>(end));
+            }
+        } else {
+            page_records = records;
+        }
+
         nlohmann::json array = nlohmann::json::array();
-        // 注意：这里遍历的是**排好序的** records，不是 items —— 遍历 items 会让排序白做。
-        for (const FileRecord& record : records) {
+        // 注意：遍历的是**过滤+排序+分页之后**的 page_records，不是 items。
+        for (const FileRecord& record : page_records) {
             nlohmann::json item = nlohmann::json::object();
             item["file_id"] = record.file_id;
             item["file_name"] = record.file_name;
@@ -481,7 +577,14 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
 
         nlohmann::json data = nlohmann::json::object();
         data["files"] = std::move(array);
-        data["count"] = data["files"].size();
+        data["count"] = data["files"].size();   // 本页条数
+        data["total"] = total;                  // 命中总数（过滤之后、分页之前）
+        data["page"] = wanted_page;
+        data["page_size"] = wanted_size;        // 0 = 不分页
+        data["total_pages"] = total_pages;
+        if (!search.empty()) {
+            data["search"] = search;
+        }
         // **只输出文件的信息**（用户要求）：不再附带 current_bucket 之类的环境字段。
         data["sort"] = sort;
         return data;

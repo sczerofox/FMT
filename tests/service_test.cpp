@@ -808,6 +808,95 @@ FMT_TEST(Service, 列表排序配置与清空回收站) {
     FMT_CHECK_EQ(idle.data.value("files", std::size_t{9}), std::size_t{0});
 }
 
+FMT_TEST(Service, 文件列表的搜索与分页) {
+    fmt_test::TempDir temp("service-page");
+    const auto root = temp / "root";
+    const std::vector<std::string> names = {"Report-A.txt", "report-b.txt", "notes.md",
+                                            "data.bin", "report-c.txt"};
+    for (const std::string& name : names) {
+        // 内容=名字：避免不同文件 MD5 相同被拒
+        FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(temp / name, name)));
+    }
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 1;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"工作"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+
+    for (const std::string& name : names) {
+        fmt::ipc::Request upload;
+        upload.id = 2;
+        upload.op = "file.upload";
+        upload.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(temp / name)});
+        FMT_CHECK(runtime.handle(upload).ok);
+    }
+
+    // ---- 搜索：不区分大小写、子串 ----
+    fmt::ipc::Request search_request;
+    search_request.id = 3;
+    search_request.op = "file.list";
+    search_request.args["search"] = "REPORT";
+    const fmt::ipc::Response searched = runtime.handle(search_request);
+    FMT_CHECK(searched.ok);
+    FMT_CHECK_EQ(searched.data["total"].get<std::size_t>(), std::size_t{3});
+    FMT_CHECK_EQ(searched.data["count"].get<std::size_t>(), std::size_t{3});
+    FMT_CHECK_EQ(searched.data["files"].size(), std::size_t{3});
+
+    // ---- 分页：total 是命中总数，不是本页条数 ----
+    fmt::ipc::Request page_request;
+    page_request.id = 4;
+    page_request.op = "file.list";
+    page_request.args["page"] = 1;
+    page_request.args["page_size"] = 2;
+    const fmt::ipc::Response page1 = runtime.handle(page_request);
+    FMT_CHECK(page1.ok);
+    FMT_CHECK_EQ(page1.data["total"].get<std::size_t>(), std::size_t{5});
+    FMT_CHECK_EQ(page1.data["total_pages"].get<std::size_t>(), std::size_t{3});
+    FMT_CHECK_EQ(page1.data["files"].size(), std::size_t{2});
+
+    // ---- 翻页不漏不重：三页拼起来正好 5 条，且无重复 ----
+    std::vector<std::string> collected;
+    for (int page = 1; page <= 3; ++page) {
+        fmt::ipc::Request request;
+        request.id = 5;
+        request.op = "file.list";
+        request.args["page"] = page;
+        request.args["page_size"] = 2;
+        const fmt::ipc::Response response = runtime.handle(request);
+        FMT_CHECK(response.ok);
+        for (const nlohmann::json& item : response.data["files"]) {
+            collected.push_back(item["file_id"].get<std::string>());
+        }
+    }
+    FMT_CHECK_EQ(collected.size(), std::size_t{5});
+    std::vector<std::string> unique_check = collected;
+    std::sort(unique_check.begin(), unique_check.end());
+    FMT_CHECK(std::unique(unique_check.begin(), unique_check.end()) == unique_check.end());
+
+    // ---- 非法参数一律 FMT-001 ----
+    fmt::ipc::Request bad;
+    bad.id = 6;
+    bad.op = "file.list";
+    bad.args["page"] = 0;
+    const fmt::ipc::Response rejected = runtime.handle(bad);
+    FMT_CHECK(!rejected.ok);
+    FMT_CHECK(rejected.error.code == fmt::ErrorCode::InvalidArgument);
+
+    // ---- 默认不分页（保持老行为），但 total 一定有 ----
+    fmt::ipc::Request all_request;
+    all_request.id = 7;
+    all_request.op = "file.list";
+    const fmt::ipc::Response all = runtime.handle(all_request);
+    FMT_CHECK(all.ok);
+    FMT_CHECK_EQ(all.data["files"].size(), std::size_t{5});
+    FMT_CHECK_EQ(all.data["page_size"].get<int>(), 0);
+    FMT_CHECK_EQ(all.data["total"].get<std::size_t>(), std::size_t{5});
+}
+
 FMT_TEST(Service, 分享的创建查看列出撤销与计数) {
     fmt_test::TempDir temp("service-share");
     const auto root = temp / "root";

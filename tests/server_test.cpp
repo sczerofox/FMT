@@ -323,6 +323,28 @@ FMT_TEST(Server, File路由与上传) {
         FMT_CHECK_EQ(nlohmann::json::parse(listed->body)["data"]["files"].size(), std::size_t{1});
     }
 
+    // 查询串必须**透到业务层**：?search= / ?sort= / ?page= / ?page_size=
+    //（这里曾经只声明不生效：路由忘了把 request 的查询参数放进 args）
+    const auto queried = client.Get("/api/file?search=doc&page=1&page_size=1");
+    FMT_CHECK(queried != nullptr);
+    if (queried != nullptr) {
+        FMT_CHECK_EQ(queried->status, 200);
+        const nlohmann::json parsed = nlohmann::json::parse(queried->body);
+        FMT_CHECK_EQ(parsed["data"].value("search", std::string{}), std::string("doc"));
+        FMT_CHECK_EQ(parsed["data"].value("page_size", 0), 1);
+        FMT_CHECK_EQ(parsed["data"].value("total", std::size_t{0}), std::size_t{1});
+    }
+
+    // 非法的 page_size 要报 FMT-001，不能悄悄当成 0（那就成了"参数随便写都行"）
+    const auto bad_page_size = client.Get("/api/file?page_size=abc");
+    FMT_CHECK(bad_page_size != nullptr);
+    if (bad_page_size != nullptr) {
+        FMT_CHECK_EQ(bad_page_size->status, 400);
+        FMT_CHECK_EQ(
+            nlohmann::json::parse(bad_page_size->body)["error"]["code"].get<std::string>(),
+            std::string("FMT-001"));
+    }
+
     // 按 file_id 与按文件名都能查
     for (const std::string& key : {file_id, std::string("doc.bin")}) {
         const auto detail = client.Get("/api/file/" + fmt::url_encode(key));
