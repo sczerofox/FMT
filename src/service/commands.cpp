@@ -8,6 +8,7 @@
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/file/file.hpp"
+#include "fmt/share/share.hpp"
 #include "fmt/trash/trash.hpp"
 
 namespace fmt::service {
@@ -686,6 +687,126 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
     return make_error(ErrorCode::InvalidArgument, "未知的配置操作：" + operation);
 }
 
+// share.*：数据面（创建/查看/列出/撤销 + 下载记账）。
+// **HTTP 下载端点还没做**（用户决定先做数据面）：register_download 已经把
+// §50/§51 那套「全部检查通过才计数、且在业务锁内完成」实现好，端点将来只管调它。
+Result<nlohmann::json> share_command(AppContext& context, const std::string& operation,
+                                     const nlohmann::json& args) {
+    ShareService shares(*context.paths, context.config, context.logger.get());
+
+    const auto share_json = [](const ShareRecord& record) {
+        nlohmann::json item = nlohmann::json::object();
+        item["share_id"] = record.share_id;
+        item["file_id"] = record.file_id;
+        item["max_download_count"] = record.max_download_count;
+        item["download_count"] = record.download_count;
+        item["expire_time"] = record.expire_time.empty() ? nlohmann::json(nullptr)
+                                                         : nlohmann::json(record.expire_time);
+        item["is_valid"] = record.is_valid;
+        return item;
+    };
+    const auto view_json = [&share_json](const ShareView& view) {
+        nlohmann::json item = share_json(view.share);
+        item["state"] = std::string(share_state_name(view.state));
+        item["available"] = view.state == ShareState::Ok;
+        item["message"] = view.message;
+        if (!view.file.file_id.empty()) {
+            item["file_name"] = view.file.file_name;
+            item["size"] = view.file.size;
+            item["bucket"] = view.file.bucket;
+        }
+        return item;
+    };
+
+    if (operation == "share.create") {
+        const Result<std::string> file_id = argument(args, 0, "file_id");
+        if (!ok(file_id)) {
+            return *error_of(file_id);
+        }
+        const Result<ShareRecord> created = shares.create(std::get<std::string>(file_id));
+        if (!ok(created)) {
+            return *error_of(created);
+        }
+        const ShareRecord& record = std::get<ShareRecord>(created);
+        nlohmann::json data = share_json(record);
+        data["message"] = "分享已创建：" + record.share_id + "（" +
+                          std::to_string(record.max_download_count) + " 次，到期 " +
+                          record.expire_time + "）";
+        return data;
+    }
+
+    if (operation == "share.get") {
+        const Result<std::string> share_id = argument(args, 0, "share_id");
+        if (!ok(share_id)) {
+            return *error_of(share_id);
+        }
+        // 未知 id 是真错误（FMT-500）；「存在但过期 / 次数用尽 / 文件进回收站」如实返回。
+        const Result<ShareView> view = shares.get(std::get<std::string>(share_id));
+        if (!ok(view)) {
+            return *error_of(view);
+        }
+        return view_json(std::get<ShareView>(view));
+    }
+
+    if (operation == "share.list") {
+        const Result<std::string> file_id = argument(args, 0, "file_id");
+        if (!ok(file_id)) {
+            return *error_of(file_id);
+        }
+        const Result<std::vector<ShareView>> views = shares.list(std::get<std::string>(file_id));
+        if (!ok(views)) {
+            return *error_of(views);
+        }
+
+        nlohmann::json array = nlohmann::json::array();
+        for (const ShareView& view : std::get<std::vector<ShareView>>(views)) {
+            array.push_back(view_json(view));
+        }
+        nlohmann::json data = nlohmann::json::object();
+        data["shares"] = std::move(array);
+        data["count"] = data["shares"].size();
+        data["file_id"] = std::get<std::string>(file_id);
+        return data;
+    }
+
+    if (operation == "share.delete") {
+        const Result<std::string> share_id = argument(args, 0, "share_id");
+        if (!ok(share_id)) {
+            return *error_of(share_id);
+        }
+        const Result<ShareRecord> removed = shares.remove(std::get<std::string>(share_id));
+        if (!ok(removed)) {
+            return *error_of(removed);
+        }
+        nlohmann::json data = share_json(std::get<ShareRecord>(removed));
+        data["message"] = "分享已撤销：" + std::get<ShareRecord>(removed).share_id;
+        return data;
+    }
+
+    if (operation == "share.download") {
+        // 下载记账：检查与计数在业务锁内一次完成（§51）。
+        // 现在只有管道调用它；将来的 HTTP 下载端点也走这一条。
+        const Result<std::string> share_id = argument(args, 0, "share_id");
+        if (!ok(share_id)) {
+            return *error_of(share_id);
+        }
+        const Result<FileRecord> file = shares.register_download(std::get<std::string>(share_id));
+        if (!ok(file)) {
+            return *error_of(file);
+        }
+        const FileRecord& record = std::get<FileRecord>(file);
+        nlohmann::json data = nlohmann::json::object();
+        data["file_id"] = record.file_id;
+        data["file_name"] = record.file_name;
+        data["size"] = record.size;
+        data["md5"] = record.md5;
+        data["message"] = "下载计数已记账：" + record.file_name;
+        return data;
+    }
+
+    return make_error(ErrorCode::InvalidArgument, "未知的分享操作：" + operation);
+}
+
 bool is_known_business(const std::string& operation) {
     for (const std::string_view prefix :
          {"bucket.", "file.", "share.", "trash.", "config.", "server."}) {
@@ -718,7 +839,11 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
         return config_command(context, operation, args);
     }
 
-    // 已经登记、还没实现的模块（share / server）。
+    if (starts_with(operation, "share.")) {
+        return share_command(context, operation, args);
+    }
+
+    // 已经登记、还没实现的模块（只剩 server.*）。
     return make_error(ErrorCode::ServiceOperationFailed, "操作尚未实现：" + operation);
 }
 

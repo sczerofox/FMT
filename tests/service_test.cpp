@@ -8,6 +8,7 @@
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/ipc/protocol.hpp"
+#include "fmt/share/share.hpp"
 #include "fmt/storage/storage.hpp"
 #include "fmt_test.hpp"
 #include "temp_dir.hpp"
@@ -194,7 +195,7 @@ FMT_TEST(Service, 管道能执行Bucket命令) {
     // 已登记但没实现的模块仍然是 FMT-602，而不是「未知操作」
     fmt::ipc::Request pending;
     pending.id = 15;
-    pending.op = "share.list";  // share 还没做（file 已经能用了）
+    pending.op = "server.nosuch";  // server.* 还是空壳：已登记、没实现（share 提交后已实现）
     const fmt::ipc::Response not_yet = runtime.handle(pending);
     FMT_CHECK(!not_yet.ok);
     FMT_CHECK(not_yet.error.code == fmt::ErrorCode::ServiceOperationFailed);
@@ -807,6 +808,174 @@ FMT_TEST(Service, 列表排序配置与清空回收站) {
     FMT_CHECK_EQ(idle.data.value("files", std::size_t{9}), std::size_t{0});
 }
 
+FMT_TEST(Service, 分享的创建查看列出撤销与计数) {
+    fmt_test::TempDir temp("service-share");
+    const auto root = temp / "root";
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(temp / "payload.txt", "share me")));
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 1;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"工作"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+
+    fmt::ipc::Request upload;
+    upload.id = 2;
+    upload.op = "file.upload";
+    upload.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(temp / "payload.txt")});
+    const fmt::ipc::Response uploaded = runtime.handle(upload);
+    FMT_CHECK(uploaded.ok);
+    const std::string file_id = uploaded.data.value("file_id", std::string{});
+    FMT_CHECK(!file_id.empty());
+
+    // ---- 创建 ----
+    fmt::ipc::Request create;
+    create.id = 3;
+    create.op = "share.create";
+    create.args["argv"] = nlohmann::json::array({file_id});
+    const fmt::ipc::Response created = runtime.handle(create);
+    FMT_CHECK(created.ok);
+    const std::string share_id = created.data.value("share_id", std::string{});
+    FMT_CHECK_EQ(share_id.size(), std::size_t{12});
+    FMT_CHECK(share_id.find_first_not_of("0123456789abcdef") == std::string::npos);
+    FMT_CHECK_EQ(created.data.value("max_download_count", 0), fmt::kDefaultShareDownloads);
+    FMT_CHECK_EQ(created.data.value("download_count", -1), 0);
+    FMT_CHECK(created.data["expire_time"].is_string());  // 默认 7 天，不是 null
+    FMT_CHECK(created.data.value("is_valid", false));
+
+    const fmt::ipc::Response second = runtime.handle(create);
+    FMT_CHECK(second.ok);
+    FMT_CHECK(second.data.value("share_id", std::string{}) != share_id);
+
+    // ---- 查看 ----
+    fmt::ipc::Request get;
+    get.id = 4;
+    get.op = "share.get";
+    get.args["argv"] = nlohmann::json::array({share_id});
+    const fmt::ipc::Response viewed = runtime.handle(get);
+    FMT_CHECK(viewed.ok);
+    FMT_CHECK(viewed.data.value("available", false));
+    FMT_CHECK_EQ(viewed.data.value("state", std::string{}), std::string("可用"));
+    FMT_CHECK_EQ(viewed.data.value("file_name", std::string{}), std::string("payload.txt"));
+
+    fmt::ipc::Request missing;
+    missing.id = 5;
+    missing.op = "share.get";
+    missing.args["argv"] = nlohmann::json::array({"000000000000"});
+    const fmt::ipc::Response not_found = runtime.handle(missing);
+    FMT_CHECK(!not_found.ok);
+    FMT_CHECK(not_found.error.code == fmt::ErrorCode::ShareNotFound);
+    FMT_CHECK_EQ(fmt::exit_code(not_found.error.code), 3);
+
+    // ---- 列出 ----
+    fmt::ipc::Request list;
+    list.id = 6;
+    list.op = "share.list";
+    list.args["argv"] = nlohmann::json::array({file_id});
+    const fmt::ipc::Response listed = runtime.handle(list);
+    FMT_CHECK(listed.ok);
+    FMT_CHECK_EQ(listed.data.value("count", std::size_t{0}), std::size_t{2});
+    FMT_CHECK_EQ(listed.data["shares"][0].value("share_id", std::string{}),
+                 second.data.value("share_id", std::string{}));
+
+    // ---- 下载记账：20 次之后第 21 次必须被拒（§51）----
+    const auto download = [&runtime, &share_id](int id) {
+        fmt::ipc::Request request;
+        request.id = id;
+        request.op = "share.download";
+        request.args["argv"] = nlohmann::json::array({share_id});
+        return runtime.handle(request);
+    };
+    for (int i = 0; i < fmt::kDefaultShareDownloads; ++i) {
+        FMT_CHECK(download(100 + i).ok);
+    }
+    const fmt::ipc::Response over = download(200);
+    FMT_CHECK(!over.ok);
+    FMT_CHECK(over.error.code == fmt::ErrorCode::ShareDownloadLimitReached);
+    FMT_CHECK_EQ(fmt::exit_code(over.error.code), 5);
+
+    const fmt::ipc::Response exhausted = runtime.handle(get);
+    FMT_CHECK(exhausted.ok);
+    FMT_CHECK_EQ(exhausted.data.value("download_count", -1), fmt::kDefaultShareDownloads);
+    FMT_CHECK_EQ(exhausted.data.value("state", std::string{}), std::string("下载次数已用尽"));
+    FMT_CHECK(!exhausted.data.value("available", true));
+
+    // ---- 分享不得绕过文件状态（§50）----
+    fmt::ipc::Request remove_file;
+    remove_file.id = 7;
+    remove_file.op = "file.delete";
+    remove_file.args["argv"] = nlohmann::json::array({file_id});
+    remove_file.args["force"] = true;
+    FMT_CHECK(runtime.handle(remove_file).ok);
+
+    const fmt::ipc::Response blocked = runtime.handle(get);
+    FMT_CHECK(blocked.ok);  // 查得到（不是「不存在」），状态说明它在回收站
+    FMT_CHECK_EQ(blocked.data.value("state", std::string{}), std::string("关联文件不可用"));
+    FMT_CHECK(!blocked.data.value("available", true));
+
+    const fmt::ipc::Response refused = download(300);
+    FMT_CHECK(!refused.ok);
+    FMT_CHECK(refused.error.code == fmt::ErrorCode::ShareFileUnavailable);
+
+    fmt::ipc::Request late = create;
+    late.id = 8;
+    const fmt::ipc::Response late_created = runtime.handle(late);
+    FMT_CHECK(!late_created.ok);
+    FMT_CHECK(late_created.error.code == fmt::ErrorCode::ShareFileUnavailable);
+
+    // ---- 撤销 ----
+    fmt::ipc::Request revoke;
+    revoke.id = 9;
+    revoke.op = "share.delete";
+    revoke.args["argv"] = nlohmann::json::array({share_id});
+    FMT_CHECK(runtime.handle(revoke).ok);
+
+    fmt::ipc::Request after;
+    after.id = 10;
+    after.op = "share.get";
+    after.args["argv"] = nlohmann::json::array({share_id});
+    const fmt::ipc::Response gone = runtime.handle(after);
+    FMT_CHECK(!gone.ok);
+    FMT_CHECK(gone.error.code == fmt::ErrorCode::ShareNotFound);
+
+    revoke.id = 11;
+    const fmt::ipc::Response again = runtime.handle(revoke);
+    FMT_CHECK(!again.ok);
+    FMT_CHECK(again.error.code == fmt::ErrorCode::ShareNotFound);
+
+    // ---- 过期：直接写一条过去的 expire_time，看是否如实报「已过期」----
+    // 先把文件从回收站恢复：§49 的检查顺序是「文件状态 -> 过期」，
+    // 文件还在回收站时得到的是「关联文件不可用」，那就测不到过期这条。
+    {
+        fmt::ipc::Request restore_file;
+        restore_file.id = 20;
+        restore_file.op = "trash.restore";
+        restore_file.args["argv"] = nlohmann::json::array({file_id});
+        FMT_CHECK(runtime.handle(restore_file).ok);
+    }
+
+    const fmt::PathManager paths{root};
+    const auto document = fmt::read_json_file(paths.share_data());
+    FMT_CHECK(fmt::ok(document));
+    nlohmann::json value = std::get<nlohmann::json>(document);
+    FMT_CHECK_EQ(value["shares"].size(), std::size_t{1});  // 只剩第二条（第一条被撤销）
+    value["shares"][0]["expire_time"] = "2000-01-01T00:00:00";
+    FMT_CHECK(fmt::ok(fmt::write_json_file(paths.share_data(), value)));
+
+    fmt::ipc::Request expired;
+    expired.id = 12;
+    expired.op = "share.get";
+    expired.args["argv"] =
+        nlohmann::json::array({value["shares"][0].value("share_id", std::string{})});
+    const fmt::ipc::Response expired_view = runtime.handle(expired);
+    FMT_CHECK(expired_view.ok);
+    FMT_CHECK_EQ(expired_view.data.value("state", std::string{}), std::string("已过期"));
+    FMT_CHECK(expired_view.data.value("message", std::string{}).find("过期") != std::string::npos);
+}
+
 FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {
     fmt_test::TempDir temp("service-ops");
     fmt::service::ServerRuntime runtime(temp / "root", temp / "state");
@@ -814,7 +983,7 @@ FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {
 
     fmt::ipc::Request business;
     business.id = 2;
-    business.op = "share.create";  // share 还没做
+    business.op = "server.nosuch";  // server.* 还没做（share 提交后已实现）
     const fmt::ipc::Response not_implemented = runtime.handle(business);
     FMT_CHECK(!not_implemented.ok);
     FMT_CHECK(not_implemented.error.code == fmt::ErrorCode::ServiceOperationFailed);

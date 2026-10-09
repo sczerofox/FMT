@@ -19,6 +19,11 @@ std::string local_date_compact();
 // 本地时间 "YYYY-MM-DDTHH:MM:SS"，trash.json 的 deleted_at 使用。
 std::string local_datetime_iso();
 
+// 当前本地时间 + days 天，格式同 local_datetime_iso()。
+// share 的 expire_time 用它（到期判断走 parse_datetime_iso() 解析后比时间点，
+// 不靠字符串比较——两种格式只差一个字符，比字符串会踩坑）。
+std::string local_datetime_iso_after_days(int days);
+
 // 本地日期片段，用于 repository/<user>/<bucket>/YYYY/MM/DD/ 这样的路径。
 struct DateParts {
     std::string year;

@@ -114,9 +114,8 @@ void print_command_list() {
     std::printf("  (config)   list  set\n");
     std::printf("  (help)     help [命令]\n");
     std::printf("  (version)  version                打印版本与构建日期\n");
-    std::printf("  (exit)     exit  quit\n");
-    std::printf("\n业务命令（服务端尚未实现，现在会返回 FMT-602）：\n");
     std::printf("  (share)    create  get  list  delete\n");
+    std::printf("  (exit)     exit  quit\n");
 }
 
 // help <命令>：某一组命令的详细说明。
@@ -201,11 +200,17 @@ bool print_command_help(const std::string& topic) {
     }
     if (topic == "share") {
         std::printf(
-            "share —— 分享（服务端尚未实现，现在返回 FMT-602）\n"
-            "  create <file_id>    创建分享\n"
-            "  get <share_id>      查看\n"
-            "  list <file_id>      列出某个文件的分享\n"
-            "  delete <share_id>   取消分享\n");
+            "share —— 分享（把**正常**文件开放成一条可撤销的链接）\n"
+            "  create <file_id>    创建分享：默认 20 次、7 天过期；返回 share_id\n"
+            "  get <share_id>      查看：如实报告状态（可用 / 已过期 / 次数用尽 /\n"
+            "                      已撤销 / 关联文件在回收站），不伪装成不存在\n"
+            "  list <file_id>      列出某个文件的所有分享（最近创建的在前）\n"
+            "  delete <share_id>   撤销分享（删记录）\n"
+            "\n"
+            "约束（开发文档 §50）：**分享不得绕过文件状态**——文件进回收站或被删掉，\n"
+            "分享立刻失效（FMT-503）。share_id 是 12 位随机十六进制，本身就是访问凭证。\n"
+            "**HTTP 下载端点还没做**：现在只有管道命令；链接要能被外部打开，\n"
+            "还需要那套简单接口（等你定开放哪几个）。\n");
         return true;
     }
     if (topic == "config") {
@@ -626,6 +631,48 @@ void print_business_data(const nlohmann::json& data) {
                     static_cast<std::size_t>(max_bytes));
         std::printf("大小单位：%s    语言：%s\n", data.value("size_unit", std::string{}).c_str(),
                     data.value("language", std::string{}).c_str());
+        return;
+    }
+
+    // 单条分享：share_id 是标志字段（create / get / delete 都返回它）。
+    // **必须排在「单条文件信息」之前**：分享数据里也带 file_id 与 size，
+    // 否则会被当成文件详情打出来，把分享本身的信息（次数、到期、状态）全丢掉。
+    if (data.contains("share_id")) {
+        const auto expire = data.find("expire_time");
+        std::printf("share_id：%s\n", data.value("share_id", std::string{}).c_str());
+        if (data.contains("file_name")) {
+            std::printf("文件：%s（file_id %s）\n", data.value("file_name", std::string{}).c_str(),
+                        data.value("file_id", std::string{}).c_str());
+        } else {
+            std::printf("file_id：%s\n", data.value("file_id", std::string{}).c_str());
+        }
+        std::printf("下载次数：%d/%d\n", data.value("download_count", 0),
+                    data.value("max_download_count", 0));
+        std::printf("到期：%s\n", (expire != data.end() && expire->is_string())
+                                      ? expire->get<std::string>().c_str()
+                                      : "不过期");
+        if (data.contains("state")) {
+            std::printf("状态：%s\n", data.value("state", std::string{}).c_str());
+        }
+        if (data.contains("message")) {
+            std::printf("%s\n", data.value("message", std::string{}).c_str());
+        }
+        return;
+    }
+
+    // 分享列表：shares: [{share_id, download_count, state, …}, …]
+    if (const auto items = data.find("shares"); items != data.end() && items->is_array()) {
+        for (const nlohmann::json& item : *items) {
+            const auto expire = item.find("expire_time");
+            std::printf("  %s  %d/%d  %s  到期 %s\n", item.value("share_id", std::string{}).c_str(),
+                        item.value("download_count", 0), item.value("max_download_count", 0),
+                        item.value("state", std::string{}).c_str(),
+                        (expire != item.end() && expire->is_string())
+                            ? expire->get<std::string>().c_str()
+                            : "不过期");
+        }
+        std::printf("共 %zu 条分享（file_id %s）\n", items->size(),
+                    data.value("file_id", std::string{}).c_str());
         return;
     }
 

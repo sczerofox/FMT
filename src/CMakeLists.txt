@@ -26,6 +26,7 @@ add_subdirectory(service)
 add_subdirectory(bucket)
 add_subdirectory(file)
 add_subdirectory(trash)
+add_subdirectory(share)
 
 # 命令行界面（两条入口中的 CLI 一侧）
 add_subdirectory(cli)
