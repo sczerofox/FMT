@@ -160,6 +160,11 @@ public:
         pipe_ = L"\\\\.\\pipe\\fmt-e2e-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
                 std::to_wstring(counter.fetch_add(1));
         SetEnvironmentVariableW(L"FMT_PIPE", pipe_.c_str());
+        // 必须同时告诉子进程「别碰服务管理」。测试用**无参数**跑真的 fmt.exe 会走进
+        // 双击引导，而引导会装/启动/重装**真实的 Windows 服务**——FMT_PIPE 只隔离
+        // 管道，管不到 SCM。我们就这样把服务注册指向过测试的临时目录，第二天宿主
+        // exe 被清理，线上服务指向不存在的文件。设了这个开关，引导一步都不碰 SCM。
+        SetEnvironmentVariableW(L"FMT_NO_SERVICE", L"1");
 
         FMT_CHECK(fmt::ok(fmt::ensure_directory(deploy_)));
         const std::filesystem::path source = fmt::executable_path().parent_path() / L"fmt.exe";
@@ -197,6 +202,7 @@ public:
             runner_.join();
         }
         SetEnvironmentVariableW(L"FMT_PIPE", nullptr);
+        SetEnvironmentVariableW(L"FMT_NO_SERVICE", nullptr);
     }
 
     E2eFixture(const E2eFixture&) = delete;

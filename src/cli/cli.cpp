@@ -42,8 +42,19 @@ void set_logger(Logger* logger) { g_logger = logger; }
 
 Logger* logger() { return g_logger; }
 
-void log(LogLevel level, std::string_view module, const std::string& message) {
-    if (g_logger != nullptr) {
+// 环境变量开关：值为 "1" / "true" / "yes" 视为开。用 _dupenv_s 避免 C4996。
+bool env_flag(const char* name) {
+    char* value = nullptr;
+    std::size_t size = 0;
+    if (_dupenv_s(&value, &size, name) != 0 || value == nullptr) {
+        return false;
+    }
+    const std::string text = to_lower(trim(value));
+    free(value);
+    return text == "1" || text == "true" || text == "yes";
+}
+
+void log(LogLevel level, std::string_view module, const std::string& message) {    if (g_logger != nullptr) {
         g_logger->log(level, module, message);
     }
 }
@@ -631,6 +642,14 @@ void print_business_data(const nlohmann::json& data) {
                     static_cast<std::size_t>(max_bytes));
         std::printf("大小单位：%s    语言：%s\n", data.value("size_unit", std::string{}).c_str(),
                     data.value("language", std::string{}).c_str());
+        // HTTP 管理接口的凭证：这是机主唯一能拿到 token 的地方
+        //（data/user.json 里也是它，但那个文件不该逼人去翻）。
+        if (data.contains("token")) {
+            std::printf("用户 ID：%s\n", data.value("user_id", std::string{}).c_str());
+            std::printf("访问 token：%s\n", data.value("token", std::string{}).c_str());
+            std::printf("           HTTP 请求头：X-FMT-Token: %s\n",
+                        data.value("token", std::string{}).c_str());
+        }
         return;
     }
 
@@ -1115,6 +1134,23 @@ void announce_initializing() {
 }
 
 int bootstrap_and_run(const Options& options) {
+    // **测试闸门**：FMT_NO_SERVICE=1 时完全不碰服务管理（不装、不启、不重装），
+    // 只当服务已经在跑。为什么必须有它：端到端测试要用无参数方式跑真的 fmt.exe，
+    // 那就走进双击引导，而引导会去操作**真实的 Windows 服务**——FMT_PIPE 只隔离
+    // 管道，管不到 SCM。曾经因此把服务注册指向测试临时目录，宿主 exe 随后被清理，
+    // 线上服务指向不存在的文件（真事故，见提交信息）。
+    if (env_flag("FMT_NO_SERVICE")) {
+        log_info("Service", "FMT_NO_SERVICE=1：跳过全部服务管理（测试模式）");
+        Session session;
+        const service::State state = service::query_state();
+        if (state == service::State::Running) {
+            if (const Status status = ensure_connected(session, options); !ok(status)) {
+                log_warn("Cli", "暂时无法把数据根声明给服务：" + error_of(status)->message);
+            }
+        }
+        return run_interactive(options, state, session);
+    }
+
     // 数据根已经在 run() 里补过了（那一步要在日志器之前做）。
     // 2. 服务状态
     service::State state = service::query_state();
