@@ -2,9 +2,9 @@ name: ci
 
 on:
   push:
-    branches: [main, dev, arch-restart, "feature/**"]
+    branches: [main, "feature/**"]
   pull_request:
-    branches: [main, dev]
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
