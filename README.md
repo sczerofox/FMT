@@ -10,7 +10,7 @@
 | 依赖 | 只用 Windows 自带组件（WinHTTP + Schannel 下载、CNG/bcrypt 随机数与哈希、`cpp-httplib` 单头文件已 vendored） |
 | 接口 | CLI 走命名管道 `\\.\pipe\fmt.control`；HTTP 走 `localhost:4122`（默认关闭） |
 | 业务 | Bucket、File、Trash、Share、Config |
-| 测试 | 157 个用例，全绿 |
+| 测试 | 158 个用例，全绿 |
 | 设计文档 | [技术文档](<docx/FMT 技术文档.md>) · [开发文档](<docx/FMT 开发文档.md>) · [项目架构](<docx/FMT 项目架构.md>) |
 
 ---
@@ -158,7 +158,8 @@ Authorization: Bearer 1a2867378b112b8e7864218fd2fd693f
 ```
 
 **token 从哪来**：`fmt.exe config list` 会打印「用户 ID / 访问 token / 建议的请求头」。
-它存在数据根的 `data/user.json` 里，**默认永久有效**；密码只存哈希（PBKDF2-SHA256 + 每用户随机盐），
+一个数据根只有一个账号，`data/user.json` **就是这个用户**（用户字段平铺在文件里，没有 `users` 数组）。
+token 存在那里，**默认永久有效**；密码只存哈希（PBKDF2-SHA256 + 每用户随机盐），
 明文从不落盘。缺失或无效的 token 返回 **401 + `FMT-018`**。
 
 ### 路由表
@@ -228,7 +229,7 @@ D:\Tools\fmt\
 │   └── server.json          HTTP 开关、监听地址与端口
 ├── data/                    索引（JSON）
 │   ├── file.json            文件索引（**文件状态的权威**，含 is_trash）
-│   ├── user.json            账号与 token
+│   ├── user.json            唯一账号与 token（单用户文件，字段平铺）
 │   ├── share.json           分享
 │   └── trash.json           只读兼容（老数据），新数据不再写入
 ├── log/
@@ -241,6 +242,7 @@ D:\Tools\fmt\
 桶是否存在看 `repository/<用户>/<Bucket>/` 这个目录；桶级回收站的原名看
 `trash/<用户>/.original`；当前用户与当前 Bucket 看 `config/config.json`。
 `data/user.json` 里**没有**桶列表——桶列表以磁盘上的真实目录为准。
+这个文件本身就是那个唯一账号：以后加字段直接平铺进去，不套 `users` 数组。
 
 **备份建议**：备份整个数据根即可，其中 `repository/` + `data/` + `trash/` 是必须的，
 `log/` 与 `temp/` 可以不要。
@@ -263,7 +265,7 @@ pwsh -File tools/build.ps1 -Test
 #   String  Time  Trash  Validation
 ```
 
-157 个用例，覆盖文件名与路径校验、Bucket/File/Trash/Share 全流程、错误码与退出码、
+158 个用例，覆盖文件名与路径校验、Bucket/File/Trash/Share 全流程、错误码与退出码、
 配置与存储的并发写、日志轮转、命名管道协议、HTTP 路由与状态码、认证、流式上传下载、
 以及**用真实 exe + 真实管道**跑的端到端用例。
 
@@ -303,7 +305,8 @@ docx/            设计文档
 
 - **服务暂停/继续**（不声明 `SERVICE_ACCEPT_PAUSE_CONTINUE`，只处理 STOP/SHUTDOWN/INTERROGATE）
 - **HTTP 客户端形态的 CLI**（CLI 走管道；HTTP 可关闭、端口可能被占）
-- **多用户与权限系统**（`current_user` 目前是占位名 `user`；HTTP 侧是单账号 + token，不是多用户体系）
+- **多用户与权限系统**（`data/user.json` 就是那一个账号，字段平铺；`current_user` 目前是占位名
+  `user`。HTTP 侧只有这个账号 + token，不是多用户体系，也没有角色与权限）
 - **HTTP 的 Bucket 接口**（桶由 CLI 管理，HTTP 客户端只操作**当前** Bucket）
 
 ## 13. 已知边界

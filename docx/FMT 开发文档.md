@@ -610,7 +610,8 @@ data/trash.json
 
 按「单例 / 集合」分两类，**都带 `version` 字段**。
 
-单例数据（`config.json`、`server.json`）：
+单例数据（`config.json`、`server.json`、`user.json`——`user.json` 是**单用户文件**：
+一个数据根只有一个账号，用户字段平铺在根上，见第 18 节）：
 
 ```json
 {
@@ -619,7 +620,7 @@ data/trash.json
 }
 ```
 
-集合数据（`file.json`、`share.json`、`trash.json`、`user.json`）：
+集合数据（`file.json`、`share.json`、`trash.json`）：
 
 ```json
 {
@@ -634,8 +635,9 @@ data/trash.json
 file.json   -> files
 share.json  -> shares
 trash.json  -> trash
-user.json   -> users
 ```
+
+（`user.json` **不再是集合**：只有一个账号，所以它是单例、字段平铺，没有 `users` 数组。）
 
 采用「带集合字段的对象」而非裸数组，便于以后给集合增加元数据、演进 Schema。
 
@@ -931,14 +933,16 @@ Bucket 不生成 `file_id`；桶级记录**没有 `file_id`**，用原桶名标�
 
 # 18. User 数据
 
-**最终 schema（提交 `bfd89f7`）**：
+**单用户文件**：**一个数据根只有一个账号**，所以 `data/user.json` 就是「那个用户」——
+用户字段平铺在根上，没有 `users` 数组（字段本身与提交 `bfd89f7` 定的**完全一致**，
+只是换了容器；以后加字段直接平铺进根对象）。
 
 ```json
-{ "version": 1, "users": [ {
+{ "version": 1,
   "user_id": "u-b1e7c28f", "username": "user",
   "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节随机盐>",
   "token": "<32 位十六进制，永久有效>", "current_bucket": "lazy",
-  "created_at": "…", "updated_at": "…", "last_login_at": "" } ] }
+  "created_at": "…", "updated_at": "…", "last_login_at": "" }
 ```
 
 ```text
@@ -951,9 +955,13 @@ current_bucket 保留（以后可能有用），但它只是**快照**——运�
         V1 没有登录接口，所以拿不到也不影响——**真正的凭证是 token**。
 token   32 位十六进制、**永久有效**；`config list` 会打印它（机主唯一方便拿到的地方），
         HTTP 的 `/api/*` 就靠它认证（第 82 节、`FMT 技术文档.md` 第 12.3.2 节）。
+还没账号 文件里只有 {"version":1}：补建缺失文件时写的就是它，账号随后由
+        initialize_root → UserStore::ensure_default() 建出来。
 默认账号 在数据根初始化（initialize_root）时创建：**新根会建**；
-        **已经是 {"users":[],"version":1} 的老根也会补建**（线上就是这种情况）；
-        **已存在则绝不覆盖**。
+        **老根（空数组，或还套着 users 的）也会补建 / 改写**（线上就是这种情况）；
+        **已存在则绝不覆盖**——token、密码哈希、时间戳一个都不动。
+老形状   `{"version":1,"users":[{…}]}` 照读（取第一条）；下一次 ensure_default()
+        把它改写成单用户形状。空的老数组等价于「还没有账号」。
 ```
 
 > **原口径「V1 不实现完整用户系统，只保留 `data/user.json` 作为未来扩展入口、
@@ -5830,7 +5838,7 @@ Service 启动时会删除它下面以 `fmt-` 开头的遗留文件（用户手�
 ```text
 config/config.json     {"version":1,...}
 config/server.json     {"version":1,...}
-data/user.json         {"version":1,"users":[]}
+data/user.json         {"version":1}
 data/file.json         {"version":1,"files":[]}
 data/share.json        {"version":1,"shares":[]}
 data/trash.json        {"version":1,"trash":[]}
@@ -8576,8 +8584,10 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 > 142（`a9af276`）→ 143（`2c841c8`）→ 144（`5b316b3`）→ 144（`8f0fd5c` 只补断言，
 > 计数不变）→ 145（`d108c80`）→ 146（`bb7a40f`）→ 147（`c573f14`）→ 150（`a340d1e`）→
 > 152（`821aba3`）→ 153（`674d0b0`）→ 154（`d5779db`）→ 156（`bfd89f7` / `4b812b5`，
-> `ff237d5` 只修测试隔离不新增用例）→ **157（`53ec4be`）**。
-> 第 109、112、125 节已按 157 更新。
+> `ff237d5` 只修测试隔离不新增用例）→ 157（`53ec4be`）→ **158（`64eccce`：
+> `data/user.json` 改成单用户文件，`App.已有空users文件时也要补建默认账号` 拆成
+> `App.老的多用户文件会被改写成单用户形状` 与 `App.老的空users文件要补建单用户账号`）**。
+> 第 109、112、125 节已按 158 更新。
 
 后续开发过程中，如果发现：
 
@@ -9527,6 +9537,8 @@ blocked 的情况     歧义（file.delete）、同名冲突 / 随桶删除 / �
 | 40 | **HTTP 接口第 1、2 步 + 账号/令牌（提交 `bfd89f7` / `4b812b5` / `ff237d5` / `22c3c3e`）**：① HTTP **已开启**、监听 **`localhost:4122`**（代码默认 `host` 从 `127.0.0.1` 改成 `localhost`；线上 `server.json` 为 `enabled: true`）。② **全部 `/api/*` 要 token**，唯一例外是 `/api/ping` 与 `/api/share/<id>/download`（分享链接本身就是凭证）；缺 / 错 → **401 + `FMT-018`**；认证**只在一处**（httplib pre-routing 钩子——「漏给某条路由加认证」是这类代码最典型的事故），**没有校验器时一律 401**（fail-closed）；`X-FMT-Token` 与 `Authorization: Bearer` 都收，比较常量时间；token 从 `config list` 拿。③ **`/api/bucket*` 五条已删除**（用户明确「桶不要」）→ **404 + `FMT-017`**（故意不要 ≠ 还没做），「已知模块」里没有 bucket。④ `/api/share` 四条落地，下载端点公开但**第 3 步才做**（501 + `FMT-602`）。⑤ `data/user.json` 定稿：**没有 buckets 字段**（桶以磁盘为准）、密码只存 PBKDF2-SHA256 哈希、token 永久有效、默认账号在数据根初始化时创建（老的空 `users` 也补建，已存在不覆盖）。⑥ **测试隔离教训**：`FMT_PIPE` 管不到 SCM，新增 **`FMT_NO_SERVICE=1`**（提交 `ff237d5`；此前出过真事故：测试把**真服务**注册指向临时目录） | 用户先前的判断是「业务侧做完再定开哪几个接口」，这一轮明确了：**接口要开，但只开该开的**——认证必须**一处集中**（逐路由判断一定会漏），默认**关着就全拒**（fail-closed），桶**从 HTTP 面整体删掉**（用户不要，且 CLI 已经能管），分享下载**公开**（链接本身是凭证）。另外两条经验：**「故意不要」和「还没做」必须用不同状态码**（404 vs 501，否则调用方以为将来会有）；**跑「用户双击也会走的入口」时必须显式切断 SCM**，换管道名远远不够 |
 | 41 | **HTTP 第 3 步：流式 upload / download / preview + 公开分享下载（提交 `d3aeb3d`，HTTP 接口的最后一部分）**：`POST /api/file/upload` 的**请求体就是文件内容**（旧的「请求体给服务端本地路径」那套删除）；**边收边写、边判上限**（超 `max_upload_size` 立刻中止接收并删暂存文件，`FMT-303` → 400，不是「写完再看」；暂存名 `fmt-upload-<pid>-<序号>.tmp` 沿用 `fmt-` 前缀，启动清理能收走碎片）；落盘后补算大小与 MD5 入库，**全程只有一次移动、不二次拷贝**；新增 op **`file.upload_stream`** 与函数 `prepare_staged_upload()` / `content_type_of()` / `preview_content_type()`。`download`（attachment）与 `preview`（inline）都用 `set_content_provider` **流式回**；**下载不受预览策略限制**，**预览策略只有一份**（其余 → `FMT-701` 400）。**分享下载公开**（唯一不要 token 的接口）且**先记账再放行**。`file.get` / `share.download` 新增 `path`（相对数据根），`file.list` 不加 | 前两步定的是「谁能进来」（token 一处集中 + 桶整体拿掉），这一步定「怎么搬字节」：**流式**是唯一能同时满足「大文件不占内存」和「超上限立刻停」的做法；**上传用请求体而不是路径**是客户端决定的（Java/Python 只会推流）；**下载与预览必须分开**——策略只该约束「浏览器能不能直接看」，不该拦住「用户就是要拿走这个文件」；而**公开分享下载必须先记账**，否则 §51 的「19 + 两次 = 21」会在公开端点上重演。两个坑（`drain_reader()`、下载误用预览策略）是这一步最贵的两课 |
 | 35 | 数据根被别的 `fmt.exe` 抢走时**控制台上看不见**（换根只在日志里留一行；横幅也不显示服务在看哪个目录） | **提交 `8f2fbc5` + `bb7a40f`**：① 切换那一刻（`switched=true`）在 **stderr** 打印 `cli::root_switch_notice(previous, current)`（两个根 + 原因 + 怎么切回去，正斜杠）；② 交互窗口横幅区**永远多一行「数据根：…」**，与本程序所在目录不一致时再补一行说明；③ 文本抽成函数才能**断言**——这是控制台输出第一次有测试覆盖（用例 `Cli.数据根切换提示要把两个根都说清楚`） | 数据根意味着**桶、文件、回收站整体换成另一个目录的内容**，这不是例行日志，是用户必须立刻知道的事；而「服务一次只接受一条连接」（技术文档 15.1 ①）意味着**会话中途被搬走不可能发生**，只可能在「连上那一刻」——所以在这一刻报一次 + 横幅常驻显示，覆盖就是完整的，不需要在每条命令前后都查根 |
+
+| 42 | **`data/user.json` 收敛成单用户文件（字段一个没改）**：用户要求「改成唯一一个用户的文件，字段不变保留，以后可以拓展其他字段」——**一个数据根只有一个账号**，所以这个文件就是「那个用户」：`{"version":1,"user_id":…,"username":…,"password_hash":…,"password_salt":…,"token":…,"current_bucket":…,"created_at":…,"updated_at":…,"last_login_at":…}`。九个字段与提交 `bfd89f7` 定的**完全一致**，只是不再套 `users` 数组——JSON 归类从「集合」移到「单例」（第 13.1 节）。「还没有账号」= 文件里只有 `{"version":1}`（补建缺失文件时写的就是它，账号由 `initialize_root` → `UserStore::ensure_default()` 建）。**老文件照读**：`{"version":1,"users":[{…}]}` 取第一条，下一次 `ensure_default()` 改写成单用户形状，**token / 密码哈希 / 时间戳一个都不动**；空的老数组等价于「还没有账号」，会补建。`UserStore::load/save` 由 `vector<UserRecord>` 改成单条记录（`UserRecord::empty()` 表示「还没有账号」，`save` 拒绝写空记录），另加 `Storage::make_document(1)`。**行为口径**：`ensure_default` 不再按 `config.current_user` 找名字——文件里那条记录就是这个数据根的账号，`current_user` 只决定**创建时**叫什么（名字不一致时不新建）。**158 项全绿**（157 + 净 +1：`App.老的多用户文件会被改写成单用户形状`、`App.老的空users文件要补建单用户账号` 取代 `App.已有空users文件时也要补建默认账号`） | 用户的原话是「字段不变保留，到时候可以拓展其他字段」：这条改动**只换容器、不动字段**——既去掉「一个数据根理论上能装多个账号」这个假象（HTTP 侧本来就是单账号 + token，从没有第二条账号的入口），又把文件变成以后**加字段**的自然落点：直接平铺在根上，不必先想「加到哪个用户身上」。兼容放在**读**这一侧（老形状照读 + 一次性改写），所以 v1.0 已经建好的数据根升级后 token 不变、HTTP 调用方一行都不用改 |
 
 # 附录 A. 已冻结决策（第二阶段开工前）
 
