@@ -20,28 +20,26 @@ FMT_TEST(App, 初始化数据根会建默认账号与token) {
     }
     const fmt::PathManager& manager = *std::get<std::unique_ptr<fmt::PathManager>>(paths);
 
-    // 直接看文件：初始化之后 data/user.json 里就该有一个默认用户
+    // 直接看文件：data/user.json 是**单用户文件**——用户字段平铺在根上，
+    // 没有 users 数组（一个数据根只有一个账号）。
     const auto document = fmt::read_json_file(manager.user_data());
     FMT_CHECK(fmt::ok(document));
     if (!fmt::ok(document)) {
         return;
     }
-    const nlohmann::json& users = std::get<nlohmann::json>(document)["users"];
-    FMT_CHECK_EQ(users.size(), std::size_t{1});
-    if (users.empty()) {
-        return;
-    }
-
-    FMT_CHECK_EQ(users[0].value("username", std::string{}), std::string("user"));
-    FMT_CHECK(!users[0].value("user_id", std::string{}).empty());
+    const nlohmann::json& user = std::get<nlohmann::json>(document);
+    FMT_CHECK(!user.contains("users"));
+    FMT_CHECK_EQ(user.value("version", 0), 1);
+    FMT_CHECK_EQ(user.value("username", std::string{}), std::string("user"));
+    FMT_CHECK(!user.value("user_id", std::string{}).empty());
     // token：32 位十六进制（16 字节 CSPRNG），永久有效
-    const std::string token = users[0].value("token", std::string{});
+    const std::string token = user.value("token", std::string{});
     FMT_CHECK_EQ(token.size(), std::size_t{32});
     FMT_CHECK(token.find_first_not_of("0123456789abcdef") == std::string::npos);
     // 密码只存哈希与盐（PBKDF2-SHA256 -> 64 位十六进制）
-    FMT_CHECK_EQ(users[0].value("password_hash", std::string{}).size(), std::size_t{64});
-    FMT_CHECK(!users[0].value("password_salt", std::string{}).empty());
-    FMT_CHECK(!users[0].value("created_at", std::string{}).empty());
+    FMT_CHECK_EQ(user.value("password_hash", std::string{}).size(), std::size_t{64});
+    FMT_CHECK(!user.value("password_salt", std::string{}).empty());
+    FMT_CHECK(!user.value("created_at", std::string{}).empty());
 
     // 再初始化一次：不覆盖已有账号（token 与创建时间都不变）
     const auto again = fmt::initialize_root(root);
@@ -49,19 +47,63 @@ FMT_TEST(App, 初始化数据根会建默认账号与token) {
     const auto after = fmt::read_json_file(manager.user_data());
     FMT_CHECK(fmt::ok(after));
     if (fmt::ok(after)) {
-        const nlohmann::json& kept = std::get<nlohmann::json>(after)["users"];
-        FMT_CHECK_EQ(kept.size(), std::size_t{1});
-        if (!kept.empty()) {
-            FMT_CHECK_EQ(kept[0].value("token", std::string{}), token);
-            FMT_CHECK_EQ(kept[0].value("created_at", std::string{}),
-                         users[0].value("created_at", std::string{}));
-        }
+        const nlohmann::json& kept = std::get<nlohmann::json>(after);
+        FMT_CHECK(!kept.contains("users"));
+        FMT_CHECK_EQ(kept.value("token", std::string{}), token);
+        FMT_CHECK_EQ(kept.value("created_at", std::string{}),
+                     user.value("created_at", std::string{}));
     }
 }
 
-FMT_TEST(App, 已有空users文件时也要补建默认账号) {
-    // 复刻线上状态：数据根早就初始化过，data/user.json 是 `{"users":[],"version":1}`
-    //（那会儿还没有账号功能）。这时候再初始化必须把默认账号补上。
+FMT_TEST(App, 老的多用户文件会被改写成单用户形状) {
+    // 复刻线上状态：数据根是 v1.0 建出来的，data/user.json 还是老形状
+    // `{"version":1,"users":[{…}]}`。再初始化时账号**原样保留**
+    //（token / 密码哈希 / 创建时间一个都不动），只把文件改写成单用户形状。
+    fmt_test::TempDir temp("app-user-legacy");
+    const auto root = temp / "root";
+
+    const auto first = fmt::initialize_root(root);
+    FMT_CHECK(fmt::ok(first));
+    if (!fmt::ok(first)) {
+        return;
+    }
+    const fmt::PathManager& manager = *std::get<std::unique_ptr<fmt::PathManager>>(first);
+
+    // 手工把它按回老形状：把那条记录塞回 users 数组（version 属于文件，不属于记录）。
+    const auto created = fmt::read_json_file(manager.user_data());
+    FMT_CHECK(fmt::ok(created));
+    if (!fmt::ok(created)) {
+        return;
+    }
+    nlohmann::json record = std::get<nlohmann::json>(created);
+    record.erase("version");
+    nlohmann::json legacy = fmt::make_collection(1, "users");
+    legacy["users"].push_back(record);
+    FMT_CHECK(fmt::ok(fmt::write_json_file(manager.user_data(), legacy)));
+
+    const auto second = fmt::initialize_root(root);
+    FMT_CHECK(fmt::ok(second));
+    if (!fmt::ok(second)) {
+        return;
+    }
+
+    const auto document = fmt::read_json_file(manager.user_data());
+    FMT_CHECK(fmt::ok(document));
+    if (!fmt::ok(document)) {
+        return;
+    }
+    const nlohmann::json& user = std::get<nlohmann::json>(document);
+    FMT_CHECK(!user.contains("users"));  // 老容器已经没了
+    FMT_CHECK_EQ(user.value("token", std::string{}), record.value("token", std::string{}));
+    FMT_CHECK_EQ(user.value("password_hash", std::string{}),
+                 record.value("password_hash", std::string{}));
+    FMT_CHECK_EQ(user.value("created_at", std::string{}),
+                 record.value("created_at", std::string{}));
+}
+
+FMT_TEST(App, 老的空users文件要补建单用户账号) {
+    // 更老的数据根：`{"version":1,"users":[]}`（那会儿还没有账号功能）。
+    // 这时候再初始化必须把默认账号补上，并按单用户形状写回去。
     fmt_test::TempDir temp("app-user-existing");
     const auto root = temp / "root";
 
@@ -72,7 +114,6 @@ FMT_TEST(App, 已有空users文件时也要补建默认账号) {
     }
     const fmt::PathManager& manager = *std::get<std::unique_ptr<fmt::PathManager>>(first);
 
-    // 手工把它清回「老数据根」的样子
     FMT_CHECK(fmt::ok(fmt::write_json_file(manager.user_data(), fmt::make_collection(1, "users"))));
 
     const auto second = fmt::initialize_root(root);
@@ -83,14 +124,13 @@ FMT_TEST(App, 已有空users文件时也要补建默认账号) {
 
     const auto document = fmt::read_json_file(manager.user_data());
     FMT_CHECK(fmt::ok(document));
-    if (fmt::ok(document)) {
-        const nlohmann::json& users = std::get<nlohmann::json>(document)["users"];
-        FMT_CHECK_EQ(users.size(), std::size_t{1});
-        if (!users.empty()) {
-            FMT_CHECK_EQ(users[0].value("username", std::string{}), std::string("user"));
-            FMT_CHECK_EQ(users[0].value("token", std::string{}).size(), std::size_t{32});
-        }
+    if (!fmt::ok(document)) {
+        return;
     }
+    const nlohmann::json& user = std::get<nlohmann::json>(document);
+    FMT_CHECK(!user.contains("users"));
+    FMT_CHECK_EQ(user.value("username", std::string{}), std::string("user"));
+    FMT_CHECK_EQ(user.value("token", std::string{}).size(), std::size_t{32});
 }
 
 FMT_TEST(App, 初始化建出六个目录与默认JSON) {

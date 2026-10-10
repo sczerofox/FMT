@@ -149,6 +149,12 @@ nlohmann::json make_collection(int version, std::string_view collection) {
     return value;
 }
 
+nlohmann::json make_document(int version) {
+    nlohmann::json value = nlohmann::json::object();
+    value["version"] = version;
+    return value;
+}
+
 Status check_version(const nlohmann::json& value, int supported) {
     if (!value.is_object()) {
         return make_error(ErrorCode::JsonParseError, "JSON 顶层必须是对象");

@@ -286,8 +286,9 @@ CheckEq '原文件 17364485.jpg 还在' ($nowFiles -match '17364485\.jpg') $true
 CheckEq '原回收站条目 a7.jpg 还在' ($nowTrash -match 'a7\.jpg') $true
 CheckEq '测试 Bucket 已删除' ($nowBuckets -match $testBucket) $false
 $userJson = Get-Content -LiteralPath (Join-Path $root 'data\user.json') -Encoding UTF8 -Raw | ConvertFrom-Json
-CheckEq 'user.json 仍只有一个用户' $userJson.users.Count 1
-CheckEq 'user.json 仍无 buckets 字段' ($null -eq $userJson.users[0].buckets) $true
+CheckEq 'user.json 仍是单用户形状（没有 users 数组）' ($null -eq $userJson.users) $true
+CheckEq 'user.json 仍带着账号（user_id 非空）' (-not [string]::IsNullOrEmpty($userJson.user_id)) $true
+CheckEq 'user.json 仍无 buckets 字段' ($null -eq $userJson.buckets) $true
 $shareAfter = Get-Content -LiteralPath $sharePath -Encoding UTF8 -Raw | ConvertFrom-Json
 CheckEq 'share.json 没留下测试分享' $shareAfter.shares.Count 0
 $leftovers = Get-ChildItem (Join-Path $root 'temp') -Filter 'fmt-upload-*' -ErrorAction SilentlyContinue

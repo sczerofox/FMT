@@ -148,14 +148,16 @@ FMT_TEST(Storage, 版本策略) {
     FMT_CHECK(fmt::error_of(not_object)->code == fmt::ErrorCode::JsonParseError);
 }
 
-FMT_TEST(Storage, 集合默认结构) {
+FMT_TEST(Storage, 集合与单对象的默认结构) {
     const nlohmann::json files = fmt::make_collection(1, "files");
     FMT_CHECK(files["version"].get<int>() == 1);
     FMT_CHECK(files["files"].is_array());
     FMT_CHECK(files["files"].empty());
 
-    const nlohmann::json users = fmt::make_collection(1, "users");
-    FMT_CHECK(users.contains("users"));
+    // 单对象文件（data/user.json）：补建时只有版本号，用户字段由 user 模块往上加。
+    const nlohmann::json document = fmt::make_document(1);
+    FMT_CHECK(document["version"].get<int>() == 1);
+    FMT_CHECK_EQ(document.size(), std::size_t{1});
 }
 
 FMT_TEST(Storage, 目录创建幂等) {

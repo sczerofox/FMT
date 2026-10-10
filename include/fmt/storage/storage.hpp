@@ -33,6 +33,9 @@ Status write_json_file(const std::filesystem::path& path, const nlohmann::json& 
 // 集合数据：{"version":1,"<collection>":[...]}
 nlohmann::json make_collection(int version, std::string_view collection);
 
+// 单对象数据：{"version":1}，字段由模块自己往上加（例如 data/user.json）。
+nlohmann::json make_document(int version);
+
 // 版本策略：只接受明确支持的版本，未知版本直接拒绝，不降级、不猜测。
 // 缺 version 字段或不是对象 -> JsonParseError；版本不符 -> JsonUnsupportedVersion。
 Status check_version(const nlohmann::json& value, int supported);

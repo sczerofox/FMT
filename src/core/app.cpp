@@ -25,7 +25,8 @@ std::vector<ExpectedFile> default_data_files(const PathManager& paths) {
         {paths.file_data(), make_collection(1, "files")},
         {paths.share_data(), make_collection(1, "shares")},
         {paths.trash_data(), make_collection(1, "trash")},
-        {paths.user_data(), make_collection(1, "users")},
+        // user.json 是单用户文件：补建时只有一个 version，账号由 UserStore 建。
+        {paths.user_data(), make_document(1)},
     };
 }
 
