@@ -1,7 +1,7 @@
 // CLI：横幅、提示符、命令分发、单实例、提权
 //
 // 界面约定（docx/FMT 开发文档.md §127）：
-//   FMT 1.0.0
+//   FMT 2.0.0
 //   Service Running...
 //   fmt> service stop
 //   需要管理员权限

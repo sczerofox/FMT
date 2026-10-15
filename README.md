@@ -8,9 +8,9 @@
 | 形态 | 单个 `fmt.exe` —— CLI / Windows 服务 / 提权副本 三合一，manifest `asInvoker` |
 | 语言与构建 | C++17 · CMake ≥ 3.20 · Ninja · MSVC（`/MT` 静态链接运行库） |
 | 依赖 | 只用 Windows 自带组件（WinHTTP + Schannel 下载、CNG/bcrypt 随机数与哈希、`cpp-httplib` 单头文件已 vendored） |
-| 接口 | CLI 走命名管道 `\\.\pipe\fmt.control`；HTTP 走 `localhost:4122`（默认关闭） |
+| 接口 | CLI 走命名管道 `\\.\pipe\fmt.control`；HTTP 走 `localhost:4122`（**默认打开**，可用 `config set server_enabled false` 关闭） |
 | 业务 | Bucket、File、Trash、Share、Config |
-| 测试 | 158 个用例，全绿 |
+| 测试 | 176 个用例，全绿 |
 | 设计文档 | [技术文档](<docx/FMT 技术文档.md>) · [开发文档](<docx/FMT 开发文档.md>) · [项目架构](<docx/FMT 项目架构.md>) |
 
 ---
@@ -98,16 +98,53 @@ cmake --build --preset debug
 
 ```text
 file upload <来源> [文件名]     来源可以是 http(s):// 或本机路径；大小上限取 config.json
+                               判重只看**当前 Bucket**，而且**先看内容、再看名字**：
+                               桶内已有相同内容（不管名字同不同）→ FMT-304「文件已存在」，
+                               **不要求改文件名**；内容不同而文件名相同 → FMT-105
+                               「文件名重复」，提示修改文件名；两者都不同就正常入库。
+                               别的桶里有同内容/同名的文件完全不影响
 file list [--sort name|size|id] [--search 关键字] [--page N --page-size M]
-file delete <file_id|文件名>    软删除进回收站；跨 Bucket 时会先说明再确认
-trash restore <标识>            文件级按 file_id 回退；桶级整体回退（同名冲突会拒绝）
+file get <file_id|文件名>       按文件名只查当前 Bucket（同名的在别的桶时会告诉你）；
+                               按 file_id 全局查，回收站里的也查得到；输出里带
+                               完整「预览链接：」「下载链接：」（不管服务开没开）
+file delete <file_id|文件名>    软删除进回收站；按名字只作用于当前 Bucket，
+                               要删别的桶里那份请用 file_id（会先说明再确认）
+trash restore <标识>            文件级按 file_id 回退；桶级整体回退（目标桶已存在时改为
+                                合并：先说清搬几个文件、要一次确认；有同名文件则
+                                一个都不搬，报 FMT-403 并列出冲突名）
 trash empty                     清空整个回收站（两级一起，不可恢复，要 --yes 或答 y）
-share create <file_id>          默认 20 次、7 天过期；share_id 就是访问凭证
-config list                     看配置，**也打印 HTTP 访问 token**
+share create <file_id|文件名>   默认 20 次、7 天过期；返回 share_id 与**完整分享链接**
+                                （http://host:port/api/share/<id>/download，不管服务开没开）
+share list [<file_id|文件名>]   不带参数列**全部**分享，**一条一行**：文件名、下载次数、
+                                状态、到期；用满/过期时直接写「[下载次数已满]」
+                                「[下载已过期]」（列表不打印分享链接——用 share get 看）
+share get <share_id>           看这条分享的全部信息：文件与 Bucket、**分享链接**、下载次数、
+                                到期、状态（过期 / 次数用尽都如实说，链接失效也标注）
+config list                     看配置：config.json 与 config/server.json 的字段按顺序分开输出
+                                （**token 默认不打印**，要看加 `--show-token`）
 config set max_upload_size 10MB 支持 10485760 / 10MB / 512KB / 1GB
+config set server_enabled true  开/关网络服务；另有 server_host / server_port
+                                （改完自动重启服务，让配置立即生效）
+log clean [--keep 8MB] [--dry-run]  清理日志（本地执行、不需要服务）
 ```
 
-**破坏性操作**（`file delete`、`trash delete`、`trash empty`、`bucket delete`）都是三步：
+**Bucket 是命名空间**：同一个桶里**内容相同的只留一份**，同名的也不能再来一份——
+
+| 当前桶内 | 结果 |
+|---|---|
+| 内容相同 + 名字不同 | `FMT-304`「文件已存在」，**不提改名** |
+| 内容相同 + 名字相同 | `FMT-304`「文件已存在」，**不提改名** |
+| 内容不同 + 名字相同 | `FMT-105`「文件名重复」，**提示改文件名**（两者会落到同一个磁盘路径） |
+| 内容不同 + 名字不同 | 正常上传 |
+
+同一份文件可以在两个桶里各存一份（内容判重也不跨桶）。
+
+**链接不看服务开关**：`share create` / `share get` / `share list` 会给出完整分享链接，
+`file get` 会给出预览链接与下载链接——地址由 `config/server.json` 的 `host` / `port`
+算出来，**HTTP 服务没开也照样给**（协议只给 `http://`，服务端本身不提供 TLS）。
+
+**破坏性操作**（`file delete`、`trash delete`、`trash empty`、`bucket delete`）
+以及**会往现有桶里加东西的 `trash restore`（合并）**都是三步：
 先检查并说清要动什么 → 交互窗口里问一次 → 一次性命令必须加 `--yes`。
 服务端**独立**再校验一次 `force`，客户端跳过确认也拦得住。
 
@@ -135,13 +172,25 @@ config set max_upload_size 10MB 支持 10485760 / 10MB / 512KB / 1GB
 
 ## 7. HTTP 接口
 
-**默认关闭**，由数据根下的 `config/server.json` 打开：
+**默认打开**（`config/server.json` 的 `enabled` 默认 `true`），所以新数据根装完服务就能连：
 
 ```json
 { "version": 1, "enabled": true, "host": "localhost", "port": 4122 }
 ```
 
-改完需要重启服务（`fmt.exe service stop` → `service start`）。它**只监听本机**。
+开关与地址可以用 CLI 改，**改完会自动重启服务**（已提权就直接重装，否则弹一次 UAC；
+提权被取消时会提示你手动执行 `fmt.exe service reinstall`）：
+
+```text
+fmt> config set server_enabled false       关闭网络服务
+fmt> config set server_enabled true        打开
+fmt> config set server_host 127.0.0.1      改监听地址（默认 localhost，只监听本机）
+fmt> config set server_port 4321           改端口（默认 4122）
+fmt> config list                          看两个配置文件的字段（token 默认不打印）
+fmt> config list --show-token               要看 token 时加这个开关
+```
+
+也可以（改完自己重启一次服务）：`fmt.exe service stop` → `service start`。它**只监听本机**。
 
 ### 认证
 
@@ -150,25 +199,49 @@ config set max_upload_size 10MB 支持 10485760 / 10MB / 512KB / 1GB
 - `GET /api/ping` —— 健康检查，不要 token
 - `GET /api/share/<share_id>/download` —— 别人拿分享链接下载，**分享链接本身就是凭证**
 
-请求头两种写法都认：
+请求头两种写法都认（**`<token>` 是一个占位符，不是能直接用的值**）：
 
 ```http
-X-FMT-Token: 1a2867378b112b8e7864218fd2fd693f
-Authorization: Bearer 1a2867378b112b8e7864218fd2fd693f
+X-FMT-Token: <你的 token>
+Authorization: Bearer <你的 token>
 ```
 
-**token 从哪来**：`fmt.exe config list` 会打印「用户 ID / 访问 token / 建议的请求头」。
-一个数据根只有一个账号，`data/user.json` **就是这个用户**（用户字段平铺在文件里，没有 `users` 数组）。
-token 存在那里，**默认永久有效**；密码只存哈希（PBKDF2-SHA256 + 每用户随机盐），
-明文从不落盘。缺失或无效的 token 返回 **401 + `FMT-018`**。
+**token 从哪来**：`fmt.exe config list` **默认不打印 token**（省得暴露在屏幕、日志、工单
+与截图里），要它得显式加一个开关：
+
+```powershell
+# 直接打印（占位符形式 32 位十六进制）
+.\cmake-build-debug\bin\fmt.exe config list --show-token
+```
+
+或者读数据根下的 `data/user.json`——一个数据根只有一个账号，那个文件**就是这个用户**
+（字段平铺，没有 `users` 数组），token 存在 `token` 字段里，**默认永久有效**；
+密码只存哈希（PBKDF2-SHA256 + 每用户随机盐），明文从不落盘。
+
+**每个数据根一个 token，别照抄文档里的值**：文档与 SDK 示例里的 32 位十六进制串都是
+占位符，服务端只认**它自己数据根** `data/user.json` 里那一个。抄错了会拿到
+**401 + `FMT-018`**（消息里会告诉你去 `data/user.json` 拿），响应形如：
+
+```json
+{ "ok": false, "error": { "code": "FMT-018",
+  "message": "缺少或无效的访问 token：请求头用 X-FMT-Token: <token>，或 Authorization: Bearer <token>（token 在 data/user.json 里）" } }
+```
+
+查看服务当前认哪个 token（一眼确认，不用猜）：
+
+```powershell
+Get-Content '<数据根>\data\user.json' | Select-String token
+```
 
 ### 路由表
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/file/upload` | **流式上传**：请求体就是文件内容；文件名用 `?name=` 或 `Content-Disposition` |
+| `GET` | `/api/config` | 读配置（**只读**）：当前用户/当前 Bucket/上传上限…**响应里永远没有 token**（连 `?include_token=1` 这种开关都不提供） |
+| `GET` | `/api/bucket` | 列出 Bucket（**只读**）：名称 + 是否当前桶。创建/切换/删除仍然由 CLI 管 |
+| `POST` | `/api/file/upload` | **上传**（两种请求体都收）：① **裸字节**——请求体就是文件内容，文件名用 `?name=` 或 `Content-Disposition`；② **`multipart/form-data`**——Postman 的 form-data / 浏览器表单 / Spring 的 `MultipartFile`，取**第一个带 `filename` 的 part** 的正文（普通文本字段读掉但不落盘）。名字优先级 `?name=` > `Content-Disposition` > part 的 `filename`；没有文件部分 → `FMT-100`，多于一个文件 → `FMT-001` |
 | `GET` | `/api/file` | 列出文件，支持 `?search=` `?sort=` `?page=` `?page_size=` |
-| `GET` | `/api/file/<file_id或文件名>` | 单条文件信息（含相对数据根的 `path`） |
+| `GET` | `/api/file/<file_id或文件名>` | 单条文件信息（含相对数据根的 `path`）；按**文件名**只查当前 Bucket，按 `file_id` 全局查 |
 | `GET` | `/api/file/<…>/download` | 下载（流式，`attachment`） |
 | `GET` | `/api/file/<…>/preview` | 预览（流式，`inline`；图片与文本类，其余 `FMT-701`） |
 | `DELETE` | `/api/file/<…>` | 软删除（`?dry_run=1` 预检、`?force=1` 执行） |
@@ -176,6 +249,7 @@ token 存在那里，**默认永久有效**；密码只存哈希（PBKDF2-SHA256
 | `GET` | `/api/trash/<标识>` | 单条回收站条目 |
 | `DELETE` | `/api/trash/<标识>` | **永久删除**（不可恢复，需 `?force=1`） |
 | `POST` | `/api/trash/<标识>/restore` | 回退 |
+| `DELETE` | `/api/trash/empty` | **清空整个回收站**（不可恢复）：`?dry_run=1` 预检、`?force=1` 执行。有内容不给 `force` → `FMT-016`；回收站本来就空则直接成功、不要确认 |
 | `POST` | `/api/share` | 创建分享，请求体 `{"file_id": "fmt-20261009-0"}` |
 | `GET` | `/api/share/<share_id>` | 查看分享（如实报告 可用/已过期/次数用尽/已撤销/文件不可用） |
 | `GET` | `/api/share?file_id=<file_id>` | 列出某个文件的分享 |
@@ -189,18 +263,30 @@ token 存在那里，**默认永久有效**；密码只存哈希（PBKDF2-SHA256
 ### 例子
 
 ```powershell
-$token = '1a2867378b112b8e7864218fd2fd693f'
+# 先从数据根拿真 token（这里读的是 D:\Data\Temp\JMT\fmt 这个数据根）
+$token = (Get-Content 'D:\Data\Temp\JMT\fmt\data\user.json' | ConvertFrom-Json).token
 $h = @{ 'X-FMT-Token' = $token }
 
 # 流式上传（请求体就是内容，适合 .jar 这类大文件）
 Invoke-WebRequest 'http://localhost:4122/api/file/upload?name=lib.jar' -Method Post `
     -Headers $h -ContentType 'application/octet-stream' -InFile .\lib.jar
 
+# multipart 也行（Postman 的 form-data / 浏览器表单就是这个形状；取第一个带 filename 的 part）
+curl.exe -X POST 'http://localhost:4122/api/file/upload' -H "X-FMT-Token: $token" -F 'file=@.\报表.xlsx'
+
 # 搜索 + 分页：total 是命中总数，不是本页条数
 Invoke-WebRequest 'http://localhost:4122/api/file?search=report&page=1&page_size=20' -Headers $h
 
 # 下载
 Invoke-WebRequest 'http://localhost:4122/api/file/fmt-20261009-0/download' -Headers $h -OutFile .\x.jar
+
+# 读配置（默认不含 token）与列桶
+Invoke-WebRequest 'http://localhost:4122/api/config' -Headers $h
+Invoke-WebRequest 'http://localhost:4122/api/bucket' -Headers $h
+
+# 清空回收站：先预检，再确认执行
+Invoke-WebRequest 'http://localhost:4122/api/trash/empty?dry_run=1' -Method Delete -Headers $h
+Invoke-WebRequest 'http://localhost:4122/api/trash/empty?force=1'   -Method Delete -Headers $h
 
 # 公开分享链接（**不带 token**）
 Invoke-WebRequest 'http://localhost:4122/api/share/0d7b3cf4bc2e/download' -OutFile .\shared.bin
@@ -221,12 +307,14 @@ D:\Tools\fmt\
 ├── fmt.exe
 ├── repository/              唯一的业务数据（按用户/Bucket/日期分层）
 │   └── <用户>/<Bucket>/YYYY/MM/DD/<文件名>
+│       └── 文件名在**同一个 Bucket 内**唯一（不区分大小写）；不同 Bucket 互不影响，
+│           所以同一个文件可以在两个桶里各存一份（Day 目录由 file_id 推出）
 ├── trash/                   回收站数据
 │   └── <用户>/.files/…      文件级条目（权威记录在 data/file.json）
 │   └── <用户>/<桶名>_<时间戳>/  桶级条目（权威是 .original）
 ├── config/
 │   ├── config.json          当前用户、当前 Bucket、上传上限、语言、大小单位
-│   └── server.json          HTTP 开关、监听地址与端口
+│   └── server.json          HTTP 开关（默认 true）、监听地址与端口
 ├── data/                    索引（JSON）
 │   ├── file.json            文件索引（**文件状态的权威**，含 is_trash）
 │   ├── user.json            唯一账号与 token（单用户文件，字段平铺）
@@ -234,8 +322,18 @@ D:\Tools\fmt\
 │   └── trash.json           只读兼容（老数据），新数据不再写入
 ├── log/
 │   ├── fmt.log              运行日志（CLI 与服务共用；超过 5MB 轮转出一代）
-│   └── error.log            仅 ERROR 级
+│   ├── fmt.log.1            上一代（清理时会先删它）
+│   └── error.log            仅 ERROR 级（同样轮转、同样清理）
 └── temp/                    临时文件，随时可以清空
+```
+
+**日志不会无限长**：单个文件超过 5 MB 轮转出一代 `.1`；整个 `log/` 还有一条 8 MB 的预算——
+超过就先删 `.1` 备份，再只保留活动文件最新的一段（顶部会留一行「日志已裁剪」的断点）。
+**每次启动 CLI / 服务时自动兜底清一次**，也可以随时手动看一眼：
+
+```text
+fmt> log clean --dry-run      只报告会删什么、会裁什么、能释放多少，磁盘一个字节都不动
+fmt> log clean                真清理（--keep 16MB 可改保留上限）
 ```
 
 **权威在哪里**（出问题时看这几句）：文件的正常/回收站状态看 `data/file.json`；
@@ -265,7 +363,7 @@ pwsh -File tools/build.ps1 -Test
 #   String  Time  Trash  Validation
 ```
 
-158 个用例，覆盖文件名与路径校验、Bucket/File/Trash/Share 全流程、错误码与退出码、
+173 个用例，覆盖文件名与路径校验、Bucket/File/Trash/Share 全流程、错误码与退出码、
 配置与存储的并发写、日志轮转、命名管道协议、HTTP 路由与状态码、认证、流式上传下载、
 以及**用真实 exe + 真实管道**跑的端到端用例。
 
@@ -307,12 +405,16 @@ docx/            设计文档
 - **HTTP 客户端形态的 CLI**（CLI 走管道；HTTP 可关闭、端口可能被占）
 - **多用户与权限系统**（`data/user.json` 就是那一个账号，字段平铺；`current_user` 目前是占位名
   `user`。HTTP 侧只有这个账号 + token，不是多用户体系，也没有角色与权限）
-- **HTTP 的 Bucket 接口**（桶由 CLI 管理，HTTP 客户端只操作**当前** Bucket）
+- **HTTP 的 Bucket 写接口**（创建/切换/删除桶由 CLI 管，HTTP 只有 `GET /api/bucket` 这个只读列表；
+  HTTP 的文件类接口都作用在**当前** Bucket 上）
 
 ## 13. 已知边界
 
-- HTTP 默认关闭，且只监听本机；打开或改地址要改 `config/server.json` 后重启服务。
-- token 默认**永久有效**（尚无轮换/吊销命令），请按凭证对待。
+- HTTP **默认打开**，且只监听本机（`localhost`）；开/关与改地址用 `config set server_enabled|server_host|server_port`（会顺手重启服务），或改 `config/server.json` 后自己重启服务。
+- token 默认**永久有效**（尚无轮换/吊销命令），请按凭证对待。`GET /api/config` **永远不回传 token**
+  （连"要不要带"的开关都不提供），**CLI `config list` 默认也不打印它**——凭证不该因为"顺手"
+  而多出现在日志、转发、工单和截图里；要 token 只有两条路：`fmt.exe config list --show-token`，
+  或直接读数据根下的 `data/user.json`。
 - 分享默认 **20 次下载、7 天过期**，两者相互独立；文件进回收站后分享立即失效。
 - 预览只支持图片（按扩展名）与文本类（`.txt/.md/.json/.csv/.log/.xml`），其余返回 `FMT-701`；
   **下载不受此限制**，任何类型都能下载。
