@@ -187,23 +187,44 @@ FMT_TEST(File, 入库写记录并分配file_id) {
     FMT_CHECK_EQ(std::get<nlohmann::json>(document)["files"].size(), std::size_t{2});
 }
 
-FMT_TEST(File, 重复内容与重名都被拒绝) {
+FMT_TEST(File, 桶内判重先看内容再看名字) {
     Fixture f;
-    FMT_CHECK(fmt::ok(upload_local(f)));
+    FMT_CHECK(fmt::ok(upload_local(f)));  // 工作 / source.txt（"hello world"）
 
-    // 同样的内容换个名字：MD5 去重（第 37 节）
-    const auto duplicate = upload_local(f, "copy.txt");
-    FMT_CHECK(!fmt::ok(duplicate));
-    FMT_CHECK(fmt::error_of(duplicate)->code == fmt::ErrorCode::Md5Duplicate);
+    // ① 内容相同 + 名字不同 → FMT-304「文件已存在」，**不提示改文件名**
+    const auto other_name = upload_local(f, "copy.txt");
+    FMT_CHECK(!fmt::ok(other_name));
+    FMT_CHECK(fmt::error_of(other_name)->code == fmt::ErrorCode::Md5Duplicate);
+    FMT_CHECK(fmt::error_of(other_name)->message.find("文件已存在") != std::string::npos);
+    FMT_CHECK(fmt::error_of(other_name)->message.find("修改文件名") == std::string::npos);
+    FMT_CHECK(fmt::error_of(other_name)->message.find("source.txt") != std::string::npos);
+    FMT_CHECK_EQ(fmt::exit_code(fmt::error_of(other_name)->code), 4);
 
-    // 不同的内容、同样的名字：文件名冲突（第 38 节），不自动改名
+    // ② 内容相同 + 名字相同 → 同样 FMT-304「文件已存在」，**不提示改文件名**
+    const auto same_both = upload_local(f, "source.txt");
+    FMT_CHECK(!fmt::ok(same_both));
+    FMT_CHECK(fmt::error_of(same_both)->code == fmt::ErrorCode::Md5Duplicate);
+    FMT_CHECK(fmt::error_of(same_both)->message.find("文件已存在") != std::string::npos);
+    FMT_CHECK(fmt::error_of(same_both)->message.find("修改文件名") == std::string::npos);
+
+    // ③ 内容不同 + 名字相同 → FMT-105「文件名重复」，**要提示修改文件名**
     FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(f.source, "different content")));
     const auto conflict = upload_local(f, "source.txt");
     FMT_CHECK(!fmt::ok(conflict));
     FMT_CHECK(fmt::error_of(conflict)->code == fmt::ErrorCode::FileNameConflict);
+    FMT_CHECK(fmt::error_of(conflict)->message.find("文件名重复") != std::string::npos);
+    FMT_CHECK(fmt::error_of(conflict)->message.find("修改文件名") != std::string::npos);
     FMT_CHECK_EQ(fmt::exit_code(fmt::error_of(conflict)->code), 4);
 
-    // 两次失败都不许留下临时文件
+    // ④ 内容不同 + 名字不同 → 正常入库
+    const auto fresh = upload_local(f, "brand-new.txt");
+    FMT_CHECK(fmt::ok(fresh));
+    if (fmt::ok(fresh)) {
+        FMT_CHECK_EQ(std::get<fmt::FileRecord>(fresh).file_name, std::string("brand-new.txt"));
+        FMT_CHECK_EQ(std::get<fmt::FileRecord>(fresh).md5, fmt::md5_hex("different content"));
+    }
+
+    // 三条失败路径都不许留下临时文件
     std::size_t leftovers = 0;
     std::error_code code;
     for (const auto& entry : std::filesystem::directory_iterator(f.paths->temp(), code)) {
@@ -212,6 +233,104 @@ FMT_TEST(File, 重复内容与重名都被拒绝) {
         }
     }
     FMT_CHECK_EQ(leftovers, std::size_t{0});
+}
+
+FMT_TEST(File, 判重不跨桶) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+
+    // 1 桶：source.txt（"hello world"）
+    const auto first = upload_local(f);
+    FMT_CHECK(fmt::ok(first));
+    if (!fmt::ok(first)) {
+        return;
+    }
+
+    // 2 桶：同一份内容 + 同一个文件名，全都允许（桶各自是独立的命名空间：
+    // 内容判重也只看当前桶，别的桶里就算一模一样也不冲突）
+    FMT_CHECK(fmt::ok(buckets.create("生活")));
+    FMT_CHECK(fmt::ok(buckets.use("生活")));  // 第一个桶之后，create 不自动切桶
+    const auto in_other = upload_local(f);
+    FMT_CHECK(fmt::ok(in_other));
+    if (!fmt::ok(in_other)) {
+        return;
+    }
+    FMT_CHECK_EQ(std::get<fmt::FileRecord>(in_other).bucket, std::string("生活"));
+    FMT_CHECK_EQ(std::get<fmt::FileRecord>(in_other).md5,
+                 std::get<fmt::FileRecord>(first).md5);
+    FMT_CHECK_EQ(std::get<fmt::FileRecord>(in_other).file_name, std::string("source.txt"));
+
+    // 两条记录各自指向自己的桶目录，磁盘上两份文件都在
+    fmt::FileService files(*f.paths, f.config, nullptr);
+    const auto one = files.resolve_path(std::get<fmt::FileRecord>(first));
+    const auto two = files.resolve_path(std::get<fmt::FileRecord>(in_other));
+    FMT_CHECK(fmt::ok(one));
+    FMT_CHECK(fmt::ok(two));
+    if (fmt::ok(one) && fmt::ok(two)) {
+        FMT_CHECK(std::get<std::filesystem::path>(one) != std::get<std::filesystem::path>(two));
+        FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(one)));
+        FMT_CHECK(fmt::file_exists(std::get<std::filesystem::path>(two)));
+    }
+
+    // 回到 1 桶：按名字查到的是 1 桶那一条；2 桶的同名不影响它
+    FMT_CHECK(fmt::ok(buckets.use("工作")));
+    const auto by_name = files.get_by_name("source.txt");
+    FMT_CHECK(fmt::ok(by_name));
+    if (fmt::ok(by_name)) {
+        FMT_CHECK_EQ(std::get<fmt::FileRecord>(by_name).bucket, std::string("工作"));
+        FMT_CHECK_EQ(std::get<fmt::FileRecord>(by_name).file_id,
+                     std::get<fmt::FileRecord>(first).file_id);
+    }
+
+    // 1 桶里再传同名（不同内容）：仍然拒绝，跨桶的同名不参与判定
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(f.source, "another content")));
+    const auto conflict = upload_local(f);
+    FMT_CHECK(!fmt::ok(conflict));
+    FMT_CHECK(fmt::error_of(conflict)->code == fmt::ErrorCode::FileNameConflict);
+}
+
+FMT_TEST(File, 判重不跨桶时按名字删除只作用于当前桶) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+    FMT_CHECK(fmt::ok(upload_local(f, "a.txt")));  // 工作 / a.txt
+
+    // 别的桶里放一个同名文件
+    FMT_CHECK(fmt::ok(buckets.create("生活")));
+    FMT_CHECK(fmt::ok(buckets.use("生活")));
+    const auto other = upload_local(f, "a.txt");
+    FMT_CHECK(fmt::ok(other));
+    FMT_CHECK(fmt::ok(buckets.use("工作")));
+
+    fmt::FileService files(*f.paths, f.config, nullptr);
+    const auto checked = files.check_remove("a.txt");
+    FMT_CHECK(fmt::ok(checked));
+    if (fmt::ok(checked)) {
+        const fmt::FileDeleteCheck& check = std::get<fmt::FileDeleteCheck>(checked);
+        FMT_CHECK(!check.ambiguous);
+        FMT_CHECK(!check.other_bucket);
+        FMT_CHECK_EQ(check.bucket, std::string("工作"));
+        FMT_CHECK(check.message.empty());
+    }
+
+    // 切到「生活」：当前桶里没有 a.txt，别的桶（工作）里有——**按名字删不到别的桶**
+    // （名字的命名空间是 Bucket，破坏性操作不跨桶猜），错误消息要点明它在哪个桶。
+    FMT_CHECK(fmt::ok(buckets.create("临时")));
+    FMT_CHECK(fmt::ok(buckets.use("临时")));
+    const auto not_here = files.check_remove("a.txt");
+    FMT_CHECK(!fmt::ok(not_here));
+    FMT_CHECK(fmt::error_of(not_here)->code == fmt::ErrorCode::FileNotFound);
+    FMT_CHECK(fmt::error_of(not_here)->message.find("工作") != std::string::npos);
+    const auto remove_here = files.remove("a.txt");
+    FMT_CHECK(!fmt::ok(remove_here));
+    FMT_CHECK(fmt::error_of(remove_here)->code == fmt::ErrorCode::FileNotFound);
+
+    // 按 file_id 删得掉别桶那一份，删的是指定的那一条
+    const std::string other_id = std::get<fmt::FileRecord>(other).file_id;
+    const auto removed = files.remove(other_id);
+    FMT_CHECK(fmt::ok(removed));
+    if (fmt::ok(removed)) {
+        FMT_CHECK_EQ(std::get<fmt::FileRecord>(removed).file_id, other_id);
+    }
 }
 
 FMT_TEST(File, 没有当前Bucket时拒绝上传) {
@@ -362,7 +481,7 @@ FMT_TEST(File, 按文件名也能软删除) {
     FMT_CHECK(fmt::error_of(again)->message.find(record.file_id) != std::string::npos);
 }
 
-FMT_TEST(File, 按名字删除用的是记录自己的Bucket) {
+FMT_TEST(File, 按file_id删别的桶的文件时回收站用记录自己的Bucket) {
     Fixture f;
     fmt::BucketService buckets(*f.paths, f.config, nullptr);
     FMT_CHECK(fmt::ok(buckets.create("生活")));  // 第二个桶（第一个「工作」已是当前）
@@ -375,12 +494,12 @@ FMT_TEST(File, 按名字删除用的是记录自己的Bucket) {
     }
     FMT_CHECK_EQ(std::get<fmt::FileRecord>(uploaded).bucket, std::string("工作"));
 
-    // 名字的作用域是「同用户跨 Bucket」，所以切到别的桶也能按名字删到它；
-    // 关键是回收站落点要用**记录自己的桶**，不是当前桶。
+    // 切到别的桶，再用 file_id 删：关键是回收站落点要用**记录自己的桶**，不是当前桶。
+    // （按名字删不带桶限定，跨桶不再命中——见 File.判重不跨桶时按名字删除要能定位）
     FMT_CHECK(fmt::ok(buckets.use("生活")));
     fmt::FileService files(*f.paths, f.config, nullptr);
 
-    const auto removed = files.remove("跨桶.txt");
+    const auto removed = files.remove(std::get<fmt::FileRecord>(uploaded).file_id);
     FMT_CHECK(fmt::ok(removed));
     if (!fmt::ok(removed)) {
         return;
@@ -532,12 +651,19 @@ FMT_TEST(File, 删除预检会把情况说清楚) {
         FMT_CHECK(!check.path.empty());
     }
 
-    // 切到另一个桶：预检要能说清「属于哪个桶、当前是哪个桶」
+    // 切到另一个桶：**按名字删不到别的桶里的文件**（本次改动（未提交）：名字的命名空间是 Bucket，
+    // 别的桶里的同名文件跟当前桶不相干，不能被当前桶的名字操作误删）。
     FMT_CHECK(fmt::ok(buckets.use("生活")));
     const auto cross = files.check_remove("a.txt");
-    FMT_CHECK(fmt::ok(cross));
-    if (fmt::ok(cross)) {
-        const fmt::FileDeleteCheck& check = std::get<fmt::FileDeleteCheck>(cross);
+    FMT_CHECK(!fmt::ok(cross));
+    FMT_CHECK(fmt::error_of(cross)->code == fmt::ErrorCode::FileNotFound);
+    FMT_CHECK(fmt::error_of(cross)->message.find("工作") != std::string::npos);
+
+    // 按 file_id 仍然能定位到它，跨桶提示与回收站落点照旧由记录自己的桶决定
+    const auto by_id = files.check_remove(std::get<fmt::FileRecord>(uploaded).file_id);
+    FMT_CHECK(fmt::ok(by_id));
+    if (fmt::ok(by_id)) {
+        const fmt::FileDeleteCheck& check = std::get<fmt::FileDeleteCheck>(by_id);
         FMT_CHECK(check.other_bucket);
         FMT_CHECK(!check.ambiguous);
         FMT_CHECK_EQ(check.bucket, std::string("工作"));

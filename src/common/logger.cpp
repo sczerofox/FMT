@@ -1,12 +1,15 @@
 #include "fmt/common/logger.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <system_error>
 #include <utility>
+#include <vector>
 
 #include "fmt/common/string.hpp"
 #include "fmt/common/time.hpp"
+#include "fmt/core/path.hpp"
 
 namespace fmt {
 namespace {
@@ -35,6 +38,75 @@ std::uintmax_t size_of(const std::filesystem::path& path) {
     return code ? 0 : size;
 }
 
+// 活动日志：清理时只认这两个名字，别的文件（用户手放的、将来新增的）一律不动。
+constexpr const char* kActiveLogNames[] = {"fmt.log", "error.log"};
+constexpr const char* kBackupSuffix = ".1";
+
+// 保留 path 最新的 keep 字节：写临时文件 -> 校验 -> 原子替换。
+// 正在被另一个进程追加时替换会失败（共享冲突）——返回 false，调用方跳过它。
+bool trim_tail(const std::filesystem::path& path, std::uintmax_t keep, std::uintmax_t* freed) {
+    const std::uintmax_t size = size_of(path);
+    if (size <= keep) {
+        return false;
+    }
+
+    std::ifstream in(path, std::ios::in | std::ios::binary);
+    if (!in) {
+        return false;
+    }
+    in.seekg(static_cast<std::streamoff>(size - keep));
+    if (!in) {
+        return false;
+    }
+
+    std::string tail;
+    tail.resize(static_cast<std::size_t>(keep));
+    in.read(tail.data(), static_cast<std::streamsize>(tail.size()));
+    tail.resize(static_cast<std::size_t>(in.gcount()));
+    in.close();
+
+    // 从头保留的可能是半行：丢掉第一个（不完整的）换行之前的内容，
+    // 免得日志里出现一截断掉的时间戳，看起来像文件坏了。
+    const std::size_t first_newline = tail.find('\n');
+    if (first_newline == std::string::npos) {
+        return false;  // 一个换行都没有：不正常，别动它
+    }
+    std::string kept = tail.substr(first_newline + 1);
+
+    std::string content = local_timestamp() + " [INFO] [Log] 日志已裁剪：保留最近 " +
+                          std::to_string(kept.size()) + " 字节（原 " + std::to_string(size) +
+                          " 字节），更早的记录已删除\n";
+    content += kept;
+
+    const std::filesystem::path temporary = path.string() + ".trim.tmp";
+    {
+        std::ofstream out(temporary, std::ios::out | std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return false;
+        }
+        out.write(content.data(), static_cast<std::streamsize>(content.size()));
+        out.flush();
+        if (!out) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            return false;
+        }
+    }
+
+    std::error_code code;
+    std::filesystem::rename(temporary, path, code);
+    if (code) {
+        std::error_code ignored;
+        std::filesystem::remove(temporary, ignored);
+        return false;  // 另一个进程正握着这个文件
+    }
+
+    if (freed != nullptr) {
+        *freed = (size > content.size()) ? size - content.size() : 0;
+    }
+    return true;
+}
+
 }  // namespace
 
 std::string_view level_name(LogLevel level) {
@@ -47,6 +119,135 @@ std::string_view level_name(LogLevel level) {
             return "ERROR";
     }
     return "INFO";
+}
+
+Result<LogCleanup> cleanup_logs(const std::filesystem::path& log_directory,
+                                std::uintmax_t budget, bool dry_run) {
+    LogCleanup report;
+    report.dry_run = dry_run;
+
+    std::error_code code;
+    if (!std::filesystem::is_directory(log_directory, code)) {
+        // 还没写过日志：没什么可清的，也不是错误。
+        report.message = "日志目录不存在，无需清理";
+        return report;
+    }
+
+    // 目录里有什么、多大：一次性扫出来，后面按名字取。
+    struct Item {
+        std::filesystem::path path;
+        std::uintmax_t size = 0;
+    };
+    std::vector<Item> backups;
+    std::vector<Item> actives;
+    std::uintmax_t total = 0;
+
+    for (const auto& entry : std::filesystem::directory_iterator(log_directory, code)) {
+        if (code) {
+            break;
+        }
+        std::error_code type_code;
+        if (!entry.is_regular_file(type_code)) {
+            continue;
+        }
+        const std::string name = path_to_utf8(entry.path().filename());
+        Item item{entry.path(), size_of(entry.path())};
+        total += item.size;
+
+        bool is_backup = false;
+        for (const char* active : kActiveLogNames) {
+            if (name == std::string(active) + kBackupSuffix) {
+                is_backup = true;
+                break;
+            }
+        }
+        if (is_backup) {
+            backups.push_back(std::move(item));
+            continue;
+        }
+        for (const char* active : kActiveLogNames) {
+            if (name == active) {
+                actives.push_back(std::move(item));
+                break;
+            }
+        }
+    }
+
+    report.over_budget = (total > budget);
+    if (!report.over_budget) {
+        report.remaining_bytes = total;
+        report.message = "日志占用 " + format_size(total) + "，未超过上限 " +
+                         format_size(budget) + "，未做任何清理";
+        return report;
+    }
+
+    std::uintmax_t projected = total;
+
+    // ① 先删轮转备份（纯附加物）。删不掉（另一个进程握着）就跳过。
+    for (const Item& item : backups) {
+        if (!dry_run) {
+            std::error_code remove_code;
+            if (!std::filesystem::remove(item.path, remove_code) || remove_code) {
+                report.notes.push_back(path_to_utf8(item.path.filename()) +
+                                       "：正被另一个进程使用，本次跳过");
+                continue;
+            }
+        }
+        report.notes.push_back(path_to_utf8(item.path.filename()) + "：删除（释放 " +
+                               format_size(item.size) + "）");
+        projected -= std::min(projected, item.size);
+        ++report.removed_backups;
+        report.freed_bytes += item.size;
+    }
+
+    // ② 仍超预算：活动文件保留最新的尾部。预算是两个活动文件共享的，先各分一半，
+    //    再按「谁大谁多留」调不平——这里保持简单：各分一半，且不低于下限。
+    if (budget > 0 && projected > budget) {
+        const std::uintmax_t share = std::max(budget / 2, kMinActiveLogBytes);
+        for (const Item& item : actives) {
+            if (item.size <= share) {
+                continue;
+            }
+            std::uintmax_t freed = 0;
+            if (!dry_run && !trim_tail(item.path, share, &freed)) {
+                report.notes.push_back(path_to_utf8(item.path.filename()) +
+                                       "：正被另一个进程使用，本次跳过");
+                continue;
+            }
+            // dry_run 时按「保留 share + 一行说明」估个大概，不必精确。
+            const std::uintmax_t estimate = dry_run ? item.size - share : freed;
+            report.notes.push_back(path_to_utf8(item.path.filename()) + "：裁剪为最新 " +
+                                   format_size(share) + "（释放 " + format_size(estimate) + "）");
+            projected -= std::min(projected, estimate);
+            ++report.trimmed_files;
+            report.freed_bytes += estimate;
+        }
+    }
+
+    // 真正剩下的占用**重新扫一遍**：`projected` 是估算（裁剪之后那行说明本身也占
+    // 几个字节、被跳过的文件没变），报给用户的数字必须与磁盘对得上。
+    if (dry_run) {
+        report.remaining_bytes = projected;
+    } else {
+        std::uintmax_t after = 0;
+        std::error_code rescan;
+        for (const auto& entry : std::filesystem::directory_iterator(log_directory, rescan)) {
+            if (rescan) {
+                break;
+            }
+            std::error_code type_code;
+            if (entry.is_regular_file(type_code)) {
+                after += size_of(entry.path());
+            }
+        }
+        report.remaining_bytes = after;
+        report.freed_bytes = (total > after) ? total - after : 0;
+    }
+
+    report.message = std::string(dry_run ? "（预演）" : "") + "日志清理：释放 " +
+                     format_size(report.freed_bytes) + "，剩余约 " +
+                     format_size(report.remaining_bytes) + "（上限 " + format_size(budget) + "）";
+    return report;
 }
 
 bool Logger::append_line(const std::filesystem::path& path, const std::string& line) {

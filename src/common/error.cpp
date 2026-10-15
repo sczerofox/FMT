@@ -42,7 +42,7 @@ constexpr Entry kTable[] = {
     {ErrorCode::FileNameSeparator, "FileNameSeparator", 2, "文件名含路径分隔符"},
     {ErrorCode::FileNameReserved, "FileNameReserved", 2, "文件名是 Windows 保留设备名"},
     {ErrorCode::FileNameTooLong, "FileNameTooLong", 2, "文件名超长"},
-    {ErrorCode::FileNameConflict, "FileNameConflict", 4, "同用户下已存在同名正常文件"},
+    {ErrorCode::FileNameConflict, "FileNameConflict", 4, "当前 Bucket 内已有同名文件（文件名重复）"},
     {ErrorCode::FileNameLikeFileId, "FileNameLikeFileId", 2,
      "文件名与文件标识同形（fmt-YYYYMMDD-N），会与 file_id 混淆"},
 
@@ -57,13 +57,15 @@ constexpr Entry kTable[] = {
     {ErrorCode::DownloadFailed, "DownloadFailed", 1, "下载失败"},
     {ErrorCode::DownloadTimeout, "DownloadTimeout", 1, "下载超时"},
     {ErrorCode::SizeLimitExceeded, "SizeLimitExceeded", 2, "超过最大上传大小"},
-    {ErrorCode::Md5Duplicate, "Md5Duplicate", 4, "文件内容已存在（MD5 重复）"},
+    {ErrorCode::Md5Duplicate, "Md5Duplicate", 4, "当前 Bucket 内已有相同内容的文件（文件已存在）"},
     {ErrorCode::NoCurrentBucket, "NoCurrentBucket", 3, "未设置当前 Bucket"},
 
     // ---- FMT-4xx Trash ----
     {ErrorCode::TrashEntryNotFound, "TrashEntryNotFound", 3, "回收站记录不存在"},
     {ErrorCode::RestoreConflict, "RestoreConflict", 4, "恢复目标已存在同名文件"},
     {ErrorCode::RestoreBucketMissing, "RestoreBucketMissing", 3, "原 Bucket 已永久删除"},
+    {ErrorCode::RestoreMergeConflict, "RestoreMergeConflict", 4,
+     "合并回退时目标 Bucket 里已有同名文件"},
 
     // ---- FMT-5xx Share ----
     {ErrorCode::ShareNotFound, "ShareNotFound", 3, "分享不存在"},

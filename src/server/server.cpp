@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <functional>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -73,6 +74,7 @@ int http_status_for(ErrorCode code) {
         case ErrorCode::BucketInUse:
         case ErrorCode::Md5Duplicate:
         case ErrorCode::RestoreConflict:
+        case ErrorCode::RestoreMergeConflict:
             return 409;
         case ErrorCode::RouteNotFound:
             return 404;
@@ -80,7 +82,8 @@ int http_status_for(ErrorCode code) {
             return 401;  // 缺 token / token 不对
         case ErrorCode::ServiceOperationFailed:
             // 「服务端还没实现这个接口」是 501，不是 500：500 等于说服务器坏了，
-            // 而真相是这个功能还没做（share 就属于这一类）。
+            // 而真相是这个功能还没做（现在只剩 /api/server/*、/api/preview/* 这类
+            // 已登记但没实现的路径——share 早就落地了）。
             return 501;
         default:
             return 500;
@@ -189,24 +192,24 @@ Result<nlohmann::json> upload_args_from_body(const httplib::Request& request) {
     return args;
 }
 
-// DELETE 路由的公共参数：
+// 删除/清空类接口的公共参数：
 //   ?dry_run=1  只预检（说清要删什么、有没有冲突），零副作用
 //   ?force=1    已确认执行（也接受请求体 {"force":true}）
-nlohmann::json delete_args(const httplib::Request& request, const std::string& name) {
-    nlohmann::json args = args_with_encoded_name(name);
+// 单独拎出来是因为 /api/trash/empty 这类接口**没有位置参数**，只吃这两个开关。
+bool query_flag(const httplib::Request& request, const char* key) {
+    if (!request.has_param(key)) {
+        return false;
+    }
+    const std::string value = request.get_param_value(key);
+    return value == "1" || iequals(value, "true");
+}
 
-    const auto flag = [&request](const char* key) {
-        if (!request.has_param(key)) {
-            return false;
-        }
-        const std::string value = request.get_param_value(key);
-        return value == "1" || iequals(value, "true");
-    };
-
-    if (flag("dry_run")) {
+nlohmann::json confirm_args(const httplib::Request& request) {
+    nlohmann::json args = nlohmann::json::object();
+    if (query_flag(request, "dry_run")) {
         args["dry_run"] = true;
     }
-    bool force = flag("force");
+    bool force = query_flag(request, "force");
     if (!force && !request.body.empty()) {
         try {
             const nlohmann::json body = nlohmann::json::parse(request.body);
@@ -218,6 +221,12 @@ nlohmann::json delete_args(const httplib::Request& request, const std::string& n
     if (force) {
         args["force"] = true;
     }
+    return args;
+}
+
+nlohmann::json delete_args(const httplib::Request& request, const std::string& name) {
+    nlohmann::json args = args_with_encoded_name(name);
+    args.update(confirm_args(request));
     return args;
 }
 
@@ -388,16 +397,59 @@ void register_content_route(httplib::Server* server, const BusinessHandler& hand
 
 // 业务路由表见技术文档 12.3；这里只做「路径 -> op + 参数」的翻译。
 void register_business_routes(httplib::Server* server, BusinessHandler handler,
-                               const std::string& data_root, std::uintmax_t upload_limit) {
-    const auto run = [handler](const std::string& operation, const nlohmann::json& args,
-                               httplib::Response& response) {
+                               const std::string& data_root, UploadLimitProvider upload_limit) {
+    // 唯一的业务出口：**认证已经在 pre-routing 钩子里做完了**，这里不重复判断。
+    // transform 只在成功时改一下 data（目前只有 /api/config 用它剥掉 token，而且是无条件剥）；
+    // 失败一律原样返回，不给出「改了错误信息」的机会。
+    const auto dispatch = [handler](const std::string& operation, const nlohmann::json& args,
+                                    httplib::Response& response,
+                                    const std::function<void(nlohmann::json&)>& transform) {
         if (!handler) {
             respond(response, make_error(ErrorCode::ServiceOperationFailed,
                                          "HTTP 未接入业务处理"));
             return;
         }
-        respond(response, handler(operation, args));
+        Result<nlohmann::json> result = handler(operation, args);
+        if (ok(result) && transform) {
+            transform(std::get<nlohmann::json>(result));
+        }
+        respond(response, result);
     };
+    // 大多数路由什么都不用改，走这个更省事。**按值捕获**：这些 lambda 会活到服务停止。
+    const auto run = [dispatch](const std::string& operation, const nlohmann::json& args,
+                                httplib::Response& response) {
+        dispatch(operation, args, response, nullptr);
+    };
+
+    // 配置：**只读，而且一律不带 token**。
+    // 改配置会动服务进程的状态（max_upload_size 影响所有人），HTTP 侧不提供写入口，留给 CLI。
+    // token **连开关都不提供**（没有 ?include_token 这种口子）：HTTP 响应体会进日志、被代理、
+    // 被贴进工单，凭证多一份副本就多一处泄漏面。要 token 只有两条路——
+    // CLI `fmt config list`，或直接读数据根下的 data/user.json（Java 客户端就是这么读的）。
+    const auto strip_token = [](nlohmann::json& data) {
+        if (data.is_object()) {
+            data.erase("token");
+        }
+    };
+    server->Get("/api/config",
+                [dispatch, strip_token](const httplib::Request&, httplib::Response& response) {
+                    dispatch("config.list", nlohmann::json::object(), response, strip_token);
+                });
+
+    // Bucket：**只读列表**。写操作（create/use/delete）故意不提供——
+    // 「当前 Bucket」是服务端全局状态，多个 HTTP 调用方一起改会互相踩，
+    // 而且桶的删除有确认流程，那是 CLI 的活。未登记的桶路径会落到兜底路由的 404。
+    server->Get("/api/bucket", [run](const httplib::Request&, httplib::Response& response) {
+        run("bucket.list", nlohmann::json::object(), response);
+    });
+
+    // 清空回收站：**必须注册在 /api/trash/([^/]+) 之前**，否则 "empty" 会被当成
+    // 「名字叫 empty 的条目」走 trash.delete（结果是 FMT-016 或者 FMT-400）。
+    // 语义与 CLI 一致：?dry_run=1 只说清「几项、多少字节」，?force=1 才真删（不可恢复）。
+    server->Delete("/api/trash/empty",
+                   [run](const httplib::Request& request, httplib::Response& response) {
+                       run("trash.empty", confirm_args(request), response);
+                   });
 
     // 回收站（桶级）：GET /api/trash 列条目、POST /api/trash/<名字>/restore 回退。
     server->Get("/api/trash", [run](const httplib::Request&, httplib::Response& response) {
@@ -445,17 +497,35 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler,
         }
         run("file.list", args, response);
     });
-    // 上传：**请求体就是文件内容**（流式）。Java / Python 客户端直接推字节流，
-    // 不再要求文件在服务端本地有路径——那对远端客户端没有意义。
-    // 边收边写 temp/、**边判上限**（超了立刻中止并删掉暂存文件），
-    // 落盘后再交给业务层补算 MD5 并入库（一次移动，不二次拷贝）。
-    // 文件名：?name=xxx，或请求头 Content-Disposition 的 filename / filename*。
+    // 上传：**两种请求体形态，处理方式完全一样**——都边收边写 temp/、边判上限
+    //（超了立刻中止并删掉暂存文件），落盘后再交给业务层补算 MD5 并入库
+    //（一次移动、不二次拷贝）：
+    //   ① 裸字节（原有口径，不变）：**请求体就是文件内容**。Java / Python 客户端
+    //      直接推字节流，不要求文件在服务端本地有路径——那对远端客户端没有意义。
+    //   ② multipart/form-data（本次新增）：取**第一个带 filename 的 part** 的内容
+    //      ——Postman 的 form-data、浏览器表单、Spring 的 MultipartFile 都是这个形状。
+    //      没有 filename 的 part（普通文本字段）照样读掉，但**不落盘**；出现第二个
+    //      文件 part 直接拒（一次只收一个文件，不能让「传了两个只存一个」悄悄发生）。
+    // 上限：由服务注入的 UploadLimitProvider **每次请求现取**（改配置不用重启监听），
+    //       判的是**收到的字节**——multipart 的普通字段也算，不能白送字节。
+    // 文件名优先级：?name= > 请求头 Content-Disposition > multipart 那个 part 的 filename。
     server->Post("/api/file/upload",
                  [run, data_root, upload_limit](const httplib::Request& request,
                                                 httplib::Response& response,
                                                 const httplib::ContentReader& reader) {
-        const std::string file_name = upload_file_name(request);
-        if (file_name.empty()) {
+        const bool multipart = request.is_multipart_form_data();
+
+        // 上限**每次请求现取**：`config set max_upload_size` 之后不用重启 HTTP 监听。
+        const std::uintmax_t limit = upload_limit ? upload_limit() : 0;
+
+        std::string file_name = upload_file_name(request);  // ?name= 或请求级 Content-Disposition
+        std::string part_file_name;                         // multipart 里第一个文件 part 的名字
+        bool saw_file_part = false;
+        bool extra_file_part = false;
+        bool in_file_part = false;  // 当前收到的字节要不要落盘
+
+        // 裸字节形态：名字必须在建暂存文件之前就知道，否则白白建一个（口径与之前一致）。
+        if (!multipart && file_name.empty()) {
             drain_reader(reader);  // 不读完就回，客户端会拿到"没有响应"
             respond(response,
                     make_error(ErrorCode::FileNameEmpty,
@@ -468,10 +538,15 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler,
         // 中断留下的碎片下次启动会被收走（10 分钟年龄保护，见 clean_temp_directory）。
         const std::filesystem::path temp_path =
             PathManager(path_from_utf8(data_root)).temp() / path_from_utf8(unique_staged_name());
+        const auto discard_temp = [&temp_path]() {
+            std::error_code ignored;
+            std::filesystem::remove(temp_path, ignored);
+        };
 
-        std::uintmax_t written = 0;
+        std::uintmax_t received_bytes = 0;  // **收到的都算**（普通字段也不该白送字节）
         bool too_large = false;
         bool write_failed = false;
+        bool received = false;       // 请求体有没有完整收到
         {
             std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
             if (!out) {
@@ -479,31 +554,101 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler,
                                              "无法创建暂存文件：" + path_to_utf8(temp_path)));
                 return;
             }
-            reader([&](const char* data, std::size_t length) -> bool {
-                if (upload_limit > 0 && written + length > upload_limit) {
+            const auto sink = [&](const char* data, std::size_t length) -> bool {
+                if (limit > 0 && received_bytes + length > limit) {
                     too_large = true;
                     return false;  // 中止接收：剩下的一律不落盘
+                }
+                received_bytes += length;
+                if (!in_file_part) {
+                    return true;  // 普通字段（或还没轮到文件 part）：读掉但不落盘
                 }
                 out.write(data, static_cast<std::streamsize>(length));
                 if (!out) {
                     write_failed = true;
                     return false;
                 }
-                written += length;
                 return true;
-            });
+            };
+
+            if (multipart) {
+                // 两个回调：header 在每个 part 开头报一次（filename 非空才是文件），
+                // receiver 拿到的是**单个 part 的正文**（boundary 与 part 头都不会进来）。
+                received = reader(
+                    [&](const httplib::MultipartFormData& part) -> bool {
+                        if (part.filename.empty()) {
+                            in_file_part = false;
+                            return true;
+                        }
+                        if (saw_file_part) {
+                            // 第二个文件 part：不再落盘，但把请求体读完（连接留干净），
+                            // 读完再回 FMT-001。
+                            extra_file_part = true;
+                            in_file_part = false;
+                            return true;
+                        }
+                        saw_file_part = true;
+                        in_file_part = true;
+                        // 与 ?name= 走同一套清洗：剪掉复制粘贴带进来的成对引号与不可见字符。
+                        part_file_name = trim(clean_user_path(part.filename));
+                        return true;
+                    },
+                    sink);
+            } else {
+                in_file_part = true;  // 裸字节：整个请求体都是文件内容
+                received = reader(sink);
+            }
             out.close();
         }
 
         if (too_large || write_failed) {
-            std::error_code ignored;
-            std::filesystem::remove(temp_path, ignored);
+            discard_temp();
             respond(response,
                     too_large ? make_error(ErrorCode::SizeLimitExceeded,
-                                           "文件超过上传上限（已收 " + std::to_string(written) +
-                                               " 字节，上限 " + std::to_string(upload_limit) +
-                                               " 字节）")
+                                           "请求体超过上传上限（已收 " +
+                                               std::to_string(received_bytes) + " 字节，上限 " +
+                                               std::to_string(limit) +
+                                               " 字节；multipart 的普通字段也算在内）")
                               : make_error(ErrorCode::StorageError, "写入暂存文件失败"));
+            return;
+        }
+
+        // 请求体没收完（multipart 格式不对，或连接断在中途）：**半截文件绝不能当成功**。
+        if (!received) {
+            discard_temp();
+            respond(response,
+                    make_error(ErrorCode::HttpRequestInvalid,
+                               "请求体没有完整收到（multipart 格式不对，或连接中断）：已丢弃暂存数据"));
+            return;
+        }
+
+        if (multipart) {
+            if (extra_file_part) {
+                discard_temp();
+                respond(response,
+                        make_error(ErrorCode::InvalidArgument,
+                                   "multipart 请求里有多个文件：本接口一次只收一个，请分多次上传"));
+                return;
+            }
+            if (!saw_file_part) {
+                discard_temp();
+                respond(response,
+                        make_error(ErrorCode::FileNameEmpty,
+                                   "multipart 请求里没有带 filename 的文件部分：Postman 里把 Body 选成 "
+                                   "form-data、并把某一行的类型选 File；或把文件内容直接放进请求体，"
+                                   "用 ?name= 给文件名"));
+                return;
+            }
+            if (file_name.empty()) {
+                file_name = part_file_name;  // ?name= / 请求级 Content-Disposition 没给才用它
+            }
+        }
+        if (file_name.empty()) {
+            // 只可能出现在 multipart 分支：那个 part 的 filename 清洗后什么都不剩。
+            discard_temp();
+            respond(response,
+                    make_error(ErrorCode::FileNameEmpty,
+                               "文件名为空：multipart 那个文件 part 的 filename 是空的，请换一个名字"));
             return;
         }
 
@@ -614,7 +759,7 @@ HttpServer::~HttpServer() { stop(); }
 
 Status HttpServer::start(const std::string& host, int port, std::string data_root, Logger* logger,
                          BusinessHandler handler, TokenVerifier verifier,
-                         std::uintmax_t max_upload_size) {
+                         UploadLimitProvider upload_limit) {
     if (impl_->running.load()) {
         return make_error(ErrorCode::InvalidArgument, "HTTP 服务已经在运行");
     }
@@ -667,7 +812,7 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
 
     // 业务路由：与命名管道共用同一份实现（见 register_business_routes）。
     register_business_routes(impl_->server.get(), std::move(handler),
-                                impl_->state->data_root, max_upload_size);
+                                impl_->state->data_root, std::move(upload_limit));
 
     // 兜底：已经登记的模块里还没实现的操作。
     impl_->server->Get(R"(/api/.*)", [](const httplib::Request& request,
@@ -676,8 +821,9 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
         //   已知模块但还没实现（例如 /api/share/...）→ 404? 不：**501** Not Implemented
         //   完全没这个路径（例如打错字）            → **404** Not Found
         const std::string& path = request.path;
-        // 注意：**bucket 不在里面**。用户明确不要 HTTP 桶接口（桶由 CLI 管），
-        // 所以 /api/bucket 走 404「没有这个接口」，而不是 501「还没实现」。
+        // 注意：**bucket 不在里面**。HTTP 侧只提供 `GET /api/bucket` 这一个只读列表，
+        // 写操作（create/use/delete）是**故意不做**的，不算「还没实现」——
+        // 所以 /api/bucket/xxx 走 404「没有这个接口」，而不是 501。
         const bool known_module =
             starts_with(path, "/api/file") || starts_with(path, "/api/trash") ||
             starts_with(path, "/api/share") || starts_with(path, "/api/config") ||

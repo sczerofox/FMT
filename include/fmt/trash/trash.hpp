@@ -37,9 +37,17 @@ struct TrashEntry {
 // 预检结论：说清楚 + 要不要确认 + 能不能靠确认解决。
 struct TrashCheck {
     TrashEntry entry;
-    bool needs_confirm = false;  // 永久删除：要 y/N
+    bool needs_confirm = false;  // 永久删除：要 y/N；回退时目标桶已存在（合并）：也要 y/N
     bool blocked = false;        // 同名冲突 / 随桶删除 / 数据缺失：确认也解决不了
     std::string message;
+
+    // ---- 只对桶级回退有意义：目标是「整目录搬回」还是「合并进已存在的桶」 ----
+    bool merge = false;            // 目标 Bucket 已存在：这次回退是合并
+    bool merge_target_exists = false;
+    std::size_t merge_files = 0;    // 要搬过去的文件数（含空目录条目时的 0）
+    std::size_t target_files = 0;   // 已存在的那个桶里现有的文件数（给用户看清规模）
+    std::uintmax_t merge_bytes = 0;
+    std::vector<std::string> conflicts;  // 同名冲突（合并不覆盖：确认也解决不了）
 };
 
 class TrashService {
@@ -51,8 +59,11 @@ public:
     Result<TrashEntry> get(std::string_view identifier);
 
     // 回退：预检（只读）与执行。执行前的三种阻断由预检给出。
+    // `confirmed` 只对一种情况有意义：目标 Bucket 已存在时回退是**合并**
+    // （拿回收站的数据往现有桶里加东西），必须由调用方拿到用户确认后传 true；
+    // 不传就是 FMT-016。普通回退（目标不在）不受它影响。
     Result<TrashCheck> check_restore(std::string_view identifier) const;
-    Result<TrashEntry> restore(std::string_view identifier);
+    Result<TrashEntry> restore(std::string_view identifier, bool confirmed = false);
 
     // 永久删除：预检（只读，needs_confirm 恒为真）与执行。
     Result<TrashCheck> check_purge(std::string_view identifier) const;

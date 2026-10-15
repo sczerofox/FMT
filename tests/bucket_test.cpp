@@ -260,7 +260,9 @@ FMT_TEST(Bucket, 回退成功与已存在拒绝) {
     FMT_CHECK(fmt::ok(after));
     FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(after).size(), std::size_t{0});
 
-    // 目标已存在：整单拒绝，不覆盖不改名
+    // 目标已存在：restore 走的是**整目录搬回**那一条路，不是合并——
+    // 目标在就拒绝（不改名、不覆盖），合并要显式调 `merge()`（第 56.3 节，
+    // 命令层的 `trash restore` 由预检判定后转发到它）。
     FMT_CHECK(fmt::ok(buckets.remove("工作")));
     FMT_CHECK(fmt::ok(buckets.create("工作")));
     const auto conflict = buckets.restore("工作");
@@ -272,6 +274,16 @@ FMT_TEST(Bucket, 回退成功与已存在拒绝) {
     const auto still = buckets.list_trashed();
     FMT_CHECK(fmt::ok(still));
     FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(still).size(), std::size_t{1});
+    FMT_CHECK(fmt::directory_exists(f.repository("工作")));
+
+    // 这一条里已经没有文件（桶里的 a.txt 数据在 .files/ 下），所以合并不用搬东西，
+    // 只需收尾：摘掉 .original、收掉空目录
+    const auto merged = buckets.merge("工作");
+    FMT_CHECK(fmt::ok(merged));
+    FMT_CHECK_EQ(std::get<fmt::BucketMerge>(merged).moved_files, std::size_t{0});
+    const auto done = buckets.list_trashed();
+    FMT_CHECK(fmt::ok(done));
+    FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(done).size(), std::size_t{0});
     FMT_CHECK(fmt::directory_exists(f.repository("工作")));
 }
 
@@ -365,6 +377,156 @@ FMT_TEST(Bucket, 删空桶重建再删然后回退不会互相覆盖) {
     const auto listed = buckets.list_trashed();
     FMT_CHECK(fmt::ok(listed));
     FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(listed).size(), std::size_t{1});
+}
+
+FMT_TEST(Bucket, 目标桶已存在时回退是合并进去) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+
+    // ① 桶里有东西（按日期树放）→ 删桶
+    FMT_CHECK(fmt::ok(buckets.create("工作")));
+    seed_file_record(*f.paths, "工作", "a.txt");
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(f.repository("工作") / "2026" / "10" / "08")));
+    FMT_CHECK(fmt::ok(
+        fmt::write_text_file_atomic(f.repository("工作") / "2026" / "10" / "08" / "a.txt", "hello")));
+    const auto removal = buckets.remove("工作");
+    FMT_CHECK(fmt::ok(removal));
+    const std::string trashed = std::get<fmt::BucketRemoval>(removal).trashed_name;
+
+    // ② 原位置又有了同名桶（用户先单独回退过桶里某个文件时，file restore 会把空目录建出来）
+    FMT_CHECK(fmt::ok(buckets.create("工作")));
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(f.repository("工作") / "2026" / "10" / "08")));
+    FMT_CHECK(fmt::ok(
+        fmt::write_text_file_atomic(f.repository("工作") / "2026" / "10" / "08" / "b.txt", "keep")));
+
+    // ③ 预检：不是「回退失败」，而是「合并进去」——说清搬几个、目标已有几个
+    const auto checked = buckets.check_merge(trashed);
+    FMT_CHECK(fmt::ok(checked));
+    const fmt::BucketMergeCheck& check = std::get<fmt::BucketMergeCheck>(checked);
+    FMT_CHECK(check.target_exists);
+    FMT_CHECK_EQ(check.target_name, std::string("工作"));
+    FMT_CHECK_EQ(check.move_files, std::size_t{1});
+    FMT_CHECK_EQ(check.move_bytes, std::uintmax_t{5});
+    FMT_CHECK_EQ(check.target_files, std::size_t{1});
+    FMT_CHECK(check.conflicts.empty());
+
+    // ④ 执行：a.txt 落到**它自己的日期目录**里，b.txt 一个字节都没动
+    const auto merged = buckets.merge(trashed);
+    FMT_CHECK(fmt::ok(merged));
+    const fmt::BucketMerge& result = std::get<fmt::BucketMerge>(merged);
+    FMT_CHECK_EQ(result.moved_files, std::size_t{1});
+    FMT_CHECK_EQ(result.failed_files, std::size_t{0});
+    FMT_CHECK_EQ(result.records_freed, std::size_t{1});
+    FMT_CHECK(fmt::file_exists(f.repository("工作") / "2026" / "10" / "08" / "a.txt"));
+    FMT_CHECK(fmt::file_exists(f.repository("工作") / "2026" / "10" / "08" / "b.txt"));
+    FMT_CHECK(!fmt::file_exists(f.root / "trash" / "user" / fmt::path_from_utf8(trashed) /
+                                "2026" / "10" / "08" / "a.txt"));
+
+    // ⑤ 索引与记录都收尾了：条目没了、a.txt 不再是「已删除」
+    const auto after = buckets.list_trashed();
+    FMT_CHECK(fmt::ok(after));
+    FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(after).size(), std::size_t{0});
+    const auto files = fmt::read_json_file(f.paths->file_data());
+    FMT_CHECK(fmt::ok(files));
+    for (const nlohmann::json& record : std::get<nlohmann::json>(files)["files"]) {
+        FMT_CHECK(!record.value("is_trash", true));
+        FMT_CHECK_EQ(record.value("trash_reason", std::string{}), std::string{});
+    }
+}
+
+FMT_TEST(Bucket, 合并撞上同名文件就一个都不搬) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+
+    FMT_CHECK(fmt::ok(buckets.create("工作")));
+    seed_file_record(*f.paths, "工作", "a.txt");
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(f.repository("工作") / "2026" / "10" / "08")));
+    FMT_CHECK(fmt::ok(
+        fmt::write_text_file_atomic(f.repository("工作") / "2026" / "10" / "08" / "a.txt", "old")));
+    const auto removal = buckets.remove("工作");
+    FMT_CHECK(fmt::ok(removal));
+    const std::string trashed = std::get<fmt::BucketRemoval>(removal).trashed_name;
+
+    // 新桶里有一个同名文件（内容不同）——合并不覆盖，所以整单拒绝
+    FMT_CHECK(fmt::ok(buckets.create("工作")));
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(f.repository("工作") / "2026" / "10" / "08")));
+    FMT_CHECK(fmt::ok(
+        fmt::write_text_file_atomic(f.repository("工作") / "2026" / "10" / "08" / "a.txt", "new")));
+    seed_file_record(*f.paths, "工作", "a.txt");
+
+    const auto checked = buckets.check_merge(trashed);
+    FMT_CHECK(fmt::ok(checked));
+    const fmt::BucketMergeCheck& check = std::get<fmt::BucketMergeCheck>(checked);
+    FMT_CHECK_EQ(check.conflicts.size(), std::size_t{1});
+    FMT_CHECK_EQ(check.move_files, std::size_t{0});
+    FMT_CHECK(check.message.find("不覆盖") != std::string::npos);
+
+    // 确认也没用：这是冲突，不是「要不要做」的问题
+    const auto merged = buckets.merge(trashed);
+    FMT_CHECK(!fmt::ok(merged));
+    FMT_CHECK(fmt::error_of(merged)->code == fmt::ErrorCode::RestoreMergeConflict);
+    FMT_CHECK_EQ(fmt::exit_code(fmt::error_of(merged)->code), 4);
+
+    // 两边的数据都原样在：目标还是 "new"，回收站里还是 "old"
+    const auto target_bytes =
+        fmt::read_text_file(f.repository("工作") / "2026" / "10" / "08" / "a.txt");
+    FMT_CHECK(fmt::ok(target_bytes));
+    FMT_CHECK_EQ(std::get<std::string>(target_bytes), std::string("new"));
+    const auto trash_bytes = fmt::read_text_file(f.root / "trash" / "user" /
+                                                 fmt::path_from_utf8(trashed) / "2026" / "10" /
+                                                 "08" / "a.txt");
+    FMT_CHECK(fmt::ok(trash_bytes));
+    FMT_CHECK_EQ(std::get<std::string>(trash_bytes), std::string("old"));
+
+    // 条目还在回收站里等着处理
+    const auto listed = buckets.list_trashed();
+    FMT_CHECK(fmt::ok(listed));
+    FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(listed).size(), std::size_t{1});
+}
+
+FMT_TEST(Bucket, 合并要求目标桶的实际拼写与原桶名一致) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+
+    FMT_CHECK(fmt::ok(buckets.create("work")));
+    const auto removal = buckets.remove("work");
+    FMT_CHECK(fmt::ok(removal));
+    const std::string trashed = std::get<fmt::BucketRemoval>(removal).trashed_name;
+
+    // 手工造一个拼写不同的同名桶：file.json 里记的是 "work"，路径按它推导，
+    // 合并进 "WORK" 会让那些记录指向不存在的目录，所以直接拒绝。
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(f.root / "repository" / "user" / "WORK")));
+    const auto checked = buckets.check_merge(trashed);
+    FMT_CHECK(fmt::ok(checked));
+    FMT_CHECK(std::get<fmt::BucketMergeCheck>(checked).message.find("拼写") != std::string::npos);
+
+    const auto merged = buckets.merge(trashed);
+    FMT_CHECK(!fmt::ok(merged));
+    FMT_CHECK(fmt::error_of(merged)->code == fmt::ErrorCode::RestoreConflict);
+}
+
+FMT_TEST(Bucket, 回收站里没文件的条目合并只收尾) {
+    Fixture f;
+    fmt::BucketService buckets(*f.paths, f.config, nullptr);
+
+    FMT_CHECK(fmt::ok(buckets.create("空桶")));
+    const auto removal = buckets.remove("空桶");
+    FMT_CHECK(fmt::ok(removal));
+    const std::string trashed = std::get<fmt::BucketRemoval>(removal).trashed_name;
+
+    // 目标桶已存在，而回收站条目是空的：没有文件要搬，摘掉索引即可
+    FMT_CHECK(fmt::ok(buckets.create("空桶")));
+    const auto checked = buckets.check_merge(trashed);
+    FMT_CHECK(fmt::ok(checked));
+    FMT_CHECK_EQ(std::get<fmt::BucketMergeCheck>(checked).move_files, std::size_t{0});
+
+    const auto merged = buckets.merge(trashed);
+    FMT_CHECK(fmt::ok(merged));
+    FMT_CHECK_EQ(std::get<fmt::BucketMerge>(merged).moved_files, std::size_t{0});
+    const auto after = buckets.list_trashed();
+    FMT_CHECK(fmt::ok(after));
+    FMT_CHECK_EQ(std::get<std::vector<fmt::TrashBucket>>(after).size(), std::size_t{0});
+    FMT_CHECK(fmt::directory_exists(f.repository("空桶")));
 }
 
 FMT_TEST(Bucket, 条目详情与永久删除) {

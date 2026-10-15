@@ -58,13 +58,16 @@ enum class ErrorCode : int {
     DownloadFailed = 301,          // 下载失败               退出码 1
     DownloadTimeout = 302,         // 下载超时               退出码 1
     SizeLimitExceeded = 303,       // 超过最大上传大小       退出码 2
-    Md5Duplicate = 304,            // MD5 已存在，文件重复   退出码 4
+    Md5Duplicate = 304,            // 当前 Bucket 内同名且内容相同（文件已存在）
+                                   // 退出码 4，见开发文档第 37 节
     NoCurrentBucket = 305,         // 未设置当前 Bucket      退出码 3
 
     // ---- FMT-4xx Trash ----
     TrashEntryNotFound = 400,      // Trash 记录不存在       退出码 3
     RestoreConflict = 401,         // 恢复目标已存在同名文件 退出码 4
     RestoreBucketMissing = 402,    // 原 Bucket 已永久删除   退出码 3
+    RestoreMergeConflict = 403,    // 合并回退时桶里有同名文件（是 FMT-401 的下位：
+                                   // 目标桶存在但里面已有同名文件，合并不进去）退出码 4
 
     // ---- FMT-5xx Share ----
     ShareNotFound = 500,           // Share 不存在           退出码 3

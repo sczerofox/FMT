@@ -111,10 +111,14 @@ public:
     Result<std::vector<FileRecord>> list();
     // file_id 全局唯一（第 42 节）。
     Result<FileRecord> get_by_id(std::string_view file_id);
-    // 按名字查：当前用户 + 正常文件。
+    // 按名字查：当前用户 + 正常文件 + **当前 Bucket**（本次改动（未提交）：名字的命名空间是
+    // Bucket，别的桶可以有同名）：
+    //   当前桶里有同名 -> 返回它；
+    //   当前桶没有、别的桶里有 -> FMT-002，消息里点名它在哪个桶（**不跨桶返回**：
+    //                            按名字的查/删都只在当前桶内生效，跨桶要用 file_id）。
     Result<FileRecord> get_by_name(std::string_view file_name);
     // 软删除进回收站，file_id 不变（第 43 节）。
-    // 参数与 file get 一致：先当 file_id 查，再当文件名查（当前用户 + 正常文件）。
+    // 参数与 file get 一致：先当 file_id 查（全局），再当文件名查（当前用户 + 当前 Bucket）。
     Result<FileRecord> remove(std::string_view file_id_or_name);
 
     // 删除前的预检：只读，不改任何东西（跨桶确认与歧义检测都靠它）。
@@ -154,12 +158,16 @@ private:
     // （「名字存在但已在回收站」不能报成「文件不存在」）。
     Result<std::size_t> locate_record(const std::vector<FileRecord>& records,
                                       std::string_view key) const;
-    // 两个维度各自命中哪一条（预检与定位共用，保证判定只有一份）。
+    // 名字与 file_id 两个维度各自命中哪一条（预检与定位共用，保证判定只有一份）。
+    // **名字维度只看当前 Bucket**（本次改动（未提交）：一个桶内不允许同名，别的桶可以有同名）：
+    // 当前桶没有这个名字时 has_name 保持 false，`other_bucket_name` 记下别的桶里的同名者，
+    // 好让错误消息说得清「它在哪个桶，先 bucket use 切过去」而不是干巴巴一句「不存在」。
     struct RecordMatch {
         bool has_id = false;
         bool has_name = false;
         std::size_t by_id = 0;
         std::size_t by_name = 0;
+        std::size_t other_bucket_name = 0;  // 别的桶里同名正常文件的下标（没找到时等于 size）
     };
     RecordMatch match_record(const std::vector<FileRecord>& records, std::string_view key) const;
     // 记录在仓库里的目标路径（**按规则推**，不做兜底搜索）：file_id 定日期，

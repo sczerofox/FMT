@@ -99,20 +99,25 @@ FMT_TEST(Config, 服务配置默认值) {
     fmt_test::TempDir temp("config-server");
     const fmt::PathManager paths{temp.path()};
 
+    // 本次改动（未提交）：enabled 默认就是 **true**（新数据根开箱即用）
     const auto server = fmt::load_server_config(paths);
     FMT_CHECK(fmt::ok(server));
-    FMT_CHECK_EQ(std::get<fmt::ServerConfig>(server).enabled, false);
+    FMT_CHECK_EQ(std::get<fmt::ServerConfig>(server).enabled, true);
     FMT_CHECK_EQ(std::get<fmt::ServerConfig>(server).host, std::string("localhost"));
     FMT_CHECK_EQ(std::get<fmt::ServerConfig>(server).port, 4122);
+    // 首次读会写出默认文件，里面也必须是 true（不能只改内存默认值）
+    const auto written = fmt::read_json_file(paths.server_file());
+    FMT_CHECK(fmt::ok(written));
+    FMT_CHECK_EQ(std::get<nlohmann::json>(written).value("enabled", false), true);
 
-    fmt::ServerConfig enabled;
-    enabled.enabled = true;
-    enabled.port = 4123;
-    FMT_CHECK(fmt::ok(fmt::save_server_config(paths, enabled)));
+    fmt::ServerConfig disabled;
+    disabled.enabled = false;
+    disabled.port = 4123;
+    FMT_CHECK(fmt::ok(fmt::save_server_config(paths, disabled)));
 
     const auto reloaded = fmt::load_server_config(paths);
     FMT_CHECK(fmt::ok(reloaded));
-    FMT_CHECK_EQ(std::get<fmt::ServerConfig>(reloaded).enabled, true);
+    FMT_CHECK_EQ(std::get<fmt::ServerConfig>(reloaded).enabled, false);
     FMT_CHECK_EQ(std::get<fmt::ServerConfig>(reloaded).port, 4123);
     FMT_CHECK_EQ(std::get<fmt::ServerConfig>(reloaded).host, std::string("localhost"));
 }

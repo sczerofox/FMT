@@ -141,17 +141,28 @@ Status ShareService::save_shares(const std::vector<ShareRecord>& shares) const {
 
 std::string ShareService::new_share_id() { return make_share_id(); }
 
-Result<ShareRecord> ShareService::create(std::string_view file_id) {
+Result<FileRecord> ShareService::resolve(std::string_view file_id_or_name) const {
+    FileService files(paths_, config_, logger_);
+    // 先当 file_id（全局唯一、形状固定 fmt-YYYYMMDD-N，先查不会误伤名字）。
+    const Result<FileRecord> by_id = files.get_by_id(file_id_or_name);
+    if (ok(by_id)) {
+        return by_id;
+    }
+    // 再当文件名：当前用户 + 当前 Bucket 的正常文件（与 file get / file delete 同一套规则）。
+    return files.get_by_name(file_id_or_name);
+}
+
+Result<ShareRecord> ShareService::create(std::string_view file_id_or_name) {
     if (config_.current_user.empty()) {
         return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
     }
-    if (file_id.empty()) {
-        return make_error(ErrorCode::InvalidArgument, "缺少 file_id");
+    if (file_id_or_name.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少 file_id 或文件名");
     }
 
     // ① 文件必须存在、属于当前用户、且不在回收站（§47 + §50 的中心约束）。
-    FileService files(paths_, config_, logger_);
-    const Result<FileRecord> found = files.get_by_id(file_id);
+    //    参数可以是 file_id，也可以是文件名（本次改动（未提交））。
+    const Result<FileRecord> found = resolve(file_id_or_name);
     if (!ok(found)) {
         return *error_of(found);
     }
@@ -280,10 +291,20 @@ Result<ShareView> ShareService::get(std::string_view share_id) const {
     return view_of(*found, files);
 }
 
-Result<std::vector<ShareView>> ShareService::list(std::string_view file_id) const {
-    if (file_id.empty()) {
-        return make_error(ErrorCode::InvalidArgument, "缺少 file_id");
+Result<std::vector<ShareView>> ShareService::list(std::string_view file_id_or_name) const {
+    // 参数可空（本次改动（未提交））：空了就列**全部** share——`share list` 不带参数时
+    // 用它一眼看「哪些过期了、哪些次数用尽了」。给了 key 才按文件筛。
+    std::string file_id;
+    if (!file_id_or_name.empty()) {
+        // 参数可以是 file_id，也可以是文件名：先解析成记录，再按 **record.file_id** 筛
+        // share.json——记录里存的只有 file_id。
+        const Result<FileRecord> resolved = resolve(file_id_or_name);
+        if (!ok(resolved)) {
+            return *error_of(resolved);
+        }
+        file_id = std::get<FileRecord>(resolved).file_id;
     }
+
     Result<std::vector<ShareRecord>> loaded = load_shares();
     if (!ok(loaded)) {
         return *error_of(loaded);
@@ -294,7 +315,7 @@ Result<std::vector<ShareView>> ShareService::list(std::string_view file_id) cons
     const std::vector<ShareRecord>& shares = std::get<std::vector<ShareRecord>>(loaded);
     std::vector<ShareView> views;
     for (auto it = shares.rbegin(); it != shares.rend(); ++it) {
-        if (it->file_id != file_id) {
+        if (!file_id.empty() && it->file_id != file_id) {
             continue;
         }
         views.push_back(view_of(*it, files));

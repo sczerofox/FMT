@@ -328,8 +328,16 @@ void ServerRuntime::restart_http() {
         return ok(found) ? std::get<UserRecord>(found).username : std::string{};
     };
 
-    const Status started =
-        created->start(host, port, root, logger, std::move(handler), std::move(verifier));
+    // 上传上限：HTTP 层「边收边判」要用它，而且**每次上传请求现取**——拿启动时的
+    // 快照会让 `config set max_upload_size` 调大之后当场失效（HTTP 层还按旧的小值
+    // 中止接收，业务层根本没机会看到新值）。这里只读一次配置，锁内不干别的。
+    server::UploadLimitProvider upload_limit = [this]() -> std::uintmax_t {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return context_ == nullptr ? 0 : context_->config.max_upload_size;
+    };
+
+    const Status started = created->start(host, port, root, logger, std::move(handler),
+                                          std::move(verifier), std::move(upload_limit));
     if (!ok(started)) {
         // 端口被占用等：记 ERROR 日志，但**不中断**服务的其他功能。
         if (logger != nullptr) {

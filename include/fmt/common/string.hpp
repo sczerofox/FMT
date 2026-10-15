@@ -50,8 +50,8 @@ std::string format_size(std::uint64_t bytes);
 std::string to_forward_slashes(std::string text);
 
 // URL 百分号编解码。
-// 路径参数（例如 /api/bucket/<名称>）里的中文会被浏览器编码成 %E5%B7%A5…，
-// 服务端必须先解码再当业务参数用。
+// 路径参数（例如 /api/file/<文件名> 或 /api/trash/<标识>）里的中文会被浏览器编码成
+// %E5%B7%A5…，服务端必须先解码再当业务参数用。
 //   url_decode："%E5%B7%A5" -> "工"；非法转义原样保留；'+' 不当空格。
 //   url_encode：只保留 unreserved 字符（字母数字与 - _ . ~），其余转 %XX 大写。
 std::string url_decode(std::string_view text);

@@ -68,6 +68,42 @@ Result<std::string> argument(const nlohmann::json& args, std::size_t index, cons
     return clean_user_path(value.get<std::string>());
 }
 
+// ---------------------------------------------------------------------------
+// 对外的完整链接（本次改动（未提交））
+//
+// 分享链接与文件预览链接都要**无论 HTTP 服务有没有开**都给出完整地址：
+// 地址来自数据根下的 config/server.json（host / port），不看 enabled——
+// 用户要的是「这条链接该长什么样」，而不是「现在能不能连」。
+// 协议固定 **http://**：服务端只监听明文 HTTP（server.json 里没有 TLS 配置，
+// 也没有证书），要 https 得自己在前面挂反向代理；这里不编造 https 地址。
+// ---------------------------------------------------------------------------
+std::string base_url_of(const ServerConfig& server) {
+    // host / port 缺失或非法时退回默认值，绝不拼出 "http://:4122/…" 这种废地址。
+    std::string host = trim(server.host);
+    if (host.empty()) {
+        host = "localhost";
+    }
+    const bool port_ok = server.port > 0 && server.port <= 65535;
+    const int port = port_ok ? server.port : 4122;
+    return "http://" + host + ":" + std::to_string(port);
+}
+
+// 公开的分享下载链接（GET /api/share/<share_id>/download，不需要 token）。
+std::string share_url_of(const AppContext& context, const std::string& share_id) {
+    return base_url_of(context.server_config) + "/api/share/" + share_id + "/download";
+}
+
+// 文件预览链接（GET /api/file/<file_id>/preview，要 token）。
+// 路径用 **file_id**，不用文件名：它全局唯一、只含 [0-9a-z-]，不用做百分号编码。
+std::string preview_url_of(const AppContext& context, const std::string& file_id) {
+    return base_url_of(context.server_config) + "/api/file/" + file_id + "/preview";
+}
+
+// 文件下载链接（GET /api/file/<file_id>/download，要 token）。
+std::string download_url_of(const AppContext& context, const std::string& file_id) {
+    return base_url_of(context.server_config) + "/api/file/" + file_id + "/download";
+}
+
 Result<nlohmann::json> bucket_command(AppContext& context, const std::string& operation,
                                       const nlohmann::json& args) {
     BucketService buckets(*context.paths, context.config, context.logger.get());
@@ -261,6 +297,15 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
         data["needs_confirm"] = check.needs_confirm;
         data["blocked"] = check.blocked;
         data["entry"] = entry_json(check.entry);
+        // 桶级回退的两条路：目标不在 = 整目录搬回；目标已存在 = 合并进去（要确认）
+        data["merge"] = check.merge;
+        data["merge_target_exists"] = check.merge_target_exists;
+        data["merge_files"] = check.merge_files;
+        data["merge_bytes"] = check.merge_bytes;
+        data["target_files"] = check.target_files;
+        if (!check.conflicts.empty()) {
+            data["conflicts"] = check.conflicts;
+        }
         if (!check.message.empty()) {
             data["message"] = check.message;
         }
@@ -324,7 +369,29 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
             return check_json(std::get<TrashCheck>(checked));
         }
 
-        const Result<TrashEntry> restored = trash.restore(value);
+        // 目标桶已存在时回退是**合并**：这是「拿回收站的数据往现有桶里加东西」，
+        // 与永久删除同一口径——必须显式确认（CLI 在用户答 y 之后才置 force）。
+        // 普通回退（目标不在）预检的 needs_confirm 是 false，不受这道门槛影响。
+        bool confirmed = false;
+        {
+            const Result<TrashCheck> checked = trash.check_restore(value);
+            if (!ok(checked)) {
+                return *error_of(checked);
+            }
+            const TrashCheck& check = std::get<TrashCheck>(checked);
+            if (!check.conflicts.empty()) {
+                return make_error(ErrorCode::RestoreMergeConflict, check.message);
+            }
+            if (check.needs_confirm) {
+                confirmed = args.value("force", false);
+                if (!confirmed) {
+                    return make_error(ErrorCode::ConfirmRequired,
+                                      check.message + "；确认合并请加 force（CLI：--yes）");
+                }
+            }
+        }
+
+        const Result<TrashEntry> restored = trash.restore(value, confirmed);
         if (!ok(restored)) {
             return *error_of(restored);
         }
@@ -332,8 +399,15 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
 
         nlohmann::json data = nlohmann::json::object();
         data["entry"] = entry_json(entry);
-        data["message"] =
-            (entry.type == "file" ? "文件已回退：" : "Bucket 已回退：") + entry.name;
+        if (entry.type == "file") {
+            data["message"] = "文件已回退：" + entry.name;
+        } else if (!entry.message.empty()) {
+            // 目标 Bucket 已存在时这次回退是**合并**，结果由服务层写进 entry.message
+            //（「已合并 N 个文件」「N 个留在回收站里」）——照实转述，别盖成「Bucket 已回退」。
+            data["message"] = "Bucket「" + entry.name + "」：" + entry.message;
+        } else {
+            data["message"] = "Bucket 已回退：" + entry.name;
+        }
         return data;
     }
 
@@ -454,7 +528,6 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
             return *error_of(prepared);
         }
 
-        FileService files(*context.paths, context.config, context.logger.get());
         const Result<FileRecord> record = files.commit_upload(std::get<PreparedUpload>(prepared));
         if (!ok(record)) {
             return *error_of(record);  // commit_upload 自己负责删暂存文件
@@ -638,6 +711,10 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
                     context.paths->root(), std::get<std::filesystem::path>(trashed));
             }
         }
+        // 预览 / 下载链接（本次改动（未提交））：**无论 HTTP 服务有没有开**都给完整地址，
+        // 方便直接粘进浏览器；预览只对图片与文本类有意义（其余类型下载仍可用）。
+        data["preview_url"] = preview_url_of(context, found.file_id);
+        data["download_url"] = download_url_of(context, found.file_id);
         return data;
     }
 
@@ -779,8 +856,43 @@ Result<std::uintmax_t> parse_size_value(const std::string& text) {
     return bytes;
 }
 
-// config.*：V1 只让改 max_upload_size，其余只读。
-// 之所以只开这一项：它是唯一需要按机器/网络情况调整的值（其他项改了也没有对应行为）。
+// 解析布尔写法（本次改动（未提交））：true/false、1/0、yes/no、on/off，大小写不敏感。
+Result<bool> parse_bool_value(const std::string& text) {
+    const std::string value = to_lower(trim(text));
+    if (value == "true" || value == "1" || value == "yes" || value == "on") {
+        return Result<bool>(true);
+    }
+    if (value == "false" || value == "0" || value == "no" || value == "off") {
+        return Result<bool>(false);
+    }
+    return make_error(ErrorCode::InvalidArgument,
+                      "布尔值只能是 true / false（也接受 1 / 0、yes / no、on / off）：" + text);
+}
+
+// 解析端口：1..65535 的十进制整数。
+Result<int> parse_port_value(const std::string& text) {
+    const std::string value = trim(text);
+    if (value.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "端口不能为空（1-65535）");
+    }
+    int port = 0;
+    for (const char ch : value) {
+        if (ch < '0' || ch > '9') {
+            return make_error(ErrorCode::InvalidArgument, "端口只能是数字（1-65535）：" + text);
+        }
+        port = port * 10 + (ch - '0');
+        if (port > 65535) {
+            break;
+        }
+    }
+    if (port <= 0 || port > 65535) {
+        return make_error(ErrorCode::InvalidArgument, "端口超出范围（1-65535）：" + text);
+    }
+    return port;
+}
+
+// config.*：可改 max_upload_size（config.json）与 server_enabled / server_host /
+// server_port（config/server.json，本次改动（未提交））；其余只读。
 Result<nlohmann::json> config_command(AppContext& context, const std::string& operation,
                                       const nlohmann::json& args) {
     if (operation == "config.list") {
@@ -791,6 +903,16 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
         data["size_unit"] = context.config.size_unit;
         data["language"] = context.config.language;
         data["path"] = relative_path_text(context.paths->root(), context.paths->config_file());
+
+        // config/server.json 的公共字段（本次改动（未提交））：统一加 `server_` 前缀，
+        // 免得和 config.json 的字段撞名（两边都有 version）。
+        // 这些是「网络服务」的开关与地址，CLI 打成「网络服务 server_enabled：…」这样一行。
+        // **不含任何凭证**：token / 口令哈希都在 data/user.json，只在下面单独给出 token。
+        data["server_enabled"] = context.server_config.enabled;
+        data["server_host"] = context.server_config.host;
+        data["server_port"] = context.server_config.port;
+        data["server_path"] =
+            relative_path_text(context.paths->root(), context.paths->server_file());
 
         // HTTP 管理接口的访问 token（data/user.json 里那个）。放在这里是因为
         // 否则用户没有任何办法拿到它——CLI 是这个数据根唯一的管理入口。
@@ -817,12 +939,71 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
         }
 
         const std::string name = std::get<std::string>(key);
-        if (name != "max_upload_size") {
-            return make_error(ErrorCode::InvalidArgument,
-                              "V1 只能改 max_upload_size（其余只读）：" + name);
+        const std::string text = std::get<std::string>(value);
+        nlohmann::json data = nlohmann::json::object();
+
+        // config/server.json 的三项（本次改动（未提交））：网络服务开关、监听地址与端口。
+        // 它们的共同点是**改完必须重启服务才生效**（server.json 只在服务启动时读一次），
+        // 所以这里只负责把文件改对、并把「要重启」写进返回值；真正的 reinstall 由 CLI 做
+        // ——服务进程去提权装自己是在踩自己的脚（第 13.8 节）。
+        if (name == "server_enabled" || name == "server_host" || name == "server_port") {
+            const ServerConfig previous = context.server_config;
+            ServerConfig updated = previous;
+
+            if (name == "server_enabled") {
+                const Result<bool> parsed = parse_bool_value(text);
+                if (!ok(parsed)) {
+                    return *error_of(parsed);
+                }
+                updated.enabled = std::get<bool>(parsed);
+                data["server_enabled"] = updated.enabled;
+            } else if (name == "server_host") {
+                if (trim(text).empty()) {
+                    return make_error(ErrorCode::InvalidArgument,
+                                      "server_host 不能为空（例如 localhost / 127.0.0.1）");
+                }
+                updated.host = trim(text);
+                data["server_host"] = updated.host;
+            } else {
+                const Result<int> parsed = parse_port_value(text);
+                if (!ok(parsed)) {
+                    return *error_of(parsed);
+                }
+                updated.port = std::get<int>(parsed);
+                data["server_port"] = updated.port;
+            }
+
+            if (const Status saved = save_server_config(*context.paths, updated); !ok(saved)) {
+                return *error_of(saved);  // 留着内存里的旧值：下一轮读盘会覆盖回来
+            }
+            context.server_config = updated;
+            if (context.logger != nullptr) {
+                context.logger->info("Config", "server.json 已修改：" + name + " -> " +
+                                                   text + "（需要重启服务才生效）");
+            }
+
+            // 「谁来重启」不在服务侧决定：服务自己提权重装会把正在跑的业务打断。
+            // CLI 收到 restart_required 后会判断能不能直接 reinstall，否则提示用户执行。
+            data["restart_required"] = true;
+            data["server_path"] =
+                relative_path_text(context.paths->root(), context.paths->server_file());
+            if (name == "server_enabled") {
+                data["message"] = "网络服务已" + std::string(updated.enabled ? "开启" : "关闭") +
+                                  "（config/server.json 已写入）；需要重启服务才生效";
+            } else {
+                data["message"] = name + " 已改为 " + text + "（config/server.json 已写入）；"
+                                  "需要重启服务才生效";
+            }
+            return data;
         }
 
-        const Result<std::uintmax_t> parsed = parse_size_value(std::get<std::string>(value));
+        if (name != "max_upload_size") {
+            return make_error(ErrorCode::InvalidArgument,
+                              "只能改 max_upload_size / server_enabled / server_host / "
+                              "server_port（其余只读）：" + name);
+        }
+
+        const Result<std::uintmax_t> parsed = parse_size_value(text);
         if (!ok(parsed)) {
             return *error_of(parsed);
         }
@@ -839,7 +1020,6 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
                                                std::to_string(bytes));
         }
 
-        nlohmann::json data = nlohmann::json::object();
         data["max_upload_size"] = bytes;
         data["previous"] = previous;
         data["message"] = "max_upload_size 已改为 " + std::to_string(bytes) + " 字节（" +
@@ -851,8 +1031,9 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
 }
 
 // share.*：数据面（创建/查看/列出/撤销 + 下载记账）。
-// **HTTP 下载端点还没做**（用户决定先做数据面）：register_download 已经把
-// §50/§51 那套「全部检查通过才计数、且在业务锁内完成」实现好，端点将来只管调它。
+// 下载也走这条：HTTP 的 GET /api/share/<share_id>/download（**公开、不要 token**）
+// 先调 share.download 记账，全部检查通过才把字节流出去——§50/§51 的「先记账再放行」
+// 就落在 register_download 里（端点只负责记账完之后去读文件、回内容）。
 Result<nlohmann::json> share_command(AppContext& context, const std::string& operation,
                                      const nlohmann::json& args) {
     ShareService shares(*context.paths, context.config, context.logger.get());
@@ -873,25 +1054,37 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
         item["state"] = std::string(share_state_name(view.state));
         item["available"] = view.state == ShareState::Ok;
         item["message"] = view.message;
+        // 「为什么不能下载」的两条直接给成布尔（本次改动（未提交））：调用方不用自己去比
+        // 时间、也不用自己算剩余次数。state 里其实已经含了，但这两个是**独立维度**：
+        // 一条分享可以既过期、次数又用满（§49 只报先命中的那个状态）。
+        item["expired"] = (view.state == ShareState::Expired);
+        item["limit_reached"] = (view.state == ShareState::LimitReached);
+        item["downloads_left"] =
+            std::max(0, view.share.max_download_count - view.share.download_count);
         if (!view.file.file_id.empty()) {
             item["file_name"] = view.file.file_name;
             item["size"] = view.file.size;
             item["bucket"] = view.file.bucket;
+            item["file_in_trash"] = view.file.is_trash;
         }
         return item;
     };
 
     if (operation == "share.create") {
-        const Result<std::string> file_id = argument(args, 0, "file_id");
-        if (!ok(file_id)) {
-            return *error_of(file_id);
+        const Result<std::string> key = argument(args, 0, "file_id 或文件名");
+        if (!ok(key)) {
+            return *error_of(key);
         }
-        const Result<ShareRecord> created = shares.create(std::get<std::string>(file_id));
+        const Result<ShareRecord> created = shares.create(std::get<std::string>(key));
         if (!ok(created)) {
             return *error_of(created);
         }
         const ShareRecord& record = std::get<ShareRecord>(created);
         nlohmann::json data = share_json(record);
+        // 完整分享链接（本次改动（未提交））：**无论 HTTP 服务有没有开**都给出来，
+        // 地址取自 config/server.json 的 host / port（`share_id` 本身就是凭证）。
+        data["url"] = share_url_of(context, record.share_id);
+        data["share_url"] = data["url"];
         data["message"] = "分享已创建：" + record.share_id + "（" +
                           std::to_string(record.max_download_count) + " 次，到期 " +
                           record.expire_time + "）";
@@ -908,27 +1101,58 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
         if (!ok(view)) {
             return *error_of(view);
         }
-        return view_json(std::get<ShareView>(view));
+        nlohmann::json data = view_json(std::get<ShareView>(view));
+        data["url"] = share_url_of(context, std::get<ShareView>(view).share.share_id);
+        data["share_url"] = data["url"];
+        return data;
     }
 
     if (operation == "share.list") {
-        const Result<std::string> file_id = argument(args, 0, "file_id");
-        if (!ok(file_id)) {
-            return *error_of(file_id);
+        // **参数可选**（本次改动（未提交））：不给就列全部 share（`share list` 一行看遍
+        // 谁过期、谁次数用尽），给了就按那个文件（file_id 或文件名，与 create 同一套定位）。
+        std::string key;
+        const auto argv = args.find("argv");
+        if (argv != args.end() && argv->is_array() && !argv->empty()) {
+            const Result<std::string> wanted = argument(args, 0, "file_id 或文件名");
+            if (!ok(wanted)) {
+                return *error_of(wanted);
+            }
+            key = std::get<std::string>(wanted);
         }
-        const Result<std::vector<ShareView>> views = shares.list(std::get<std::string>(file_id));
+
+        std::string file_id;
+        if (!key.empty()) {
+            const Result<FileRecord> resolved = shares.resolve(key);
+            if (!ok(resolved)) {
+                return *error_of(resolved);
+            }
+            file_id = std::get<FileRecord>(resolved).file_id;
+        }
+
+        const Result<std::vector<ShareView>> views = shares.list(key);
         if (!ok(views)) {
             return *error_of(views);
         }
 
         nlohmann::json array = nlohmann::json::array();
         for (const ShareView& view : std::get<std::vector<ShareView>>(views)) {
-            array.push_back(view_json(view));
+            nlohmann::json item = view_json(view);
+            item["url"] = share_url_of(context, view.share.share_id);
+            item["share_url"] = item["url"];
+            array.push_back(std::move(item));
         }
         nlohmann::json data = nlohmann::json::object();
         data["shares"] = std::move(array);
         data["count"] = data["shares"].size();
-        data["file_id"] = std::get<std::string>(file_id);
+        // 过滤时回显那个文件的 file_id；不带参数列全部时给一个字段说明这是全量列表，
+        // 顺便带上当前 Bucket（列表里每条都带自己的 bucket，方便区分）。
+        data["scope"] = key.empty() ? "all" : "file";
+        // 当前 Bucket 两种模式都给：列全部时用户靠它分辨「这条是不是当前桶的文件」，
+        // 过滤单个文件时也能顺手看出它属于哪个桶。
+        data["current_bucket"] = context.config.current_bucket;
+        if (!key.empty()) {
+            data["file_id"] = file_id;
+        }
         return data;
     }
 
@@ -948,7 +1172,8 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
 
     if (operation == "share.download") {
         // 下载记账：检查与计数在业务锁内一次完成（§51）。
-        // 现在只有管道调用它；将来的 HTTP 下载端点也走这一条。
+        // 两个入口都走它：管道的 `share download`，以及 HTTP 的公开端点
+        // GET /api/share/<share_id>/download（先记账再放行——计数写不进去就不放行）。
         const Result<std::string> share_id = argument(args, 0, "share_id");
         if (!ok(share_id)) {
             return *error_of(share_id);

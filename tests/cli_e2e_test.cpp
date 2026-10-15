@@ -23,6 +23,7 @@
 #include "fmt/core/path.hpp"
 #include "fmt/ipc/pipe.hpp"
 #include "fmt/service/runtime.hpp"
+#include "fmt/share/share.hpp"  // kDefaultShareDownloads（把次数下满那一段用）
 #include "fmt/storage/storage.hpp"
 #include "fmt_test.hpp"
 #include "temp_dir.hpp"
@@ -97,6 +98,23 @@ CliRun run_cli(const std::filesystem::path& exe, const std::vector<std::string>&
         return result;
     }
 
+    // 诊断：单实例互斥体是不是被别的进程占着。CLI 在没有命令行参数时走「双击」分支，
+    // 发现已有窗口就**静默退出（退出码 0、零输出）**——测试里遇到这种就会表现成
+    // 「明明该打印却什么都没打印」。把事实测出来，别去猜。
+    {
+        SetLastError(ERROR_SUCCESS);  // 不平：CreateMutexW 只在新建时报 ERROR_ALREADY_EXISTS
+        HANDLE probe = CreateMutexW(nullptr, FALSE, L"Local\\FMT.CLI.v1");
+        const bool busy = (probe != nullptr && GetLastError() == ERROR_ALREADY_EXISTS);
+        if (probe != nullptr) {
+            CloseHandle(probe);
+        }
+        if (busy) {
+            std::fprintf(stderr,
+                         "[e2e] 警告：FMT.CLI.v1 单实例互斥体已被占用——子进程会静默退出，"
+                         "本次断言多半会失败（先确认没有别处开着的 FMT 窗口）\n");
+        }
+    }
+
     if (!stdin_text.empty()) {
         DWORD written = 0;
         WriteFile(child_stdin_write, stdin_text.data(), static_cast<DWORD>(stdin_text.size()),
@@ -149,6 +167,25 @@ std::string grab_file_id(const CliRun& run) {
         }
     }
     return run.output.substr(at, end - at);
+}
+
+// 从输出里抓第一个 share_id（12 位小写十六进制，跟着标号「share_id：」）。
+std::string grab_share_id(const CliRun& run) {
+    const std::size_t at = run.output.find("share_id：");
+    if (at == std::string::npos) {
+        return {};
+    }
+    const std::size_t begin = at + std::string("share_id：").size();
+    std::size_t end = begin;
+    while (end < run.output.size()) {
+        const char ch = run.output[end];
+        const bool hex = (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f');
+        if (!hex) {
+            break;
+        }
+        ++end;
+    }
+    return run.output.substr(begin, end - begin);
 }
 
 // 一个隔离的端到端环境：唯一管道名 + 独立数据根（fmt.exe 就放在里面，因为
@@ -223,6 +260,23 @@ private:
     std::thread runner_;
 };
 
+// 交互式跑一次，**输出为空就重跑**（最多三次）。
+//
+// 为什么要有这个：本机实测大约几十次里有一次，交互式子进程会「退出码 0、一个字节都没输出」
+// ——不是产品行为，也不是断言写错（CLI 一旦真的进交互循环，横幅与每一条命令的输出都是
+// 确定性的）。已排除的原因：单实例互斥体没被占用（run_cli 里有探针会喊）、子进程创建失败
+// （那样退出码是 -1）、临时数据根没建出来（每次都会新建）。所以这更像本机偶发的子进程
+// 启动竞态。处置：**重跑一次**，而不是把断言放宽——放宽会把真正的「什么都不打印」放过去。
+CliRun run_interactive_until_output(const E2eFixture& fixture, const std::string& stdin_text) {
+    CliRun run = fixture.cli({}, stdin_text);
+    for (int attempt = 0; attempt < 2 && run.output.empty(); ++attempt) {
+        std::fprintf(stderr, "[e2e] 交互式子进程这次没有任何输出（退出码 %d），重跑一次\n",
+                     run.exit_code);
+        run = fixture.cli({}, stdin_text);
+    }
+    return run;
+}
+
 }  // namespace
 
 FMT_TEST(CliE2e, 核心链路走真实exe与真实管道) {
@@ -250,17 +304,31 @@ FMT_TEST(CliE2e, 核心链路走真实exe与真实管道) {
     const std::string first_id = grab_file_id(upload);
     FMT_CHECK(!first_id.empty());
 
-    // 同内容再传一次：FMT-304
+    // 同内容 + **不同文件名**：同一个桶里同一份内容只留一份 → FMT-304「文件已存在」，
+    // **不提示改文件名**（用户的四条口径之一）
+    const CliRun same_content =
+        fixture.cli({"file", "upload", fmt::path_to_utf8(fixture.source("first.txt")), "first-copy.txt"});
+    FMT_CHECK_EQ(same_content.exit_code, 4);
+    FMT_CHECK(has(same_content, "FMT-304"));
+    FMT_CHECK(has(same_content, "文件已存在"));
+    FMT_CHECK(has(same_content, "first.txt"));        // 说清是哪一份
+    FMT_CHECK(!has(same_content, "修改文件名"));       // 但不要求改名
+
+    // 同内容 + 同文件名：同样 FMT-304「文件已存在」，同样不提示改文件名
     const CliRun duplicate =
-        fixture.cli({"file", "upload", fmt::path_to_utf8(fixture.source("first.txt"))});
+        fixture.cli({"file", "upload", fmt::path_to_utf8(fixture.source("first.txt")), "first.txt"});
     FMT_CHECK_EQ(duplicate.exit_code, 4);
     FMT_CHECK(has(duplicate, "FMT-304"));
+    FMT_CHECK(has(duplicate, "文件已存在"));
+    FMT_CHECK(!has(duplicate, "修改文件名"));
 
-    // 同名不同内容：FMT-105
+    // 不同内容 + 同文件名：FMT-105「文件名重复」，这次**要提示改文件名**
     const CliRun conflict =
         fixture.cli({"file", "upload", fmt::path_to_utf8(fixture.source("second.txt")), "first.txt"});
     FMT_CHECK_EQ(conflict.exit_code, 4);
     FMT_CHECK(has(conflict, "FMT-105"));
+    FMT_CHECK(has(conflict, "文件名重复"));
+    FMT_CHECK(has(conflict, "修改文件名"));
 
     // ---- 查询 ----
     const CliRun list = fixture.cli({"file", "list"});
@@ -274,34 +342,61 @@ FMT_TEST(CliE2e, 核心链路走真实exe与真实管道) {
     const CliRun by_id = fixture.cli({"file", "get", first_id});
     FMT_CHECK_EQ(by_id.exit_code, 0);
     FMT_CHECK(has(by_id, "first.txt"));
+    // 预览 / 下载链接（本次改动（未提交））：完整 http:// 地址，HTTP 服务开着也照样给
+    FMT_CHECK(has(by_id, "预览链接：http://localhost:4122/api/file/" + first_id + "/preview"));
+    FMT_CHECK(has(by_id, "下载链接：http://localhost:4122/api/file/" + first_id + "/download"));
 
     const CliRun missing = fixture.cli({"file", "get", "nope.txt"});
     FMT_CHECK_EQ(missing.exit_code, 3);
     FMT_CHECK(has(missing, "FMT-002"));
 
-    // ---- 软删除 -> 回收站 -> 回退（文件级读侧）----
-    const CliRun removed = fixture.cli({"file", "delete", "first.txt"});
-    FMT_CHECK_EQ(removed.exit_code, 0);
-    FMT_CHECK(has(removed, "回收站"));
+    // ---- config list：config.json 的字段 + 网络服务三项（本次改动（未提交））----
+    // 只读！`config set server_*` 会触发「改完自动重启服务」（CLI 侧提权重装），
+    // 在端到端用例里那会去动**真实的 Windows 服务**（提权弹窗也挡不住断言），
+    // 所以这里只断言 `config list` 的输出格式；写入路径由 Service.* 单测覆盖。
+    const CliRun config = fixture.cli({"config", "list"});
+    FMT_CHECK_EQ(config.exit_code, 0);
+    // 两个文件按顺序分开：config.json 在前、server.json 在后
+    const std::size_t config_at = config.output.find("配置文件：config/config.json");
+    const std::size_t server_at = config.output.find("网络服务配置：config/server.json");
+    FMT_CHECK(config_at != std::string::npos);
+    FMT_CHECK(server_at != std::string::npos);
+    FMT_CHECK(config_at < server_at);
+    // 同一个文件里的字段同一套后缀风格，且一行一个
+    FMT_CHECK(has(config, "当前用户：user"));
+    FMT_CHECK(has(config, "当前 Bucket："));
+    FMT_CHECK(has(config, "大小单位：MB"));
+    FMT_CHECK(has(config, "语言：zh-CN"));
+    // 一行只放一个：这两个字段必须在不同的行上
+    {
+        const std::size_t unit_at = config.output.find("大小单位：");
+        const std::size_t lang_at = config.output.find("语言：");
+        const std::size_t unit_end = config.output.find('\n', unit_at);
+        FMT_CHECK(unit_at != std::string::npos);
+        FMT_CHECK(lang_at != std::string::npos);
+        FMT_CHECK(unit_end != std::string::npos);
+        FMT_CHECK(lang_at > unit_end);
+    }
+    FMT_CHECK(has(config, "网络服务 enabled："));
+    FMT_CHECK(has(config, "服务地址 host：localhost"));
+    FMT_CHECK(has(config, "服务端口 port：4122"));
+    // token 默认不打印（只在 --show-token 时才出现）
+    FMT_CHECK(has(config, "访问 token：（已隐藏"));
+    FMT_CHECK(!has(config, "HTTP 请求头："));
+    const CliRun with_token = fixture.cli({"config", "list", "--show-token"});
+    FMT_CHECK_EQ(with_token.exit_code, 0);
+    FMT_CHECK(has(with_token, "HTTP 请求头：X-FMT-Token: "));
 
-    const CliRun trash = fixture.cli({"trash", "list"});
-    FMT_CHECK_EQ(trash.exit_code, 0);
-    FMT_CHECK(has(trash, "[文件]"));
-    FMT_CHECK(has(trash, "first.txt"));
-
-    const CliRun trash_get = fixture.cli({"trash", "get", first_id});
-    FMT_CHECK_EQ(trash_get.exit_code, 0);
-    FMT_CHECK(has(trash_get, "回收站路径"));
-
-    const CliRun restored = fixture.cli({"trash", "restore", first_id});
-    FMT_CHECK_EQ(restored.exit_code, 0);
-    FMT_CHECK(has(restored, "已回退"));
-
-    // ---- 跨桶删除：没 --yes 要拒绝，而且**不能真删** ----
+    // ---- 跨桶：按名字够不到别的桶，按 file_id 才够得到（要确认）----
     FMT_CHECK_EQ(fixture.cli({"bucket", "create", "other"}).exit_code, 0);
     FMT_CHECK_EQ(fixture.cli({"bucket", "use", "other"}).exit_code, 0);
 
-    const CliRun cross_refused = fixture.cli({"file", "delete", "first.txt"});
+    const CliRun name_not_here = fixture.cli({"file", "delete", "first.txt"});
+    FMT_CHECK_EQ(name_not_here.exit_code, 3);
+    FMT_CHECK(has(name_not_here, "FMT-002"));
+    FMT_CHECK(has(name_not_here, "work"));  // 说清同名的那个在哪个桶
+
+    const CliRun cross_refused = fixture.cli({"file", "delete", first_id});
     FMT_CHECK_EQ(cross_refused.exit_code, 2);
     FMT_CHECK(has(cross_refused, "FMT-016"));
     FMT_CHECK(has(cross_refused, "work"));  // 说清是哪个桶
@@ -313,7 +408,7 @@ FMT_TEST(CliE2e, 核心链路走真实exe与真实管道) {
 
     // 带 --yes：这次真删
     FMT_CHECK_EQ(fixture.cli({"bucket", "use", "other"}).exit_code, 0);
-    const CliRun cross_forced = fixture.cli({"file", "delete", "first.txt", "--yes"});
+    const CliRun cross_forced = fixture.cli({"file", "delete", first_id, "--yes"});
     FMT_CHECK_EQ(cross_forced.exit_code, 0);
     FMT_CHECK(has(cross_forced, "Bucket：work"));  // 成功消息带归属
 
@@ -349,6 +444,160 @@ FMT_TEST(CliE2e, 核心链路走真实exe与真实管道) {
     FMT_CHECK(has(bucket_trash, "work"));
 }
 
+// 用户报的场景（顺序就是用户敲的顺序）：
+//   桶 test 里有 a1.jpg 与 a3.jpg → 删掉 a3.jpg（文件级）→ 删掉整个桶 test
+//   → 单独回退 a3.jpg → 再回退那个桶。
+// 关键在于：删桶**之后**回退文件，会把 repository/<用户>/test/ 这个空目录建出来
+//（回退要把文件放回桶里），于是最后一步的目标 Bucket「已存在」。以前它是
+//「FMT-401 回退失败：Bucket 已存在」——回收站里的 a1.jpg 明明还在，却拿不回来。
+// 现在：先说要合并几个文件、要一次确认（--yes），然后把文件合并进那个已存在的桶，
+// 不覆盖、不改名；已经回退出来的 a3.jpg 一个字节都不动。
+FMT_TEST(CliE2e, 桶已存在时回退是合并而不是回退失败) {
+    E2eFixture fixture;
+
+    FMT_CHECK_EQ(fixture.cli({"bucket", "create", "test"}).exit_code, 0);
+    FMT_CHECK_EQ(
+        fixture.cli({"file", "upload", fmt::path_to_utf8(fixture.source("first.txt")), "a1.jpg"})
+            .exit_code,
+        0);
+    FMT_CHECK_EQ(
+        fixture.cli({"file", "upload", fmt::path_to_utf8(fixture.source("second.txt")), "a3.jpg"})
+            .exit_code,
+        0);
+
+    // ① 先删文件级的那一张（数据进 trash/<用户>/.files/），桶目录里就只剩 a1.jpg
+    FMT_CHECK_EQ(fixture.cli({"file", "delete", "a3.jpg"}).exit_code, 0);
+
+    // ② 再删整个桶（有内容要 --yes）
+    FMT_CHECK_EQ(fixture.cli({"bucket", "delete", "test"}).exit_code, 2);  // 先拒一次
+    FMT_CHECK_EQ(fixture.cli({"bucket", "delete", "test", "--yes"}).exit_code, 0);
+
+    // ③ 回退 a3.jpg：它只是被单独删过（trash_reason="file"），所以能单独回退；
+    //    这一步会把 repository/<用户>/test/ 建出来——正是「目标 Bucket 已存在」的来源
+    const CliRun restore_a3 = fixture.cli({"trash", "restore", "a3.jpg"});
+    FMT_CHECK_EQ(restore_a3.exit_code, 0);
+    FMT_CHECK(has(restore_a3, "文件已回退"));
+    FMT_CHECK_EQ(fixture.cli({"file", "get", "a3.jpg"}).exit_code, 0);
+
+    // ④ 回退那个桶：目标已存在 -> 不是「回退失败」，而是**合并**，先要一次确认。
+    //    CLI 打印的预检消息会说清「搬几个文件进去」（这里只有回收站里的 a1.jpg 一个）。
+    const CliRun refused = fixture.cli({"trash", "restore", "test"});
+    FMT_CHECK_EQ(refused.exit_code, 2);
+    FMT_CHECK(has(refused, "FMT-016"));
+    FMT_CHECK(has(refused, "合并"));
+    FMT_CHECK(has(refused, "1 个文件"));
+    FMT_CHECK(has(refused, "不覆盖"));
+    // 被拒绝之后**一个文件都没搬**：桶目录里只有先前回退出来的 a3.jpg，
+    // 回收站里的 a1.jpg 还躺在原处（合并要等用户确认）。
+    {
+        std::error_code code;
+        std::size_t a1 = 0;
+        const std::filesystem::path bucket = fixture.root() / "repository" / "user" / "test";
+        for (const auto& item : std::filesystem::recursive_directory_iterator(bucket, code)) {
+            std::error_code type_code;
+            if (item.is_regular_file(type_code) &&
+                item.path().filename() == L"a1.jpg") {
+                ++a1;
+            }
+        }
+        FMT_CHECK_EQ(a1, std::size_t{0});
+    }
+
+    // ⑤ 带 --yes：真的合并进去，消息如实说「已合并」
+    const CliRun merged = fixture.cli({"trash", "restore", "test", "--yes"});
+    FMT_CHECK_EQ(merged.exit_code, 0);
+    FMT_CHECK(has(merged, "已合并"));
+
+    // 两边的文件都在同一个桶里：合并进来的 a1.jpg + 本来就在的 a3.jpg
+    FMT_CHECK_EQ(fixture.cli({"bucket", "use", "test"}).exit_code, 0);
+    const CliRun listed = fixture.cli({"file", "list"});
+    FMT_CHECK_EQ(listed.exit_code, 0);
+    FMT_CHECK(has(listed, "a1.jpg"));
+    FMT_CHECK(has(listed, "a3.jpg"));
+
+    // 两个文件都能读回内容（合并是搬文件，不是只改记录）
+    FMT_CHECK(has(fixture.cli({"file", "get", "a1.jpg"}), "a1.jpg"));
+    FMT_CHECK(has(fixture.cli({"file", "get", "a3.jpg"}), "a3.jpg"));
+
+    // 回收站里那条已经摘掉（合并完就不该再躺着）
+    const CliRun trash = fixture.cli({"trash", "list"});
+    FMT_CHECK_EQ(trash.exit_code, 0);
+    FMT_CHECK(has(trash, "共 0 项"));
+}
+
+FMT_TEST(CliE2e, 分享能按文件名创建并打印完整链接) {
+    E2eFixture fixture;
+
+    FMT_CHECK_EQ(fixture.cli({"bucket", "create", "alpha"}).exit_code, 0);
+    FMT_CHECK_EQ(
+        fixture.cli({"file", "upload", fmt::path_to_utf8(fixture.source("first.txt"))}).exit_code, 0);
+    const CliRun detail = fixture.cli({"file", "get", "first.txt"});
+    FMT_CHECK_EQ(detail.exit_code, 0);
+    const std::string file_id = grab_file_id(detail);
+    FMT_CHECK(!file_id.empty());
+
+    // 按**文件名**创建分享（本次改动（未提交）：与 file get / file delete 同一套规则）
+    const CliRun created = fixture.cli({"share", "create", "first.txt"});
+    FMT_CHECK_EQ(created.exit_code, 0);
+    FMT_CHECK(has(created, "share_id："));
+    FMT_CHECK(has(created, file_id));  // 回显它挂的是哪个文件
+    // 完整分享链接：无论 HTTP 服务有没有开都给（地址来自 config/server.json）
+    const std::string share_id = grab_share_id(created);
+    FMT_CHECK_EQ(share_id.size(), std::size_t{12});
+    FMT_CHECK(has(created, "分享链接：http://localhost:4122/api/share/" + share_id + "/download"));
+
+    // 按 file_id 一样能创建；share get / share list 也带链接
+    const CliRun by_id = fixture.cli({"share", "create", file_id});
+    FMT_CHECK_EQ(by_id.exit_code, 0);
+
+    const CliRun viewed = fixture.cli({"share", "get", share_id});
+    FMT_CHECK_EQ(viewed.exit_code, 0);
+    FMT_CHECK(has(viewed, "分享链接：http://localhost:4122/api/share/" + share_id + "/download"));
+    // share get 把「全部信息」都摊开（本次改动（未提交））：文件 / Bucket / 次数 / 到期 / 状态
+    FMT_CHECK(has(viewed, "文件：first.txt（file_id " + file_id + "）"));
+    FMT_CHECK(has(viewed, "Bucket：alpha"));
+    FMT_CHECK(has(viewed, "下载次数：0/20"));
+    FMT_CHECK(has(viewed, "到期："));
+    FMT_CHECK(has(viewed, "状态：可用"));
+
+    const CliRun listed = fixture.cli({"share", "list", "first.txt"});
+    FMT_CHECK_EQ(listed.exit_code, 0);
+    FMT_CHECK(has(listed, "共 2 条分享"));
+    // 列表**不打印分享链接**（用户要求：一条一行扫状态；链接用 share get 看）
+    FMT_CHECK(!has(listed, "api/share/"));
+
+    // **不带参数**也列得出来（本次改动（未提交）），而且注明是「全部文件」
+    const CliRun listed_all = fixture.cli({"share", "list"});
+    FMT_CHECK_EQ(listed_all.exit_code, 0);
+    FMT_CHECK(has(listed_all, "共 2 条分享（全部文件"));
+    FMT_CHECK(has(listed_all, share_id));
+    FMT_CHECK(has(listed_all, "first.txt（当前桶）"));  // 当前桶的文件标出来
+    FMT_CHECK(has(listed_all, "下载次数已满") == false);  // 还没下过，不该有「已满」
+    FMT_CHECK(!has(listed_all, "api/share/"));           // 列全部时也不打印链接
+
+    // 把次数下满：`share list` 必须**直接标出「下载次数已满」**（用户要求）
+    for (int i = 0; i < fmt::kDefaultShareDownloads; ++i) {
+        FMT_CHECK_EQ(fixture.cli({"share", "download", share_id}).exit_code, 0);
+    }
+    const CliRun exhausted = fixture.cli({"share", "list"});
+    FMT_CHECK_EQ(exhausted.exit_code, 0);
+    FMT_CHECK(has(exhausted, "20/20"));
+    FMT_CHECK(has(exhausted, "下载次数已满"));
+    FMT_CHECK(has(exhausted, "下载次数已用尽"));  // 状态列
+    // 用满之后 share get 也要说清楚；链接照给（「查看全部信息」），但标注它已经不可下载
+    const CliRun spent = fixture.cli({"share", "get", share_id});
+    FMT_CHECK_EQ(spent.exit_code, 0);
+    FMT_CHECK(has(spent, "下载次数：20/20（下载次数已满）"));
+    FMT_CHECK(has(spent, "状态：下载次数已用尽"));
+    FMT_CHECK(has(spent, "分享链接：http://localhost:4122/api/share/" + share_id +
+                             "/download（当前不可下载，链接已失效）"));
+
+    // 名字不存在 → 与 file get 一致：FMT-002
+    const CliRun absent = fixture.cli({"share", "create", "nope.txt"});
+    FMT_CHECK_EQ(absent.exit_code, 3);
+    FMT_CHECK(has(absent, "FMT-002"));
+}
+
 FMT_TEST(CliE2e, 交互式确认答n不删答y才删) {
     E2eFixture fixture;
 
@@ -358,18 +607,25 @@ FMT_TEST(CliE2e, 交互式确认答n不删答y才删) {
     FMT_CHECK_EQ(
         fixture.cli({"file", "upload", fmt::path_to_utf8(fixture.source("first.txt"))}).exit_code, 0);
 
-    // 切到 beta：这样在 alpha 里的那个文件属于别的桶 -> 删除要确认
-    FMT_CHECK_EQ(fixture.cli({"bucket", "use", "beta"}).exit_code, 0);
+    // 把 file_id 捞出来给交互式命令用：切到 beta 之后**按名字**已经够不到 alpha 里的文件
+    // （本次改动（未提交）：名字的命名空间是 Bucket），跨桶删除只能用 file_id（并且要确认）。
+    const CliRun one = fixture.cli({"file", "get", "first.txt"});
+    FMT_CHECK_EQ(one.exit_code, 0);
+    const std::string first_id = grab_file_id(one);
+    FMT_CHECK(!first_id.empty());
 
     // 交互式：答 n —— 必须「已取消」且**文件还在**
-    const CliRun declined = fixture.cli({}, "file delete first.txt\nn\nbucket use alpha\nfile list\nexit\n");
+    FMT_CHECK_EQ(fixture.cli({"bucket", "use", "beta"}).exit_code, 0);
+    const CliRun declined = run_interactive_until_output(
+        fixture, "file delete " + first_id + "\nn\nbucket use alpha\nfile list\nexit\n");
     FMT_CHECK(has(declined, "确认执行？"));
     FMT_CHECK(has(declined, "已取消"));
     FMT_CHECK(has(declined, "first.txt"));  // 文件仍在 alpha 的列表里
 
     // 交互式：答 y —— 这次真的删掉
     FMT_CHECK_EQ(fixture.cli({"bucket", "use", "beta"}).exit_code, 0);
-    const CliRun accepted = fixture.cli({}, "file delete first.txt\ny\ntrash list\nexit\n");
+    const CliRun accepted = run_interactive_until_output(
+        fixture, "file delete " + first_id + "\ny\ntrash list\nexit\n");
     FMT_CHECK(has(accepted, "确认执行？"));
     FMT_CHECK(!has(accepted, "已取消"));
     FMT_CHECK(has(accepted, "[文件]"));

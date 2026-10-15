@@ -83,6 +83,73 @@ Result<std::unique_ptr<Logger>> open_cli_logger(const std::string& data_root) {
     return Logger::open(paths.log(), options);
 }
 
+// 日志清理的默认预算：与 cleanup_logs 的默认值同源，`log clean --keep` 可以覆盖。
+constexpr std::uintmax_t kLogBudget = kDefaultLogBudgetBytes;
+
+// log/ 里现有多少个文件、共占多少（只统计普通文件，别的目录/文件不动）。
+struct LogDirectoryInfo {
+    bool exists = false;
+    std::size_t files = 0;
+    std::uintmax_t bytes = 0;
+};
+
+LogDirectoryInfo inspect_log_directory(const std::filesystem::path& log_directory) {
+    LogDirectoryInfo info;
+    std::error_code code;
+    if (!std::filesystem::is_directory(log_directory, code)) {
+        return info;
+    }
+    info.exists = true;
+    for (const auto& entry : std::filesystem::directory_iterator(log_directory, code)) {
+        if (code) {
+            break;
+        }
+        std::error_code type_code;
+        if (!entry.is_regular_file(type_code)) {
+            continue;
+        }
+        ++info.files;
+        info.bytes += entry.file_size(type_code);
+        type_code.clear();
+    }
+    return info;
+}
+
+// `--keep` 的大小写法：10485760 / 8MB / 512KB / 1GB（1KB = 1024 字节）。
+// 与 config 的 max_upload_size 用同一套写法与同一套单位，免得用户记两套。
+bool parse_log_budget(const std::string& text, std::uintmax_t* bytes) {
+    if (text.empty() || bytes == nullptr) {
+        return false;
+    }
+
+    std::size_t digits = 0;
+    while (digits < text.size() && text[digits] >= '0' && text[digits] <= '9') {
+        ++digits;
+    }
+    if (digits == 0) {
+        return false;
+    }
+
+    const std::string value_text = text.substr(0, digits);
+    const std::string unit = to_lower(text.substr(digits));
+    std::uintmax_t multiplier = 1;
+    if (unit.empty() || unit == "b") {
+        multiplier = 1;
+    } else if (unit == "kb") {
+        multiplier = 1024;
+    } else if (unit == "mb") {
+        multiplier = 1024 * 1024;
+    } else if (unit == "gb") {
+        multiplier = 1024ull * 1024 * 1024;
+    } else {
+        return false;
+    }
+
+    const unsigned long long value = std::strtoull(value_text.c_str(), nullptr, 10);
+    *bytes = static_cast<std::uintmax_t>(value) * multiplier;
+    return true;
+}
+
 namespace {
 
 constexpr wchar_t kSingletonMutex[] = L"Local\\FMT.CLI.v1";
@@ -90,6 +157,10 @@ constexpr wchar_t kConsoleTitle[] = L"FMT";
 
 // 服务刚被 service start 拉起来时监听还没就绪，连接要给它一点时间。
 constexpr int kConnectWaitMs = 5000;
+
+// 改完 config/server.json 之后把服务重启起来（定义在 run_business_command 之后，
+// 因为要调 run_service_command）：业务命令成功后按响应里的 restart_required 触发。
+void restart_service_after_config(const Options& options);
 
 // 状态落定的兜底上限：正常由 SCM 的 dwWaitHint 决定，这只是最后一道闸。
 constexpr int kSettleCapMs = 30000;
@@ -117,16 +188,18 @@ std::string banner_text() {
 void print_version() { std::printf("%s\n", version_text().c_str()); }
 
 // 命令总览：只列命令、不加描述；细节用 help <命令>。
+// 顺序按「数据操作 → 配置 → 帮助/版本 → 退出」分组，而不是按命令名排序。
 void print_command_list() {
     std::printf("可用命令：\n");
     std::printf("  (service)  install  uninstall  start  stop  reinstall  status\n");
     std::printf("  (bucket)   create  list  get  use  delete\n");
     std::printf("  (file)     upload  list  get  delete\n");
     std::printf("  (trash)    list  get  restore  delete  empty\n");
+    std::printf("  (share)    create  get  list  delete\n");
     std::printf("  (config)   list  set\n");
+    std::printf("  (log)      clean                   清理日志（启动时也会自动兜底）\n");
     std::printf("  (help)     help [命令]\n");
     std::printf("  (version)  version                打印版本与构建日期\n");
-    std::printf("  (share)    create  get  list  delete\n");
     std::printf("  (exit)     exit  quit\n");
 }
 
@@ -140,12 +213,12 @@ bool print_command_help(const std::string& topic) {
             "             不删除 repository / trash / config / data / log / temp\n"
             "  start      启动服务；需要管理员权限\n"
             "  stop       停止服务；需要管理员权限\n"
-            "  reinstall  一次 UAC 里做完「卸载 → 按**当前这个 exe** 重新安装并启动」；\n"
+            "  reinstall  一次 UAC 里做完「卸载 → 按当前这个 exe 重新安装并启动」；\n"
             "             需要管理员权限。两个用途：\n"
-            "               ① 用新 exe 更新服务——直接运行**新 exe** 的这条命令即可，\n"
+            "               ① 用新 exe 更新服务——直接运行新 exe 的这条命令即可，\n"
             "                  它会先停掉旧宿主（解开文件占用）、再指向自己并启动；\n"
             "               ② 修复宿主 exe 被移动或删除。\n"
-            "             **业务数据一个都不动**（repository / trash / config / data / log）。\n"
+            "             业务数据一个都不动（repository / trash / config / data / log）。\n"
             "             注意：宿主会变成「你运行的那一份 exe」；数据根仍由连上来的\n"
             "             CLI 声明（见窗口横幅上的「数据根：…」）。\n"
             "  status     查询服务状态；不需要管理员权限\n"
@@ -180,7 +253,7 @@ bool print_command_help(const std::string& topic) {
             "  use <名称>      切换当前 Bucket（只改 current_bucket，不动数据）\n"
             "  delete <名称>   移到回收站，名字变成 <名称>_<时间戳>；\n"
             "                  删的是当前 Bucket 时置空，不自动切换\n"
-            "                  **桶里有文件时会先提醒**：删除后只能整体恢复这个桶，\n"
+            "                  桶里有文件时会先提醒：删除后只能整体恢复这个桶，\n"
             "                  没法只恢复其中某个文件；一次性命令要加 --yes\n"
             "\n"
             "名称统一使用小写：create WORK 会建成 work（会提示你）；\n"
@@ -192,9 +265,13 @@ bool print_command_help(const std::string& topic) {
         std::printf(
             "file —— 文件（当前用户在当前 Bucket 里的文件）\n"
             "  upload <来源> [文件名]   来源可以是 http:// 或 https:// 的 URL，也可以是本机路径。\n"
-            "                           文件名省略时取来源的最后一段；重名不会自动改名，\n"
-            "                           会提示换一个名字；相同内容（MD5 相同）会被拒绝，\n"
-            "                           不重复入库。大小上限取 config.json 的 max_upload_size。\n"
+            "                           文件名省略时取来源的最后一段。**判重只看当前 Bucket**，\n"
+            "                           而且先看内容：桶内已有相同内容（不管名字同不同）→\n"
+            "                           报「文件已存在」（FMT-304），**不要求改文件名**；\n"
+            "                           内容不同而文件名相同 → 报「文件名重复」（FMT-105），\n"
+            "                           提示修改文件名；两者都不同就正常入库。\n"
+            "                           别的 Bucket 里的同名/同内容与本桶无关。\n"
+            "                           大小上限取 config.json 的 max_upload_size。\n"
             "                           文件名不能与文件标识同形（fmt-YYYYMMDD-N）：\n"
             "                           那会和 file_id 混淆，属保留形状（FMT-106）。\n"
             "  list [--sort name|size|id] [--search 关键字] [--page N --page-size M]\n"
@@ -203,10 +280,12 @@ bool print_command_help(const std::string& topic) {
             "                           --search 按文件名/file_id 做不区分大小写的子串匹配；\n"
             "                           --page-size 给了才分页（0 = 一次给全），\n"
             "                           顺序固定为「过滤 -> 排序 -> 分页」，翻页不会漏或重。\n"
-            "  get <file_id|文件名>     按文件名只查正常文件；按 file_id 连回收站里的\n"
+            "  get <file_id|文件名>     按文件名查**当前 Bucket** 的正常文件（同名的在别的桶时\n"
+            "                           会告诉你在哪个桶）；按 file_id 全局查，连回收站里的\n"
             "                           也查得到（带 is_trash 与 trash_path）\n"
             "  delete <file_id|文件名>  软删除进回收站，file_id 不变；之后用\n"
-            "                           trash list / trash restore 找回来\n"
+            "                           trash list / trash restore 找回来。按名字只在当前\n"
+            "                           Bucket 内生效；要删别的桶里的那份请用 file_id（会先确认）\n"
             "\n"
             "文件落在 repository/<用户>/<Bucket>/YYYY/MM/DD/ 下；上传先写 temp/，\n"
             "校验（大小上限、MD5、文件名）通过后才移动入库。\n"
@@ -216,29 +295,65 @@ bool print_command_help(const std::string& topic) {
     }
     if (topic == "share") {
         std::printf(
-            "share —— 分享（把**正常**文件开放成一条可撤销的链接）\n"
-            "  create <file_id>    创建分享：默认 20 次、7 天过期；返回 share_id\n"
-            "  get <share_id>      查看：如实报告状态（可用 / 已过期 / 次数用尽 /\n"
-            "                      已撤销 / 关联文件在回收站），不伪装成不存在\n"
-            "  list <file_id>      列出某个文件的所有分享（最近创建的在前）\n"
+            "share —— 分享（把正常文件开放成一条可撤销的链接）\n"
+            "  create <file_id|文件名>  创建分享：默认 20 次、7 天过期；返回 share_id\n"
+            "                          与完整分享链接（http://host:port/api/share/<id>/download，\n"
+            "                          地址取自 config/server.json，不看 HTTP 服务有没有开）\n"
+            "  get <share_id>      查看它的**全部信息**：文件与 Bucket、分享链接、下载次数\n"
+            "                      （用满时写「（下载次数已满）」）、到期时间（过期时写\n"
+            "                      「（已过期）」）、状态与一句话说明；链接不可用时也会给出，\n"
+            "                      但标注「当前不可下载，链接已失效」。\n"
+            "                      过期 / 次数用尽 / 已撤销 / 关联文件在回收站都如实报告，\n"
+            "                      不伪装成不存在（只有 share_id 完全查不到才是 FMT-500）\n"
+            "  list [<file_id|文件名>]  列出分享（最近创建的在前）：**不带参数就列全部**，\n"
+            "                      **一条一行**：文件名（当前桶）、下载次数、状态、到期；\n"
+            "                      次数用满/已过期时直接写「[下载次数已满]」「[下载已过期]」\n"
+            "                      （两个原因可能同时成立）。**这里不打印分享链接**——\n"
+            "                      链接用 `share get <share_id>` 看，列表保持一屏能扫完\n"
             "  delete <share_id>   撤销分享（删记录）\n"
             "\n"
-            "约束（开发文档 §50）：**分享不得绕过文件状态**——文件进回收站或被删掉，\n"
+            "约束（开发文档 §50）：分享不得绕过文件状态——文件进回收站或被删掉，\n"
             "分享立刻失效（FMT-503）。share_id 是 12 位随机十六进制，本身就是访问凭证。\n"
-            "**HTTP 下载端点还没做**：现在只有管道命令；链接要能被外部打开，\n"
-            "还需要那套简单接口（等你定开放哪几个）。\n");
+            "公开下载端点已实现（提交 d3aeb3d）：GET /api/share/<share_id>/download\n"
+            "不要 token（链接本身就是凭证）、先记账再放行，可直接把链接交给别人。\n");
         return true;
     }
     if (topic == "config") {
         std::printf(
-            "config —— 配置（config/config.json）\n"
-            "  list                       看当前生效的配置\n"
-            "  set max_upload_size <大小>  改上传大小上限；大小可写 10485760，\n"
-            "                             也可写 10MB / 512KB / 1GB（1KB = 1024 字节）\n"
+            "config —— 配置（config/config.json 与 config/server.json）\n"
+            "  list [--show-token]           看当前生效的配置，两个文件按顺序分开输出：\n"
+            "                                config.json 的字段在前，接着是网络服务的\n"
+            "                                「网络服务 enabled / 服务地址 host / 服务端口 port」；\n"
+            "                                **默认不打印访问 token**（省得暴露在屏幕、日志、\n"
+            "                                工单与截图里）；要它加 --show-token，\n"
+            "                                或直接读数据根下的 data/user.json\n"
+            "  set max_upload_size <大小>     改上传大小上限；大小可写 10485760，\n"
+            "                                也可写 10MB / 512KB / 1GB（1KB = 1024 字节）\n"
+            "  set server_enabled <true|false>  开/关 HTTP 网络服务（config/server.json）\n"
+            "  set server_host <地址>         监听地址（默认 localhost，只监听本机）\n"
+            "  set server_port <1-65535>      监听端口（默认 4122）\n"
             "\n"
-            "V1 只让改 max_upload_size：它是唯一需要按机器/网络情况调整的值，\n"
-            "其余项（current_user / size_unit / language）只读。\n"
+            "server_* 三项改完会自动重启服务（已经提权就直接重装，否则弹一次 UAC；\n"
+            "提权被取消时会提示你手动执行 service reinstall）——因为 server.json\n"
+            "只在服务启动时读一次。\n"
+            "其余项（current_user / size_unit / language / version）只读。\n"
             "current_bucket 用 bucket use 切换，不走 config。\n");
+        return true;
+    }
+    if (topic == "log") {
+        std::printf(
+            "log —— 日志文件（<数据根>/log/ 下的 fmt.log 与 error.log，各留一代 .1）\n"
+            "  clean [--keep 8MB] [--dry-run]\n"
+            "      清理日志：先把轮转备份（fmt.log.1 / error.log.1）删掉；\n"
+            "      仍超过保留上限就把活动文件裁成最新的一段，并在文件顶部留一行\n"
+            "      「日志已裁剪：保留最近 N 字节」的说明，断点看得见。\n"
+            "      没超过上限时一个字节都不动。\n"
+            "      --keep 8MB   改保留上限（默认 8MB；也可写 8388608 / 512KB / 1GB）\n"
+            "      --dry-run    只报告会删什么、会裁什么、能释放多少，磁盘一个字节都不动\n"
+            "\n"
+            "这条命令本地执行、不需要服务（日志是每个数据根各自的本地文件）。\n"
+            "每次启动 CLI / 服务时也会用同一套规则自动兜底清理一次，并把结果写进日志；\n"
+            "所以正常情况下你不用手动敲它——需要用它的场合是「想看一眼现在多大」。\n");
         return true;
     }
     if (topic == "trash") {
@@ -249,13 +364,18 @@ bool print_command_help(const std::string& topic) {
             "  restore <标识>   [文件] 按 file_id 回退到原 Bucket 的原位置；\n"
             "                   [桶]   回退整个 Bucket（名称可以是回收站里的名字，\n"
             "                          也可以是原桶名——同名只有一个时）。\n"
-            "                   目标位置已有同名正常文件/Bucket 就拒绝，不覆盖、不改名；\n"
-            "                   随桶一起删除的文件**只能整体恢复那个桶**，单独恢复会被拒绝。\n"
-            "  delete <标识>    **永久删除，不可恢复**：删掉数据与记录。\n"
+            "                   目标位置已有同名正常文件就拒绝，不覆盖、不改名；\n"
+            "                   随桶一起删除的文件只能整体恢复那个桶，单独恢复会被拒绝。\n"
+            "                   目标 Bucket 已存在时（例如删桶之后先单独回退过桶里的某个文件，\n"
+            "                   回退文件会把那个桶目录建出来）不是回退失败：桶里的文件会合并\n"
+            "                   进现有桶——不覆盖、不改名，先说明搬几个文件再要一次确认\n"
+            "                   （一次性命令加 --yes）。现有桶里有同名文件就一个都不搬，\n"
+            "                   会列出冲突的名字（改完名再合并）。\n"
+            "  delete <标识>     永久删除，不可恢复：删掉数据与记录。\n"
             "                   交互窗口里会先说明要删什么、再问一次；\n"
             "                   一次性命令必须加 --yes，例如\n"
             "                   fmt.exe trash delete lazy-fox_20261008012233 --yes\n"
-            "  empty            **清空整个回收站，不可恢复**：两级条目一次全删。\n"
+            "  empty             清空整个回收站，不可恢复：两级条目一次全删。\n"
             "                   同样先说明「几项、多少」再问一次；一次性命令加 --yes。\n"
             "\n"
             "标识可以是 file_id（文件）、回收站里的目录名（桶）或原名；\n"
@@ -576,7 +696,7 @@ void print_trash_entry(const nlohmann::json& entry);
 
 // 业务命令的结果按形状打印：Bucket 列表、单条信息、或服务给的 message。
 // 服务端返回结构化数据，怎么展示放在 CLI 这一侧。
-void print_business_data(const nlohmann::json& data) {
+void print_business_data(const nlohmann::json& data, bool show_token = false) {
     if (!data.is_object()) {
         if (!data.is_null()) {
             std::printf("%s\n", data.dump(2).c_str());
@@ -636,8 +756,17 @@ void print_business_data(const nlohmann::json& data) {
         return;
     }
 
-    // config.list：字段集固定（current_user + max_upload_size + path）。
-    // 打成标签行，比在窗口里吐一段 JSON 好读；config.set 没有 current_user，会走 message。
+    // config.list：config.json 与 config/server.json 的公共字段（本次改动（未提交）
+    // 把 server.json 也一并输出）。打成标签行，比在窗口里吐一段 JSON 好读；
+    // config.set 没有 current_user，会走 message。
+    //
+    // 版式约定（都按「同一个后缀」统一风格，用户的四条意见）：
+    //   ① 两个文件各自成段：**文件路径在前**，后面跟这个文件的字段；
+    //   ② 同一个文件的字段同一套后缀风格：`当前用户 / 当前 Bucket / 上传上限 / 大小单位 /
+    //      语言`；网络服务那段是 `enabled / host / port`；
+    //   ③ 一行只放一个键值对：大小单位与语言分成两行；
+    //   ④ **token 默认不打印**（会暴露在屏幕、日志、工单与截图里）。要看加 `--show-token`，
+    //      或者直接读数据根下的 data/user.json。
     if (data.contains("max_upload_size") && data.contains("current_user")) {
         const auto max_bytes = data.value("max_upload_size", std::uintmax_t{0});
         std::printf("配置文件：%s\n", data.value("path", std::string{}).c_str());
@@ -645,15 +774,45 @@ void print_business_data(const nlohmann::json& data) {
         std::printf("当前 Bucket：%s\n", data.value("current_bucket", std::string{}).c_str());
         std::printf("上传上限：%s（%zu 字节）\n", format_size(max_bytes).c_str(),
                     static_cast<std::size_t>(max_bytes));
-        std::printf("大小单位：%s    语言：%s\n", data.value("size_unit", std::string{}).c_str(),
-                    data.value("language", std::string{}).c_str());
-        // HTTP 管理接口的凭证：这是机主唯一能拿到 token 的地方
-        //（data/user.json 里也是它，但那个文件不该逼人去翻）。
-        if (data.contains("token")) {
+        std::printf("大小单位：%s\n", data.value("size_unit", std::string{}).c_str());
+        std::printf("语言：%s\n", data.value("language", std::string{}).c_str());
+
+        // 网络服务（config/server.json）：文件路径 + 开关 / 监听地址 / 端口。
+        // 格式按用户要求：`网络服务 enabled：true`、`服务地址 host：localhost`、
+        // `服务端口 port：4122`。
+        const auto server_path = data.find("server_path");
+        if (server_path != data.end() && server_path->is_string()) {
+            std::printf("网络服务配置：%s\n", server_path->get<std::string>().c_str());
+        }
+        for (const auto& field : {std::pair<const char*, const char*>{"server_enabled", "网络服务 enabled"},
+                                  {"server_host", "服务地址 host"},
+                                  {"server_port", "服务端口 port"}}) {
+            const auto found = data.find(field.first);
+            if (found == data.end()) {
+                continue;
+            }
+            std::string shown;
+            if (found->is_boolean()) {
+                shown = found->get<bool>() ? "true" : "false";
+            } else if (found->is_number_integer()) {
+                shown = std::to_string(found->get<int>());
+            } else if (found->is_string()) {
+                shown = found->get<std::string>();
+            }
+            std::printf("%s：%s\n", field.second, shown.c_str());
+        }
+
+        // 用户 ID：不带凭证，照常给。
+        if (data.contains("user_id")) {
             std::printf("用户 ID：%s\n", data.value("user_id", std::string{}).c_str());
+        }
+        // token：默认不说；--show-token 时才打印。
+        if (show_token) {
             std::printf("访问 token：%s\n", data.value("token", std::string{}).c_str());
-            std::printf("           HTTP 请求头：X-FMT-Token: %s\n",
+            std::printf("HTTP 请求头：X-FMT-Token: %s\n",
                         data.value("token", std::string{}).c_str());
+        } else if (data.contains("token")) {
+            std::printf("访问 token：（已隐藏；加 --show-token 显示，或读数据根下的 data/user.json）\n");
         }
         return;
     }
@@ -663,18 +822,41 @@ void print_business_data(const nlohmann::json& data) {
     // 否则会被当成文件详情打出来，把分享本身的信息（次数、到期、状态）全丢掉。
     if (data.contains("share_id")) {
         const auto expire = data.find("expire_time");
+        const bool expired =
+            data.value("expired", false) || data.value("state", std::string{}) == "已过期";
+        const bool limit_reached = data.value("limit_reached", false) ||
+                                   data.value("state", std::string{}) == "下载次数已用尽";
         std::printf("share_id：%s\n", data.value("share_id", std::string{}).c_str());
         if (data.contains("file_name")) {
             std::printf("文件：%s（file_id %s）\n", data.value("file_name", std::string{}).c_str(),
                         data.value("file_id", std::string{}).c_str());
+            if (data.contains("bucket")) {
+                std::printf("Bucket：%s\n", data.value("bucket", std::string{}).c_str());
+            }
         } else {
             std::printf("file_id：%s\n", data.value("file_id", std::string{}).c_str());
         }
-        std::printf("下载次数：%d/%d\n", data.value("download_count", 0),
-                    data.value("max_download_count", 0));
-        std::printf("到期：%s\n", (expire != data.end() && expire->is_string())
-                                      ? expire->get<std::string>().c_str()
-                                      : "不过期");
+        // 分享链接：完整地址，直接就能粘进浏览器（不看 HTTP 服务有没有开）。
+        // `share get` 要「看全部信息」，所以链接**照给**——但当前不可下载（过期 / 次数用尽 /
+        // 已撤销 / 文件进回收站）时补一句，免得用户拿去试了才发现打不开。
+        if (data.contains("share_url")) {
+            const bool usable = data.value("available", false);
+            std::printf("分享链接：%s%s\n", data.value("share_url", std::string{}).c_str(),
+                        usable ? "" : "（当前不可下载，链接已失效）");
+        }
+        // 下载次数：用满时把话说明白（用户要的就是这一句「下载次数已满」）
+        std::printf("下载次数：%d/%d%s\n", data.value("download_count", 0),
+                    data.value("max_download_count", 0), limit_reached ? "（下载次数已满）" : "");
+        // 到期：过期时同样说明白；注意「已过期」与「次数已满」是两个独立维度，
+        // 可能同时成立，所以两行各报各的。
+        const std::string expire_text = (expire != data.end() && expire->is_string())
+                                            ? expire->get<std::string>()
+                                            : std::string{};
+        if (expire_text.empty()) {
+            std::printf("到期：不过期%s\n", expired ? "（已过期）" : "");
+        } else {
+            std::printf("到期：%s%s\n", expire_text.c_str(), expired ? "（已过期）" : "");
+        }
         if (data.contains("state")) {
             std::printf("状态：%s\n", data.value("state", std::string{}).c_str());
         }
@@ -684,19 +866,45 @@ void print_business_data(const nlohmann::json& data) {
         return;
     }
 
-    // 分享列表：shares: [{share_id, download_count, state, …}, …]
+    // 分享列表：shares: [{share_id, file_name, download_count, state, share_url, …}, …]
+    // 每行一条，**把「下载次数已满」「已过期」直接标在行的末尾**（用户要求）：
+    //   0d7b3cf4bc2e  report.txt  20/20  下载次数已满  到期 2026-10-20T14:03:11
     if (const auto items = data.find("shares"); items != data.end() && items->is_array()) {
+        const std::string current_bucket = data.value("current_bucket", std::string{});
         for (const nlohmann::json& item : *items) {
             const auto expire = item.find("expire_time");
-            std::printf("  %s  %d/%d  %s  到期 %s\n", item.value("share_id", std::string{}).c_str(),
-                        item.value("download_count", 0), item.value("max_download_count", 0),
-                        item.value("state", std::string{}).c_str(),
-                        (expire != item.end() && expire->is_string())
-                            ? expire->get<std::string>().c_str()
-                            : "不过期");
+            const std::string state = item.value("state", std::string{});
+            const std::string name = item.value("file_name", std::string{});
+            const bool in_current = !current_bucket.empty() &&
+                                    item.value("bucket", std::string{}) == current_bucket;
+            std::printf("  %s  %s%s  %d/%d  %s", item.value("share_id", std::string{}).c_str(),
+                        name.empty() ? item.value("file_id", std::string{}).c_str() : name.c_str(),
+                        in_current ? "（当前桶）" : "", item.value("download_count", 0),
+                        item.value("max_download_count", 0), state.c_str());
+            // 两个「不能下载」的原因**独立标注**：可以既过期、次数又用满。
+            std::string marks;
+            if (item.value("expired", false) || state == "已过期") {
+                marks += "下载已过期";
+            }
+            if (item.value("limit_reached", false) || state == "下载次数已用尽") {
+                marks += marks.empty() ? "下载次数已满" : "、下载次数已满";
+            }
+            if (!marks.empty()) {
+                std::printf("  [%s]", marks.c_str());
+            }
+            std::printf("  到期 %s\n", (expire != item.end() && expire->is_string())
+                                           ? expire->get<std::string>().c_str()
+                                           : "不过期");
+            // **打印链接**这件事在这里是有意不做的（用户要求：列表只要一行状态）。
+            // 链接仍然在 data 里（`share_url`），要看单条用 `share get <share_id>`
+            // ——列表一屏能看很多条，每条再挂一行链接会把状态淹掉。
         }
-        std::printf("共 %zu 条分享（file_id %s）\n", items->size(),
-                    data.value("file_id", std::string{}).c_str());
+        if (data.value("scope", std::string{}) == "all") {
+            std::printf("共 %zu 条分享（全部文件，最近创建的在前）\n", items->size());
+        } else {
+            std::printf("共 %zu 条分享（file_id %s）\n", items->size(),
+                        data.value("file_id", std::string{}).c_str());
+        }
         return;
     }
 
@@ -743,6 +951,15 @@ void print_business_data(const nlohmann::json& data) {
                         data.value("trash_reason", std::string{}).c_str());
         } else {
             std::printf("状态：正常\n");
+        }
+        // 预览 / 下载链接（本次改动（未提交））：完整地址，直接粘进浏览器即可，
+        // **不看 HTTP 服务有没有开**（地址来自 config/server.json）。
+        // 预览只对图片与文本类有效（其余类型浏览器会拿到 FMT-701），下载任何类型都行。
+        if (data.contains("preview_url")) {
+            std::printf("预览链接：%s\n", data.value("preview_url", std::string{}).c_str());
+        }
+        if (data.contains("download_url")) {
+            std::printf("下载链接：%s\n", data.value("download_url", std::string{}).c_str());
         }
         return;
     }
@@ -816,6 +1033,15 @@ void print_precheck(const nlohmann::json& data) {
     // 回收站条目的预检（回退 / 永久删除）
     if (data.contains("entry") && data["entry"].is_object()) {
         print_trash_entry(data["entry"]);
+    }
+
+    // 合并回退的同名冲突：把撞上的名字摊开，用户才知道该给谁改名
+    if (const auto conflicts = data.find("conflicts");
+        conflicts != data.end() && conflicts->is_array()) {
+        std::printf("同名冲突：\n");
+        for (const nlohmann::json& item : *conflicts) {
+            std::printf("  %s\n", item.get<std::string>().c_str());
+        }
     }
 
     // bucket.delete 的预检：桶里有多少东西
@@ -912,9 +1138,14 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     std::string search_key;
     int page = 0;
     int page_size = 0;
+    bool show_token = false;  // config list --show-token（本地开关，不发给服务）
     for (std::size_t i = 2; i < parts.size(); ++i) {
         if (parts[i] == "--yes" || parts[i] == "-y") {
             confirmed = true;
+            continue;
+        }
+        if (parts[i] == "--show-token") {
+            show_token = true;
             continue;
         }
         if (parts[i] == "--sort" && i + 1 < parts.size()) {
@@ -945,8 +1176,12 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     // 破坏性操作：先检查、说清楚、再确认。
     // bucket.delete 也在内——桶里有东西时要提醒「之后只能整体恢复这个桶」；
     // trash.empty 是整站永久删除，同样要确认。
+    // trash.restore 也在内：目标 Bucket 已存在时它是**合并**（拿回收站的数据往现有桶里加），
+    // 要说清「搬几个文件进去」再让用户确认；没有冲突时预检回 needs_confirm=false，
+    // 照旧静默执行——这条门槛因此不妨碍普通回退。
     const bool destructive = (operation == "file.delete" || operation == "trash.delete" ||
-                              operation == "bucket.delete" || operation == "trash.empty");
+                              operation == "bucket.delete" || operation == "trash.empty" ||
+                              operation == "trash.restore");
     if (destructive) {
         const ConfirmOutcome outcome =
             confirm_before_acting(operation, arguments, confirmed, session, options, interactive);
@@ -1003,7 +1238,14 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
     const ipc::Response& value = std::get<ipc::Response>(response);
     if (value.ok) {
         log_info("Cli", "命令 " + operation + " 执行成功（错误码 0）");
-        print_business_data(value.data);
+        print_business_data(value.data, show_token);
+        // 改了 config/server.json 的操作（本次改动（未提交）：config set server_*）要重启服务
+        // 才生效。**由 CLI 来做这件事**：服务进程去提权装自己是在踩自己的脚。
+        // 已经提权就当场做（一次 UAC 都不弹）；没提权就弹一次 UAC 拉起提权副本，
+        // 用户拒了就如实提示手动执行。
+        if (value.data.is_object() && value.data.value("restart_required", false)) {
+            restart_service_after_config(options);
+        }
         std::printf("执行成功...\n");
         std::printf("错误码：0\n");
         return 0;
@@ -1013,6 +1255,142 @@ int run_business_command(const std::vector<std::string>& parts, Session& session
                          value.error.message);
     print_failure(value.error);
     return exit_code(value.error.code);
+}
+
+// ---- 改完 config/server.json 之后把服务重启起来（本次改动（未提交）） ----
+//
+// 为什么要有它：`server.json` **只在服务启动时读一次**（ServerRuntime::start →
+// restart_http），所以 `config set server_enabled / server_host / server_port` 光写文件
+// 是不生效的——用户改完发现端口还是没开，就会以为功能坏了（真机上就发生过一次）。
+//
+// 为什么由 CLI 做、而不是服务自己：让正在跑的服务进程去提权卸载并重装自己，等于在
+// 自己脚下抽地板（13.8 节）。CLI 是短命进程，本来就是 service 命令的执行者。
+//
+// 三条分支：
+//   ① 服务没安装 → 不用重启，说明「下次 service install / 双击引导时按新配置起」；
+//   ② 已经提权（比如管理员窗口里跑的 CLI）→ 直接 reinstall，一次 UAC 都不弹；
+//   ③ 普通权限 → 走 elevate_service_command("reinstall")，弹一次 UAC；
+//      用户拒了（FMT-004）就**如实提示手动执行**，绝不假装已经生效。
+void restart_service_after_config(const Options& options) {
+    const service::State state = service::query_state();
+    if (state == service::State::NotInstalled) {
+        std::printf("提示：服务尚未安装，本次改动会在下次安装/启动服务时生效\n");
+        log_info("Cli", "config 改了 server.json，但服务未安装，无需重启");
+        return;
+    }
+
+    std::printf("正在重启服务让新配置生效（%s）…\n",
+                is_elevated() ? "已提权，直接重装" : "需要一次 UAC 提权");
+
+    if (is_elevated()) {
+        // 已经在管理员权限里：不需要再拉起提权副本，直接按当前 exe 重装 + 重启。
+        const int code = run_service_command("reinstall", options);
+        if (code == 0) {
+            std::printf("服务已重启，新配置已生效\n");
+            log_info("Cli", "config 改动后已直接 reinstall");
+        } else {
+            std::fprintf(stderr,
+                         "服务重启失败（退出码 %d）：请手动执行 `fmt.exe service reinstall`\n",
+                         code);
+        }
+        return;
+    }
+
+    const Result<ElevatedOutcome> elevated =
+        elevate_service_command("reinstall", options.self_path);
+    if (ok(elevated) && std::get<ElevatedOutcome>(elevated).exit_code == 0) {
+        std::printf("服务已重启，新配置已生效\n");
+        log_info("Cli", "config 改动后已提权 reinstall");
+        return;
+    }
+
+    // 提权被拒 / 副本失败：把该敲的命令原样告诉用户，别让他猜。
+    std::fprintf(stderr,
+                 "未能自动重启服务（提权被取消或失败）：请手动执行 `fmt.exe service reinstall`，\n"
+                 "       否则刚才的配置要等服务下次启动才生效\n");
+    log_error("Cli", "config 改动后自动 reinstall 未成功");
+}
+
+// ---- log clean：日志文件的清理（本地命令，不过服务） ----
+//
+// 为什么不走服务：日志是**每个数据根各自一份**的本地文件，而且服务可能根本不在跑
+// （`--help` / `version` 以外的所有命令都要连服务，日志清理不该有这个前提）。
+// 口径与启动时的自动清理完全一致——同一个 cleanup_logs()，所以「手动收一次」与
+// 「启动时兜底」不可能给出两套说法。
+int run_log_command(const std::vector<std::string>& parts, const Options& options) {
+    const std::string usage = "用法：log clean [--keep 8MB] [--dry-run]";
+    if (parts.size() < 2) {
+        std::fprintf(stderr, "%s\n", usage.c_str());
+        return exit_code(ErrorCode::InvalidArgument);
+    }
+    if (parts[1] != "clean") {
+        std::fprintf(stderr, "未知的日志操作：%s\n%s\n", parts[1].c_str(), usage.c_str());
+        return exit_code(ErrorCode::InvalidArgument);
+    }
+
+    std::uintmax_t budget = kLogBudget;
+    bool dry_run = false;
+    for (std::size_t i = 2; i < parts.size(); ++i) {
+        if (parts[i] == "--dry-run") {
+            dry_run = true;
+            continue;
+        }
+        if (parts[i] == "--keep") {
+            if (i + 1 >= parts.size()) {
+                std::fprintf(stderr, "--keep 后面要跟大小，例如 --keep 8MB\n");
+                return exit_code(ErrorCode::InvalidArgument);
+            }
+            if (!parse_log_budget(parts[++i], &budget)) {
+                std::fprintf(stderr, "无法识别的大小：%s（可写 8388608 / 8MB / 512KB / 1GB）\n",
+                             parts[i].c_str());
+                return exit_code(ErrorCode::InvalidArgument);
+            }
+            continue;
+        }
+        std::fprintf(stderr, "未知参数：%s\n%s\n", parts[i].c_str(), usage.c_str());
+        return exit_code(ErrorCode::InvalidArgument);
+    }
+
+    const PathManager paths{path_from_utf8(options.data_root)};
+    const LogDirectoryInfo before = inspect_log_directory(paths.log());
+    if (!before.exists) {
+        std::printf("日志目录还不存在，无需清理：%s\n", path_to_utf8(paths.log()).c_str());
+        std::printf("执行成功...\n错误码：0\n");
+        return 0;
+    }
+
+    const Result<LogCleanup> cleaned = cleanup_logs(paths.log(), budget, dry_run);
+    if (!ok(cleaned)) {
+        const Error& error = *error_of(cleaned);
+        log_error("Log", "日志清理失败：" + error.message);
+        print_failure(error);
+        return exit_code(error.code);
+    }
+    const LogCleanup& report = std::get<LogCleanup>(cleaned);
+
+    std::printf("日志目录：%s\n", path_to_utf8(paths.log()).c_str());
+    std::printf("当前占用：%s（%zu 个文件）\n", format_size(before.bytes).c_str(), before.files);
+    std::printf("保留上限：%s\n", format_size(budget).c_str());
+    if (!report.over_budget) {
+        std::printf("未超过上限，未做任何清理。\n");
+    } else {
+        std::printf("%s\n", report.message.c_str());
+        for (const std::string& note : report.notes) {
+            std::printf("  %s\n", note.c_str());
+        }
+        if (dry_run) {
+            std::printf("（这是预演：磁盘一个字节都没动；去掉 --dry-run 才会真的清理）\n");
+        }
+    }
+    std::printf("执行成功...\n错误码：0\n");
+
+    // 走到这里才写日志：清理本身的结果进**清理之后**的文件，用户翻日志看得到。
+    // （--dry-run 与「本来就没事」都不记：那种行只会把日志越写越大。）
+    if (report.over_budget) {
+        log_info("Log", std::string(dry_run ? "log clean --dry-run：" : "log clean：") +
+                            report.message);
+    }
+    return 0;
 }
 
 // ---- 交互循环 ----
@@ -1075,6 +1453,10 @@ int run_interactive(const Options& options, service::State state, Session& sessi
         }
         if (head == "version" || head == "--version" || head == "-v") {
             std::printf("%s\n", version_text().c_str());
+            continue;
+        }
+        if (head == "log") {
+            run_log_command(parts, options);  // 本地清理：不需要服务
             continue;
         }
         if (head == "service") {
@@ -1271,6 +1653,9 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
             }
             return run_service_command(args[1], options);
         }
+        if (args[0] == "log") {
+            return run_log_command(args, options);  // 本地清理：不需要服务
+        }
         if (args.size() >= 2) {
             Session session;
             return run_business_command(args, session, options, false);
@@ -1284,9 +1669,17 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
     SetConsoleTitleW(kConsoleTitle);
     HANDLE singleton = CreateMutexW(nullptr, TRUE, kSingletonMutex);
     if (singleton != nullptr && GetLastError() == ERROR_ALREADY_EXISTS) {
-        // 已经有一个 FMT 窗口：把它拉到前面，本次静默退出（控制台不加噪音，
-        // 但日志里要看得出来「这次点击为什么什么都没发生」）。
+        // 已经有一个 FMT 窗口：把它拉到前面，本次静默退出（有真控制台时才加一句说明）。
+        //
+        // 为什么在**有控制台窗口**时说一句：以前这里完全不打印，于是「双击后窗口一闪就没了」
+        // 只能靠翻日志才能解释（而日志本身又可能因为数据根不可写而不存在）。
+        // 只在 GetConsoleWindow() 非空时打印——脚本/自动化（管道 stdin，没有控制台）不受影响。
         const bool activated = activate_existing_window();
+        if (GetConsoleWindow() != nullptr) {
+            std::fprintf(stderr, activated
+                                     ? "FMT 已经开着一个窗口，已把它切到前面（本次不再新开窗口）\n"
+                                     : "FMT 已经开着一个窗口，本次不再新开窗口（未能把它切到前面）\n");
+        }
         log_info("Cli", activated ? "已有 FMT 窗口，已激活它并退出（单实例）"
                                   : "已有 FMT 窗口，未能把它置前，直接退出（单实例）");
         CloseHandle(singleton);
@@ -1327,12 +1720,37 @@ int run(const std::vector<std::string>& args, const Options& options) {
         prepare_data_root(options, &root_notes);
     }
 
+    // 日志清理：**在开日志器之前**（日志器一开就握着文件句柄，之后再删备份/替换
+    // 活动文件会被共享冲突挡住）。一条命令的执行也先兜底清一次，代价是几次
+    // file_size——不超预算时一个字节都不动。见 §65 与 help log。
+    //
+    // **显式 `log clean` 时跳过这一步**：否则自动清理会把目录先收干净，紧接着
+    // 用户那条命令（尤其是 `--dry-run`）就只剩「未超过上限」可报——预演看不到
+    // 真相。那一次由命令自己按用户给的预算清理，口径只有一份。
+    const bool explicit_log_command = !args.empty() && args[0] == "log";
+    const PathManager log_paths{path_from_utf8(options.data_root)};
+    Result<LogCleanup> cleaned = make_error(ErrorCode::InvalidArgument, "未清理");
+    bool log_cleaned = false;
+    if (!explicit_log_command) {
+        cleaned = cleanup_logs(log_paths.log(), kLogBudget);
+        log_cleaned = ok(cleaned) && std::get<LogCleanup>(cleaned).over_budget;
+    }
+
     // 从这里开始都是真的干活，才值得写日志：--help / --version 不该在磁盘上
     // 留下任何东西。日志与 Service 共用同一个 <数据根>/log/fmt.log。
     std::unique_ptr<Logger> file_logger;
     if (Result<std::unique_ptr<Logger>> opened = open_cli_logger(options.data_root); ok(opened)) {
         file_logger = std::move(std::get<std::unique_ptr<Logger>>(opened));
         set_logger(file_logger.get());
+    }
+
+    if (log_cleaned) {
+        // 清理的结果写进**清理之后**的文件（顺序：先清、再开日志器、再报告）。
+        const LogCleanup& report = std::get<LogCleanup>(cleaned);
+        log_info("Log", report.message);
+        for (const std::string& note : report.notes) {
+            log_info("Log", note);
+        }
     }
 
     for (const std::string& note : root_notes) {

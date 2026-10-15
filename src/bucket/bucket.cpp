@@ -1,6 +1,7 @@
 #include "fmt/bucket/bucket.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <system_error>
 #include <utility>
 
@@ -62,6 +63,105 @@ bool looks_like_trashed_bucket(const std::string& name) {
     const std::string suffix = name.substr(last + 1);
     return stamp.size() == 14 && is_digits(stamp) && suffix.size() <= 3 && is_digits(suffix);
 }
+
+// 桶目录下的一个文件：桶内相对路径（正斜杠）+ 大小。
+struct BucketFile {
+    std::string relative;
+    std::uintmax_t bytes = 0;
+};
+
+// 遍历桶目录收集普通文件。目录不存在时返回空（调用方按情况报错）。
+std::vector<BucketFile> scan_bucket_files(const std::filesystem::path& root) {
+    std::vector<BucketFile> files;
+    std::error_code code;
+    if (!std::filesystem::is_directory(root, code)) {
+        return files;
+    }
+    for (const auto& item : std::filesystem::recursive_directory_iterator(root, code)) {
+        if (code) {
+            break;
+        }
+        std::error_code type_code;
+        if (!item.is_regular_file(type_code)) {
+            continue;
+        }
+        BucketFile file;
+        file.relative = path_to_utf8(std::filesystem::relative(item.path(), root, type_code));
+        if (type_code) {
+            file.relative = path_to_utf8(item.path().filename());
+        }
+        file.bytes = item.file_size(type_code);
+        files.push_back(std::move(file));
+    }
+    std::sort(files.begin(), files.end(),
+              [](const BucketFile& left, const BucketFile& right) {
+                  return left.relative < right.relative;
+              });
+    return files;
+}
+
+// 两个文件是不是「同一个名字」：比桶内相对路径或只看文件名，**一律不区分大小写**
+// （Windows 的路径本来就大小写不敏感，`A.JPG` 与 `a.jpg` 落同一个位置）。
+bool same_file_name(const std::string& left, const std::string& right) {
+    if (iequals(left, right)) {
+        return true;
+    }
+    return iequals(std::filesystem::path(left).filename().string(),
+                   std::filesystem::path(right).filename().string());
+}
+
+// 目标桶里已经有东西？返回磁盘上的实际桶名（不区分大小写地扫），没有则 has=false。
+struct ExistingBucket {
+    bool has = false;
+    std::string name;
+};
+
+ExistingBucket find_existing_bucket(const std::filesystem::path& user_root,
+                                    const std::string& wanted) {
+    ExistingBucket found;
+    std::error_code code;
+    if (!std::filesystem::is_directory(user_root, code)) {
+        return found;
+    }
+    for (const auto& entry : std::filesystem::directory_iterator(user_root, code)) {
+        if (code) {
+            break;
+        }
+        std::error_code type_code;
+        if (!entry.is_directory(type_code)) {
+            continue;
+        }
+        const std::string candidate = path_to_utf8(entry.path().filename());
+        if (iequals(candidate, wanted)) {
+            found.has = true;
+            found.name = candidate;
+            return found;
+        }
+    }
+    return found;
+}
+
+// 目录里一个文件都不剩了吗？（合并之后回收站目录里的空日期树要收掉，
+// 否则它会以「孤儿桶条目」的形状继续出现在 trash list 里。）
+bool no_files_left(const std::filesystem::path& root) {
+    std::error_code code;
+    if (!std::filesystem::is_directory(root, code)) {
+        return true;  // 目录已经不在了
+    }
+    for (const auto& item : std::filesystem::recursive_directory_iterator(root, code)) {
+        if (code) {
+            break;
+        }
+        std::error_code type_code;
+        if (item.is_regular_file(type_code)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 合并冲突的提示上限：真出一堆重名时别把控制台刷屏。
+constexpr std::size_t kMergeConflictListLimit = 20;
 
 }  // namespace
 
@@ -572,13 +672,7 @@ Result<TrashBucket> BucketService::restore(std::string_view identifier) {
     }
 
     // 索引先减掉这一条：写不进去就把目录退回去，别出现「目录已回退、索引还在」。
-    std::vector<TrashBucket> remaining;
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        if (i != found.index) {
-            remaining.push_back(entries[i]);
-        }
-    }
-    if (const Status status = save_original_index(remaining); !ok(status)) {
+    if (const Status status = drop_original_entry(entries, found.index); !ok(status)) {
         std::error_code ignored;
         std::filesystem::rename(target, source, ignored);
         return *error_of(status);
@@ -598,6 +692,290 @@ Result<TrashBucket> BucketService::restore(std::string_view identifier) {
     TrashBucket restored = entry;
     restored.directory_present = true;
     return restored;
+}
+
+Status BucketService::drop_original_entry(const std::vector<TrashBucket>& entries,
+                                          std::size_t index) const {
+    std::vector<TrashBucket> remaining;
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        if (i != index) {
+            remaining.push_back(entries[i]);
+        }
+    }
+    return save_original_index(remaining);
+}
+
+// ---------------------------------------------------------------------------
+// 回退的另一条路：目标桶已存在 -> 合并（用户确认之后）
+// ---------------------------------------------------------------------------
+
+Result<BucketMergeCheck> BucketService::check_merge(std::string_view identifier) const {
+    if (config_.current_user.empty()) {
+        return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
+    }
+    if (identifier.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少回收站条目的名称");
+    }
+
+    Result<std::vector<TrashBucket>> loaded = load_original_index();
+    if (!ok(loaded)) {
+        return *error_of(loaded);
+    }
+    const std::vector<TrashBucket> entries = std::get<std::vector<TrashBucket>>(loaded);
+
+    Result<TrashLookup> lookup = find_trashed(entries, identifier);
+    if (!ok(lookup)) {
+        return *error_of(lookup);
+    }
+    const TrashLookup found = std::get<TrashLookup>(lookup);
+    if (!found.found) {
+        return make_error(ErrorCode::TrashEntryNotFound,
+                          "回收站里没有这个 Bucket：" + std::string(identifier));
+    }
+
+    const TrashBucket& entry = entries[found.index];
+    if (entry.original_name.empty()) {
+        return make_error(ErrorCode::InvalidArgument,
+                          "回收站条目缺少原桶名记录（" + std::string(kOriginalIndexName) +
+                              "），无法回退：" + entry.trashed_name);
+    }
+
+    const std::filesystem::path source = trash_user_root() / path_from_utf8(entry.trashed_name);
+    if (!directory_exists(source)) {
+        return make_error(ErrorCode::TrashEntryNotFound,
+                          "回收站目录已不存在：" + entry.trashed_name);
+    }
+
+    BucketMergeCheck check;
+    check.trashed_name = entry.trashed_name;
+    check.original_name = entry.original_name;
+
+    const ExistingBucket target = find_existing_bucket(user_root(), entry.original_name);
+    check.target_exists = target.has;
+    if (!target.has) {
+        return check;  // 目标不在：这不是合并，走原始 restore（整目录搬回）
+    }
+    check.target_name = target.name;
+
+    // 目标桶的实际拼写必须与原桶名一致：file.json 里记录的 bucket 是删除时的拼写，
+    // 而所有路径都由记录推出来——改名会让那些记录指向不存在的目录。
+    if (check.target_name != check.original_name) {
+        check.message = "回退失败：已存在的 Bucket 名字拼写是「" + check.target_name +
+                        "」，与被删除的「" + check.original_name +
+                        "」不一致。文件名与记录的路径都按原拼写推导，改名会找不到文件；"
+                        "请先把现有 Bucket 改回原名（或合并后手工核对记录）";
+        return check;
+    }
+
+    const std::vector<BucketFile> source_files = scan_bucket_files(source);
+    const std::vector<BucketFile> target_files = scan_bucket_files(user_root() / path_from_utf8(check.target_name));
+    check.target_files = target_files.size();
+
+    for (const BucketFile& file : source_files) {
+        bool conflict = false;
+        for (const BucketFile& existing : target_files) {
+            if (same_file_name(file.relative, existing.relative)) {
+                conflict = true;
+                break;
+            }
+        }
+        // 目标位置被 file.json 里没有的东西占着（残留）：同样不能覆盖。
+        if (!conflict &&
+            path_exists(user_root() / path_from_utf8(check.target_name) /
+                        path_from_utf8(file.relative))) {
+            conflict = true;
+        }
+
+        if (conflict) {
+            if (check.conflicts.size() < kMergeConflictListLimit) {
+                check.conflicts.push_back(file.relative);
+            }
+            continue;
+        }
+        ++check.move_files;
+        check.move_bytes += file.bytes;
+    }
+
+    if (!check.conflicts.empty()) {
+        // 合并不做覆盖：一个都不搬，把冲突摊开让用户处理（确认也解决不了）。
+        std::string names;
+        for (const std::string& name : check.conflicts) {
+            names += (names.empty() ? "" : "、") + name;
+        }
+        if (source_files.size() > check.conflicts.size() ||
+            check.conflicts.size() >= kMergeConflictListLimit) {
+            names += " 等";
+        }
+        check.message = "回退失败：Bucket「" + check.original_name + "」已存在，合并进去会撞上 " +
+                        std::to_string(check.conflicts.size()) +
+                        " 个同名文件，本操作不覆盖、不自动改名，因此一个文件都没动：" + names +
+                        "。请先给现有 Bucket 里的同名文件改名或删除，再执行合并；"
+                        "或者用 trash delete 永久删除回收站里这一份";
+        return check;
+    }
+
+    if (check.move_files == 0) {
+        // 回收站目录里已经空文件夹结构：目录留下，只把索引与记录收尾。
+        check.message = "回退：Bucket「" + check.original_name +
+                        "」已存在，回收站条目里已经没有文件需要搬过去，只需摘掉回收站记录";
+        return check;
+    }
+
+    check.message = "回退：Bucket「" + check.original_name + "」已存在，将把回收站里的 " +
+                    std::to_string(check.move_files) + " 个文件（" + format_size(check.move_bytes) +
+                    "）合并进去，现有 " + std::to_string(check.target_files) +
+                    " 个文件保持不动、不覆盖、不改名";
+    return check;
+}
+
+Result<BucketMerge> BucketService::merge(std::string_view identifier) {
+    if (const Status status = require_current_user(); !ok(status)) {
+        return *error_of(status);
+    }
+    if (identifier.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "缺少回收站条目的名称");
+    }
+
+    Result<std::vector<TrashBucket>> loaded = load_original_index();
+    if (!ok(loaded)) {
+        return *error_of(loaded);
+    }
+    const std::vector<TrashBucket> entries = std::get<std::vector<TrashBucket>>(loaded);
+
+    Result<TrashLookup> lookup = find_trashed(entries, identifier);
+    if (!ok(lookup)) {
+        return *error_of(lookup);
+    }
+    const TrashLookup found = std::get<TrashLookup>(lookup);
+    if (!found.found) {
+        return make_error(ErrorCode::TrashEntryNotFound,
+                          "回收站里没有这个 Bucket：" + std::string(identifier));
+    }
+
+    const TrashBucket& entry = entries[found.index];
+    if (entry.original_name.empty()) {
+        return make_error(ErrorCode::InvalidArgument,
+                          "回收站条目缺少原桶名记录（" + std::string(kOriginalIndexName) +
+                              "），无法回退：" + entry.trashed_name);
+    }
+
+    const ExistingBucket target = find_existing_bucket(user_root(), entry.original_name);
+    if (!target.has) {
+        return make_error(ErrorCode::RestoreConflict,
+                          "目标 Bucket 不在，不能合并：" + entry.original_name +
+                              "（请直接用 trash restore 整目录搬回）");
+    }
+    // 目标桶的拼写必须与原桶名一致（理由见 check_merge）：改名会让 file.json 里的
+    // bucket 字段与磁盘路径对不上，所以宁可拒绝也不动。
+    if (target.name != entry.original_name) {
+        return make_error(ErrorCode::RestoreConflict,
+                          "回退失败：已存在的 Bucket 名字拼写是「" + target.name +
+                              "」，与被删除的「" + entry.original_name +
+                              "」不一致，合并会与 file.json 里的记录对不上；"
+                              "请先把现有 Bucket 改回原名");
+    }
+
+    // 判定只有一份：真正动手之前再跑一遍预检，冲突就地拒绝（不搬、不改任何东西）。
+    Result<BucketMergeCheck> checked = check_merge(entry.trashed_name);
+    if (!ok(checked)) {
+        return *error_of(checked);
+    }
+    const BucketMergeCheck& check = std::get<BucketMergeCheck>(checked);
+    if (!check.conflicts.empty()) {
+        return make_error(ErrorCode::RestoreMergeConflict, check.message);
+    }
+
+    return merge_into_existing(entry, check.target_name, entries, found.index);
+}
+
+Result<BucketMerge> BucketService::merge_into_existing(const TrashBucket& entry,
+                                                       const std::string& target_name,
+                                                       const std::vector<TrashBucket>& entries,
+                                                       std::size_t index) {
+    const std::filesystem::path source = trash_user_root() / path_from_utf8(entry.trashed_name);
+    if (!directory_exists(source)) {
+        return make_error(ErrorCode::TrashEntryNotFound,
+                          "回收站目录已不存在：" + entry.trashed_name);
+    }
+    const std::filesystem::path target = user_root() / path_from_utf8(target_name);
+
+    const std::vector<BucketFile> files = scan_bucket_files(source);
+    BucketMerge result;
+    result.trashed_name = entry.trashed_name;
+    result.original_name = entry.original_name;
+
+    std::vector<std::string> moved;  // 真正搬过去的桶内相对路径（给 file.json 筛记录用）
+    for (const BucketFile& file : files) {
+        const std::filesystem::path from = source / path_from_utf8(file.relative);
+        const std::filesystem::path to = target / path_from_utf8(file.relative);
+        if (path_exists(to)) {
+            // 预检已经拦过同名，这里是第二道保险：绝不覆盖用户已有的文件。
+            ++result.failed_files;
+            result.failures.push_back(file.relative + "（目标已有同名文件，未覆盖）");
+            continue;
+        }
+
+        if (const Status status = ensure_directory(to.parent_path()); !ok(status)) {
+            ++result.failed_files;
+            result.failures.push_back(file.relative + "（建目录失败：" +
+                                      error_of(status)->message + "）");
+            continue;
+        }
+
+        std::error_code code;
+        std::filesystem::rename(from, to, code);
+        if (code) {
+            ++result.failed_files;
+            result.failures.push_back(file.relative + "（" + code.message() + "）");
+            continue;
+        }
+        ++result.moved_files;
+        moved.push_back(file.relative);
+    }
+
+    // 全部搬完才摘索引：中途失败的那些还在回收站里，索引留着还能再来一次。
+    if (result.failed_files == 0) {
+        if (const Status status = drop_original_entry(entries, index); !ok(status)) {
+            // 合并已经完成，索引没摘掉只留下一条「目录已不在」的幽灵记录——
+            // 如实报告并让日志留痕，不回滚已经落到正确位置的文件。
+            if (logger_ != nullptr) {
+                logger_->error("Bucket", "合并回退后写 .original 失败：" + error_of(status)->message +
+                                             "（条目 " + entry.trashed_name + " 仍在索引里）");
+            }
+            return *error_of(status);
+        }
+
+        // 回收站目录里只剩空的日期树了：收掉它，否则它会以「孤儿桶条目」的形状
+        // 继续出现在 trash list 里（索引摘了、目录还在，扫描会把它捡回来）。
+        if (no_files_left(source)) {
+            std::error_code ignored;
+            std::filesystem::remove_all(source, ignored);
+        }
+    }
+
+    // 只翻回真正搬过去的那几条记录：没搬成的继续留在回收站里（is_trash 保持 true）。
+    const std::vector<std::string> moved_names = moved;
+    if (!moved_names.empty()) {
+        if (const Status status = set_bucket_files_trash_flag(
+                target_name, false, &result.records_freed,
+                [&moved_names](const std::string& file_name) {
+                    return std::any_of(moved_names.begin(), moved_names.end(),
+                                       [&file_name](const std::string& relative) {
+                                           return same_file_name(relative, file_name);
+                                       });
+                });
+            !ok(status)) {
+            return *error_of(status);
+        }
+    }
+
+    if (logger_ != nullptr) {
+        logger_->info("Bucket", "合并回退 Bucket：" + entry.trashed_name + " -> " + target_name +
+                                    "（" + std::to_string(result.moved_files) + " 个文件，" +
+                                    std::to_string(result.failed_files) + " 个留在回收站，" +
+                                    std::to_string(result.records_freed) + " 条记录恢复为正常）");
+    }
+    return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -777,8 +1155,9 @@ Result<TrashPurge> BucketService::purge(std::string_view identifier) {
 // 文件记录的 is_trash 维护
 // ---------------------------------------------------------------------------
 
-Status BucketService::set_bucket_files_trash_flag(std::string_view name, bool trashed,
-                                                  std::size_t* affected) {
+Status BucketService::set_bucket_files_trash_flag(
+    std::string_view name, bool trashed, std::size_t* affected,
+    const std::function<bool(const std::string&)>& only) {
     if (affected != nullptr) {
         *affected = 0;
     }
@@ -825,6 +1204,11 @@ Status BucketService::set_bucket_files_trash_flag(std::string_view name, bool tr
 
         // 回退：只放回「因为桶被删」而进回收站的文件。用户单独删过的保持不动。
         if (!record.value("is_trash", false) || reason != kTrashReasonBucket) {
+            continue;
+        }
+        // 合并回退再筛一道：留在回收站没搬过去的文件，记录不能翻回正常
+        // （否则 file list 会列出一个磁盘上不在那儿的文件）。
+        if (only && !only(record.value("file_name", std::string{}))) {
             continue;
         }
         record["is_trash"] = false;

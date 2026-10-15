@@ -310,18 +310,45 @@ Result<TrashCheck> TrashService::check_restore(std::string_view identifier) cons
         check.message = "回收站目录已不存在：" + check.entry.id;
         return check;
     }
-    const std::filesystem::path target = paths_.repository() /
-                                         path_from_utf8(config_.current_user) /
-                                         path_from_utf8(check.entry.name);
-    if (path_exists(target)) {
-        // 与桶级回退的规则一致：目标已存在就不回退，不覆盖、不改名
-        check.blocked = true;
-        check.message = "回退失败：Bucket 已存在：" + check.entry.name;
+
+    // 目标桶已存在：这是用户撞过的那条路——回退一份被删的桶，而原位置已经有了同名桶
+    // （很常见：先回退了桶里的某个文件，file restore 顺手把空的桶目录建了出来）。
+    // 整单拒绝（FMT-401）不是唯一出路：**桶里的文件合进去**同样安全（不覆盖、不改名），
+    // 但这是「拿回收站的数据往现有桶里加东西」，要说清规模并让用户确认。
+    // 唯一不能靠确认解决的是同名冲突——那一个文件都不搬（FMT-403）。
+    BucketService buckets(paths_, config_, logger_);
+    const Result<BucketMergeCheck> merge_check = buckets.check_merge(resolution.trashed_name);
+    if (!ok(merge_check)) {
+        return *error_of(merge_check);
     }
+    const BucketMergeCheck& merge = std::get<BucketMergeCheck>(merge_check);
+    check.merge_target_exists = merge.target_exists;
+    check.merge_files = merge.move_files;
+    check.merge_bytes = merge.move_bytes;
+    check.target_files = merge.target_files;
+    check.conflicts = merge.conflicts;
+
+    if (!merge.target_exists) {
+        // 目标不在：整目录搬回（第 56 节），不需要确认
+        return check;
+    }
+
+    check.merge = true;
+    check.message = merge.message;
+    if (!merge.conflicts.empty()) {
+        // 同名冲突：不覆盖、不自动改名，一个文件都不搬——确认也解决不了
+        check.blocked = true;
+        return check;
+    }
+    if (merge.move_files == 0) {
+        // 回收站条目里没有文件（目录是空的，或已经从里面逐个回退过）：只收尾，不打扰用户
+        return check;
+    }
+    check.needs_confirm = true;
     return check;
 }
 
-Result<TrashEntry> TrashService::restore(std::string_view identifier) {
+Result<TrashEntry> TrashService::restore(std::string_view identifier, bool confirmed) {
     Result<Resolution> resolved = resolve(identifier);
     if (!ok(resolved)) {
         return *error_of(resolved);
@@ -356,6 +383,38 @@ Result<TrashEntry> TrashService::restore(std::string_view identifier) {
         return *error_of(entry);
     }
     BucketService buckets(paths_, config_, logger_);
+
+    // 目标桶已存在 -> 这次回退是**合并**：拿回收站里的数据往现有桶里加东西，
+    // 必须先让用户确认（confirmed=false 一律 FMT-016）。同名冲突由预检判成 blocked，
+    // 到这里还带冲突就是调用方绕过了预检：一个文件都不许动。
+    const Result<TrashCheck> checked = check_restore(identifier);
+    if (!ok(checked)) {
+        return *error_of(checked);
+    }
+    const TrashCheck& check = std::get<TrashCheck>(checked);
+    if (check.needs_confirm && !confirmed) {
+        return make_error(ErrorCode::ConfirmRequired,
+                          check.message + "；确认合并请加 force（CLI：--yes）");
+    }
+    if (!check.conflicts.empty()) {
+        return make_error(ErrorCode::RestoreMergeConflict, check.message);
+    }
+    if (check.merge) {
+        const Result<BucketMerge> merged = buckets.merge(resolution.trashed_name);
+        if (!ok(merged)) {
+            return *error_of(merged);
+        }
+        const BucketMerge& result = std::get<BucketMerge>(merged);
+        TrashEntry done = std::get<TrashEntry>(entry);
+        done.files = result.moved_files;
+        done.message = "已合并 " + std::to_string(result.moved_files) + " 个文件";
+        if (result.failed_files > 0) {
+            done.message += "，" + std::to_string(result.failed_files) +
+                            " 个留在回收站里（搬动失败）";
+        }
+        return done;
+    }
+
     const Result<TrashBucket> restored = buckets.restore(resolution.trashed_name);
     if (!ok(restored)) {
         return *error_of(restored);

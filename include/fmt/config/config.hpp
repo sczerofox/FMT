@@ -35,7 +35,10 @@ struct ServerConfig {
     static constexpr int kVersion = 1;
 
     int version = kVersion;
-    bool enabled = false;  // 默认关闭；安装流程在启用网络服务时置为 true
+    // 默认**打开**（本次改动（未提交），用户要求）：新数据根建出来就是「网络服务可用」，
+    // 免得装完连不上 4122、还以为是功能坏了。它只监听 host（默认 localhost），
+    // 而且除 /api/ping 与分享下载外都要 token，所以默认开着是可控的。
+    bool enabled = true;
     std::string host = "localhost";  // 只监听本机；用户要求写 localhost 而不是 127.0.0.1
     int port = 4122;
 };

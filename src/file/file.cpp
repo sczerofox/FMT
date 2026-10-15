@@ -629,25 +629,42 @@ Result<FileRecord> FileService::commit_upload(PreparedUpload& prepared) {
     }
     std::vector<FileRecord> records = std::get<std::vector<FileRecord>>(loaded);
 
-    // 第 37 节：同用户已有相同 MD5 就终止，不新建 id、不复制文件、不改旧名字。
-    for (const FileRecord& record : records) {
-        if (record.user == config_.current_user && !record.is_trash &&
-            !record.md5.empty() && record.md5 == prepared.md5) {
-            return make_error(ErrorCode::Md5Duplicate,
-                              "该文件已经存在：" + record.file_name + "（" + record.file_id + "）");
-        }
-    }
-    // 第 38 节：同用户 + 正常文件 + 同名 -> 拒绝，**不自动改名**。
+    // 桶内判重（第 37/38 节，本次改动（未提交）定稿的四条口径）。范围是**当前用户的当前
+    // Bucket**，不是「同用户跨 Bucket」——不同 Bucket 是各自独立的命名空间，同一个文件可以
+    // 在两个桶里各存一份（文件级记录都带 bucket，路径由 record.bucket 推出，见第 38 节）。
+    //
+    //   ① 内容相同 + 名字不同 → FMT-304「该文件已经存在」（**不提改名**，只是这份内容已经有了）
+    //   ② 内容相同 + 名字相同 → FMT-304「该文件已经存在」（同上，两条合并成一步）
+    //   ③ 内容不同 + 名字相同 → FMT-105「文件名重复」，提示用户修改文件名
+    //   ④ 内容不同 + 名字不同 → 正常入库
+    // 所以**先按内容判**（① ② 合并）、再按名字判（③），剩下的走 ④。
     //
     // 名字比较**不区分大小写**：Windows 的文件名不区分大小写，`DOC.TXT` 与 `doc.txt`
     // 会落到同一个磁盘路径上。按精确匹配放过的话，第二次上传会**直接覆盖**第一个文件的
     // 字节，而 file.json 里两条记录的 size/md5 各说各话——这是数据损坏，不是显示问题。
+    // 也正因为落到同一个路径，「同名不同内容」在桶内同样不能并存（口径 ③）。
+    //
+    // 回收站里的记录（is_trash）**不参与**：它们不占正常文件的位置，也就可以重新入库。
     for (const FileRecord& record : records) {
-        if (record.user == config_.current_user && !record.is_trash &&
-            iequals(record.file_name, prepared.file_name)) {
+        if (record.user != config_.current_user || record.is_trash ||
+            !iequals(record.bucket, config_.current_bucket)) {
+            continue;
+        }
+        // ①② 内容相同（同一个桶里同一份内容只留一份）：名字相同与否都是同一句「文件已存在」，
+        //    并且**不提示改文件名**——用户要的就是「这份内容已经有了」。
+        //    消息带上已有文件的名字与 file_id：知道是哪一份（名字可能与本次不同）比一句冲突有用。
+        if (!record.md5.empty() && record.md5 == prepared.md5) {
+            return make_error(ErrorCode::Md5Duplicate,
+                              "文件已存在：Bucket「" + config_.current_bucket + "」里已有相同内容的" +
+                                  (iequals(record.file_name, prepared.file_name) ? "同名文件：" : "文件：") +
+                                  record.file_name + "（file_id " + record.file_id + "）");
+        }
+        // ③ 内容不同 + 名字相同 → 要求用户改文件名（落到同一个磁盘路径，不能让它们并存）
+        if (iequals(record.file_name, prepared.file_name)) {
             return make_error(ErrorCode::FileNameConflict,
-                              "同名文件已存在：" + record.file_name +
-                                  "（换一个文件名再上传）");
+                              "文件名重复：Bucket「" + config_.current_bucket + "」里已有同名文件：" +
+                                  record.file_name + "（file_id " + record.file_id +
+                                  "，内容不同；请修改文件名后重新上传）");
         }
     }
 
@@ -755,11 +772,33 @@ Result<FileRecord> FileService::get_by_name(std::string_view file_name) {
     if (!ok(loaded)) {
         return *error_of(loaded);
     }
-    for (const FileRecord& record : std::get<std::vector<FileRecord>>(loaded)) {
+    const std::vector<FileRecord> records = std::get<std::vector<FileRecord>>(loaded);
+    // 名字的命名空间是 Bucket（本次改动（未提交））：桶内唯一，别的桶可以有同名，所以先找当前桶。
+    for (const FileRecord& record : records) {
         if (record.user == config_.current_user && !record.is_trash &&
+            iequals(record.bucket, config_.current_bucket) &&
             iequals(record.file_name, file_name)) {
             return record;
         }
+    }
+    // 当前桶没有：别的桶里**恰好一个**同名才认，多个就是歧义（不能猜是哪一个）。
+    const FileRecord* other = nullptr;
+    for (const FileRecord& record : records) {
+        if (record.user != config_.current_user || record.is_trash ||
+            !iequals(record.file_name, file_name)) {
+            continue;
+        }
+        if (other != nullptr) {
+            return make_error(ErrorCode::InvalidArgument,
+                              "有歧义：" + std::string(file_name) + " 在多个 Bucket 里都有（" +
+                                  other->bucket + " 的 " + other->file_id + "、" + record.bucket +
+                                  " 的 " + record.file_id +
+                                  "）。请先用 bucket use 切到目标桶，或用 file_id 指定");
+        }
+        other = &record;
+    }
+    if (other != nullptr) {
+        return *other;
     }
     return make_error(ErrorCode::FileNotFound, "文件不存在：" + std::string(file_name));
 }
@@ -814,6 +853,7 @@ FileService::RecordMatch FileService::match_record(const std::vector<FileRecord>
     // 标识比较**一律不区分大小写**（Windows 习惯：文件名与路径都不区分大小写，
     // 用户敲 `DOC.TXT` 或大写 file_id 时不该得到「文件不存在」）。
     RecordMatch match;
+    match.other_bucket_name = records.size();
 
     // ① 当 file_id：全局唯一，形状固定（fmt-YYYYMMDD-N）。
     for (std::size_t i = 0; i < records.size(); ++i) {
@@ -824,14 +864,21 @@ FileService::RecordMatch FileService::match_record(const std::vector<FileRecord>
         }
     }
 
-    // ② 当文件名：当前用户 + 正常文件。
-    //    名字在同用户范围内唯一（重名上传会被 FMT-105 拒绝，且比较不区分大小写）。
+    // ② 当文件名：当前用户 + 正常文件，**只看当前 Bucket**（本次改动（未提交）：一个桶内不允许
+    //    同名，名字的命名空间是 Bucket）。别的桶里的同名文件另记一笔，只用来把错误消息
+    //    说清楚——它不参与定位，`file delete` 不能因为别的桶有同名就删到别的桶去。
     for (std::size_t i = 0; i < records.size(); ++i) {
-        if (records[i].user == config_.current_user && !records[i].is_trash &&
-            iequals(records[i].file_name, key)) {
+        if (records[i].user != config_.current_user || records[i].is_trash ||
+            !iequals(records[i].file_name, key)) {
+            continue;
+        }
+        if (iequals(records[i].bucket, config_.current_bucket)) {
             match.has_name = true;
             match.by_name = i;
             break;
+        }
+        if (match.other_bucket_name == records.size()) {
+            match.other_bucket_name = i;
         }
     }
     return match;
@@ -850,6 +897,16 @@ Result<std::size_t> FileService::locate_record(const std::vector<FileRecord>& re
                               records[match.by_name].file_id +
                               "）。这种名字现在不允许上传；请直接用 file_id 指定要删哪一个");
     }
+    // 当前桶没有这个文件名、别的桶里有：**不跨桶猜**（本次改动（未提交））。按名字操作只在
+    // 当前 Bucket 内生效，说清它在哪个桶，让用户 bucket use 切过去或直接用 file_id。
+    if (!match.has_id && !match.has_name && match.other_bucket_name < records.size()) {
+        const FileRecord& other = records[match.other_bucket_name];
+        return make_error(ErrorCode::FileNotFound,
+                          "当前 Bucket「" + config_.current_bucket + "」里没有这个文件：" +
+                              std::string(key) + "（同名的在 Bucket「" + other.bucket +
+                              "」，file_id " + other.file_id + "；请先 bucket use 切过去，"
+                              "或用 file_id 指定）");
+    }
     if (match.has_id) {
         return match.by_id;
     }
@@ -858,8 +915,11 @@ Result<std::size_t> FileService::locate_record(const std::vector<FileRecord>& re
     }
 
     // ③ 名字存在、但已经在回收站里：说清楚是哪一条，别让用户以为文件没了。
+    //    同样只看**记录自己的桶与当前桶一致**的那一条（本次改动（未提交）：别的桶里的回收站
+    //    条目跟当前桶不相干，不能因为它在回收站里就说当前桶的文件「在回收站里」）。
     for (const FileRecord& record : records) {
         if (record.user == config_.current_user && record.is_trash &&
+            iequals(record.bucket, config_.current_bucket) &&
             iequals(record.file_name, key)) {
             return make_error(ErrorCode::InvalidArgument,
                               "该文件已经在回收站里：" + std::string(key) + "（file_id " +
@@ -902,8 +962,8 @@ Result<FileDeleteCheck> FileService::check_remove(std::string_view file_id_or_na
         return check;
     }
 
-    // 没有命中：走与 delete 完全相同的错误路径（含「已经在回收站里」的提示），
-    // 免得预检与执行给出两套说法。
+    // 没有命中：走与 delete 完全相同的错误路径（含「已经在回收站里」「同名的在别的桶、
+    // 先 bucket use 切过去」这些提示），免得预检与执行给出两套说法。
     if (!match.has_id && !match.has_name) {
         const Result<std::size_t> located = locate_record(records, file_id_or_name);
         return *error_of(located);
@@ -919,6 +979,7 @@ Result<FileDeleteCheck> FileService::check_remove(std::string_view file_id_or_na
         check.path = relative_path_text(paths_.root(), std::get<std::filesystem::path>(path));
     }
 
+    // 按 file_id 命中别的桶里的文件：跨桶删除要先说清楚（按名字命中不可能跨桶）
     check.other_bucket = !iequals(record.bucket, config_.current_bucket);
     if (check.other_bucket) {
         check.message = "「" + record.file_name + "」属于 Bucket「" + record.bucket +
@@ -1102,10 +1163,12 @@ Result<FileService::FileRestoreCheck> FileService::check_restore(std::string_vie
     }
     check.target = std::get<std::filesystem::path>(target);
 
-    // ② 目标位置的同名正常文件：名字在同用户范围内唯一，所以要么没有、要么撞一条。
-    //    **不覆盖、不改名**——与桶级回退同一口径。
+    // ② 目标位置的同名正常文件：**只看记录自己的那个桶**（本次改动（未提交）：名字的命名空间是
+    //    Bucket，别的桶里的同名文件与本条记录不相干，回退落点由 record.bucket 决定，
+    //    所以要么没有、要么撞一条）。**不覆盖、不改名**——与桶级回退同一口径。
     for (const FileRecord& other : records) {
         if (other.user == config_.current_user && !other.is_trash &&
+            iequals(other.bucket, record.bucket) &&
             iequals(other.file_name, record.file_name)) {
             check.conflict = true;
             check.conflicting = other;

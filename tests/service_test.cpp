@@ -2,8 +2,11 @@
 #include "fmt/service/runtime.hpp"
 #include "fmt/service/service.hpp"
 
+#include <atomic>
 #include <filesystem>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
@@ -318,6 +321,106 @@ FMT_TEST(Service, 管道能执行回收站命令) {
     FMT_CHECK_EQ(after.data["entries"].size(), std::size_t{0});
 }
 
+FMT_TEST(Service, 目标桶已存在时回退要先确认再合并) {
+    fmt_test::TempDir temp("service-merge");
+    const auto root = temp / "root";
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    // 造一个桶，里面按日期树放一个文件
+    fmt::ipc::Request create;
+    create.id = 60;
+    create.op = "bucket.create";
+    create.args["argv"] = nlohmann::json::array({"test"});
+    FMT_CHECK(runtime.handle(create).ok);
+
+    const std::filesystem::path bucket = root / "repository" / "user" / "test";
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(bucket / "2026" / "10" / "08")));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(bucket / "2026" / "10" / "08" / "a5.png", "png")));
+
+    fmt::ipc::Request remove;
+    remove.id = 61;
+    remove.op = "bucket.delete";
+    remove.args["argv"] = nlohmann::json::array({"test"});
+    remove.args["force"] = true;  // 有内容要确认，测试里直接给
+    const fmt::ipc::Response removed = runtime.handle(remove);
+    FMT_CHECK(removed.ok);
+    const std::string trashed = removed.data.value("trashed_name", std::string{});
+    FMT_CHECK(!trashed.empty());
+
+    // 原位置又建了同名桶（用户先单独回退过桶里某个文件时就是这样）
+    fmt::ipc::Request recreate;
+    recreate.id = 62;
+    recreate.op = "bucket.create";
+    recreate.args["argv"] = nlohmann::json::array({"test"});
+    FMT_CHECK(runtime.handle(recreate).ok);
+
+    // 预检：这次回退是**合并**，要一次确认（不是「Bucket 已存在」的硬拒绝）
+    fmt::ipc::Request check;
+    check.id = 63;
+    check.op = "trash.restore";
+    check.args["argv"] = nlohmann::json::array({trashed});
+    check.args["dry_run"] = true;
+    const fmt::ipc::Response checked = runtime.handle(check);
+    FMT_CHECK(checked.ok);
+    if (checked.ok) {
+        FMT_CHECK(checked.data.value("merge", false));
+        FMT_CHECK(checked.data.value("needs_confirm", false));
+        FMT_CHECK(!checked.data.value("blocked", true));
+        FMT_CHECK_EQ(checked.data.value("merge_files", std::size_t{0}), std::size_t{1});
+        FMT_CHECK_EQ(checked.data.value("target_files", std::size_t{0}), std::size_t{0});
+    }
+
+    // 没带 force：拒绝，而且**一个文件都没搬**
+    fmt::ipc::Request unconfirmed;
+    unconfirmed.id = 64;
+    unconfirmed.op = "trash.restore";
+    unconfirmed.args["argv"] = nlohmann::json::array({trashed});
+    const fmt::ipc::Response refused = runtime.handle(unconfirmed);
+    FMT_CHECK(!refused.ok);
+    FMT_CHECK(refused.error.code == fmt::ErrorCode::ConfirmRequired);
+    FMT_CHECK_EQ(fmt::exit_code(refused.error.code), 2);
+    FMT_CHECK(fmt::file_exists(root / "trash" / "user" / fmt::path_from_utf8(trashed) / "2026" /
+                               "10" / "08" / "a5.png"));
+
+    // 带 force：合并进去
+    fmt::ipc::Request forced;
+    forced.id = 65;
+    forced.op = "trash.restore";
+    forced.args["argv"] = nlohmann::json::array({trashed});
+    forced.args["force"] = true;
+    const fmt::ipc::Response merged = runtime.handle(forced);
+    if (!merged.ok) {
+        std::printf("    合并失败：%s %s\n", fmt::code_string(merged.error.code).c_str(),
+                    merged.error.message.c_str());
+    }
+    FMT_CHECK(merged.ok);
+    if (merged.ok) {
+        FMT_CHECK_EQ(merged.data["entry"].value("type", std::string{}), std::string("bucket"));
+        FMT_CHECK(merged.data.value("message", std::string{}).find("已合并") != std::string::npos);
+    }
+    FMT_CHECK(fmt::file_exists(bucket / "2026" / "10" / "08" / "a5.png"));
+
+    // 桶还在（是合并，不是搬回），回收站里那条已经摘掉
+    FMT_CHECK(fmt::directory_exists(bucket));
+    fmt::ipc::Request list_after;
+    list_after.id = 66;
+    list_after.op = "trash.list";
+    const fmt::ipc::Response after = runtime.handle(list_after);
+    FMT_CHECK(after.ok);
+    FMT_CHECK_EQ(after.data["entries"].size(), std::size_t{0});
+
+    // 已经合并过的条目再回退一次：条目没了
+    fmt::ipc::Request again;
+    again.id = 67;
+    again.op = "trash.restore";
+    again.args["argv"] = nlohmann::json::array({trashed});
+    const fmt::ipc::Response missing = runtime.handle(again);
+    FMT_CHECK(!missing.ok);
+    FMT_CHECK(missing.error.code == fmt::ErrorCode::TrashEntryNotFound);
+}
+
 FMT_TEST(Service, 运行体声明数据根并幂等初始化) {
     fmt_test::TempDir temp("service-runtime");
     const auto root_a = temp / "A";
@@ -471,15 +574,42 @@ FMT_TEST(Service, 管道能上传与操作文件) {
         if (detail.ok) {
             FMT_CHECK_EQ(detail.data.value("file_id", std::string{}), file_id);
             FMT_CHECK(detail.data.value("path", std::string{}).rfind("repository/user/", 0) == 0);
+            // 预览 / 下载链接（本次改动（未提交））：完整地址，按 file_id 拼、与按什么查无关
+            FMT_CHECK_EQ(detail.data.value("preview_url", std::string{}),
+                         std::string("http://localhost:4122/api/file/") + file_id + "/preview");
+            FMT_CHECK_EQ(detail.data.value("download_url", std::string{}),
+                         std::string("http://localhost:4122/api/file/") + file_id + "/download");
         }
     }
 
-    // 重复上传同一内容：MD5 去重
+    // 同一条命令重放（同一个文件：内容与名字都相同）→ FMT-304「文件已存在」
     fmt::ipc::Request duplicate = upload;
     duplicate.id = 44;
     const fmt::ipc::Response rejected = runtime.handle(duplicate);
     FMT_CHECK(!rejected.ok);
     FMT_CHECK(rejected.error.code == fmt::ErrorCode::Md5Duplicate);
+    FMT_CHECK(rejected.error.message.find("文件已存在") != std::string::npos);
+
+    // 同一份内容换个名字 → 同样是 FMT-304（内容判重不看名字），且不要求改文件名
+    fmt::ipc::Request same_content = upload;
+    same_content.id = 47;
+    same_content.args["argv"] = nlohmann::json::array(
+        {fmt::path_to_utf8(source), std::string("payload-copy.txt")});
+    const fmt::ipc::Response content_hit = runtime.handle(same_content);
+    FMT_CHECK(!content_hit.ok);
+    FMT_CHECK(content_hit.error.code == fmt::ErrorCode::Md5Duplicate);
+    FMT_CHECK(content_hit.error.message.find("文件已存在") != std::string::npos);
+    FMT_CHECK(content_hit.error.message.find("修改文件名") == std::string::npos);
+
+    // 内容不同 + 名字相同 → FMT-105「文件名重复」，这次要求改文件名
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(source, "another content")));
+    fmt::ipc::Request same_name = upload;
+    same_name.id = 48;
+    const fmt::ipc::Response name_hit = runtime.handle(same_name);
+    FMT_CHECK(!name_hit.ok);
+    FMT_CHECK(name_hit.error.code == fmt::ErrorCode::FileNameConflict);
+    FMT_CHECK(name_hit.error.message.find("文件名重复") != std::string::npos);
+    FMT_CHECK(name_hit.error.message.find("修改文件名") != std::string::npos);
 
     // 软删除
     fmt::ipc::Request remove;
@@ -536,7 +666,13 @@ FMT_TEST(Service, 破坏性操作先预检再确认) {
     upload.id = 52;
     upload.op = "file.upload";
     upload.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(source)});
-    FMT_CHECK(runtime.handle(upload).ok);
+    const fmt::ipc::Response uploaded = runtime.handle(upload);
+    FMT_CHECK(uploaded.ok);
+    if (!uploaded.ok) {
+        return;
+    }
+    const std::string payload_id = uploaded.data.value("file_id", std::string{});
+    FMT_CHECK(!payload_id.empty());
 
     fmt::ipc::Request use_other;
     use_other.id = 53;
@@ -545,10 +681,20 @@ FMT_TEST(Service, 破坏性操作先预检再确认) {
     FMT_CHECK(runtime.handle(use_other).ok);
 
     // ── 软删除：目标在别的桶里，预检要说清楚，执行要先确认 ──
+    // 按名字在别的桶里已经够不到（本次改动（未提交）：名字的命名空间是 Bucket），跨桶只能用 file_id。
+    fmt::ipc::Request by_name;
+    by_name.id = 57;
+    by_name.op = "file.delete";
+    by_name.args["argv"] = nlohmann::json::array({"payload.txt"});
+    by_name.args["dry_run"] = true;
+    const fmt::ipc::Response name_missed = runtime.handle(by_name);
+    FMT_CHECK(!name_missed.ok);
+    FMT_CHECK(name_missed.error.code == fmt::ErrorCode::FileNotFound);
+
     fmt::ipc::Request check;
     check.id = 54;
     check.op = "file.delete";
-    check.args["argv"] = nlohmann::json::array({"payload.txt"});
+    check.args["argv"] = nlohmann::json::array({payload_id});
     check.args["dry_run"] = true;
     const fmt::ipc::Response checked = runtime.handle(check);
     FMT_CHECK(checked.ok);
@@ -722,6 +868,15 @@ FMT_TEST(Service, 列表排序配置与清空回收站) {
     FMT_CHECK(config.ok);
     FMT_CHECK_EQ(config.data.value("max_upload_size", std::uintmax_t{0}),
                  std::uintmax_t{52428800});
+    // 本次改动（未提交）：config.list 也输出 config/server.json 的公共字段（带 server_ 前缀），
+    // 且**不含任何凭证**（token 单独给，口令哈希从不出现）
+    FMT_CHECK_EQ(config.data.value("server_enabled", false), true);  // 默认已改成 true
+    FMT_CHECK_EQ(config.data.value("server_host", std::string{}), std::string("localhost"));
+    FMT_CHECK_EQ(config.data.value("server_port", 0), 4122);
+    FMT_CHECK(config.data.value("server_path", std::string{}).rfind("config/", 0) == 0);
+    FMT_CHECK_EQ(config.data.value("server_token", std::string{}), std::string{});
+    FMT_CHECK(!config.data.contains("password_hash"));
+    FMT_CHECK(!config.data.contains("password_salt"));
 
     fmt::ipc::Request set;
     set.id = 6;
@@ -740,6 +895,77 @@ FMT_TEST(Service, 列表排序配置与清空回收站) {
         if (fmt::ok(reloaded)) {
             FMT_CHECK_EQ(std::get<fmt::Config>(reloaded).max_upload_size,
                          std::uintmax_t{2097152});
+        }
+    }
+
+    // config set server_enabled：改 server.json（本次改动（未提交）），并回报要重启服务；
+    // **服务侧不做 reinstall**（那由 CLI 做），所以这里只断言文件与响应字段
+    {
+        fmt::ipc::Request disable;
+        disable.id = 11;
+        disable.op = "config.set";
+        disable.args["argv"] = nlohmann::json::array({"server_enabled", "false"});
+        const fmt::ipc::Response off = runtime.handle(disable);
+        FMT_CHECK(off.ok);
+        FMT_CHECK_EQ(off.data.value("server_enabled", true), false);
+        FMT_CHECK(off.data.value("restart_required", false));
+        FMT_CHECK(off.data.value("message", std::string{}).find("重启") != std::string::npos);
+
+        const fmt::PathManager paths{root};
+        const auto reloaded = fmt::load_server_config(paths);
+        FMT_CHECK(fmt::ok(reloaded));
+        if (fmt::ok(reloaded)) {
+            FMT_CHECK_EQ(std::get<fmt::ServerConfig>(reloaded).enabled, false);
+        }
+
+        // 打开回来，并顺手校验 host / port 也能改
+        fmt::ipc::Request enable;
+        enable.id = 12;
+        enable.op = "config.set";
+        enable.args["argv"] = nlohmann::json::array({"server_enabled", "true"});
+        FMT_CHECK(runtime.handle(enable).ok);
+
+        fmt::ipc::Request host;
+        host.id = 13;
+        host.op = "config.set";
+        host.args["argv"] = nlohmann::json::array({"server_host", "127.0.0.1"});
+        FMT_CHECK(runtime.handle(host).ok);
+
+        fmt::ipc::Request port;
+        port.id = 14;
+        port.op = "config.set";
+        port.args["argv"] = nlohmann::json::array({"server_port", "4321"});
+        const fmt::ipc::Response moved = runtime.handle(port);
+        FMT_CHECK(moved.ok);
+        FMT_CHECK_EQ(moved.data.value("server_port", 0), 4321);
+
+        const auto final_config = fmt::load_server_config(paths);
+        FMT_CHECK(fmt::ok(final_config));
+        if (fmt::ok(final_config)) {
+            const fmt::ServerConfig& value = std::get<fmt::ServerConfig>(final_config);
+            FMT_CHECK_EQ(value.enabled, true);
+            FMT_CHECK_EQ(value.host, std::string("127.0.0.1"));
+            FMT_CHECK_EQ(value.port, 4321);
+        }
+
+        // 非法值：布尔写错、端口越界、host 空 → FMT-001，且**不改文件**
+        for (const auto& invalid : {std::pair<const char*, const char*>{"server_enabled", "maybe"},
+                                    {"server_port", "70000"},
+                                    {"server_port", "abc"},
+                                    {"server_host", "  "}}) {
+            fmt::ipc::Request request;
+            request.id = 15;
+            request.op = "config.set";
+            request.args["argv"] = nlohmann::json::array({invalid.first, invalid.second});
+            const fmt::ipc::Response refused = runtime.handle(request);
+            FMT_CHECK(!refused.ok);
+            FMT_CHECK(refused.error.code == fmt::ErrorCode::InvalidArgument);
+        }
+        const auto unchanged = fmt::load_server_config(paths);
+        FMT_CHECK(fmt::ok(unchanged));
+        if (fmt::ok(unchanged)) {
+            FMT_CHECK_EQ(std::get<fmt::ServerConfig>(unchanged).port, 4321);
+            FMT_CHECK_EQ(std::get<fmt::ServerConfig>(unchanged).host, std::string("127.0.0.1"));
         }
     }
 
@@ -935,6 +1161,22 @@ FMT_TEST(Service, 分享的创建查看列出撤销与计数) {
     FMT_CHECK(created.data["expire_time"].is_string());  // 默认 7 天，不是 null
     FMT_CHECK(created.data.value("is_valid", false));
 
+    // 完整分享链接（本次改动（未提交））：地址来自 config/server.json 的 host / port，
+    // **不看 HTTP 服务有没有开**（这里根本没起 HTTP），share_id 就是路径里的凭证。
+    const std::string share_url = created.data.value("share_url", std::string{});
+    FMT_CHECK_EQ(share_url, std::string("http://localhost:4122/api/share/") + share_id + "/download");
+    FMT_CHECK_EQ(created.data.value("url", std::string{}), share_url);
+    // share.get 也带同一条链接
+    {
+        fmt::ipc::Request get_url;
+        get_url.id = 30;
+        get_url.op = "share.get";
+        get_url.args["argv"] = nlohmann::json::array({share_id});
+        const fmt::ipc::Response with_url = runtime.handle(get_url);
+        FMT_CHECK(with_url.ok);
+        FMT_CHECK_EQ(with_url.data.value("share_url", std::string{}), share_url);
+    }
+
     const fmt::ipc::Response second = runtime.handle(create);
     FMT_CHECK(second.ok);
     FMT_CHECK(second.data.value("share_id", std::string{}) != share_id);
@@ -959,16 +1201,82 @@ FMT_TEST(Service, 分享的创建查看列出撤销与计数) {
     FMT_CHECK(not_found.error.code == fmt::ErrorCode::ShareNotFound);
     FMT_CHECK_EQ(fmt::exit_code(not_found.error.code), 3);
 
-    // ---- 列出 ----
+    // ---- 列出（带参数：只看这个文件）----
     fmt::ipc::Request list;
     list.id = 6;
     list.op = "share.list";
     list.args["argv"] = nlohmann::json::array({file_id});
     const fmt::ipc::Response listed = runtime.handle(list);
     FMT_CHECK(listed.ok);
+    // 这个快照排在下面「按文件名再建一条」之前：那时会变成 3 条
     FMT_CHECK_EQ(listed.data.value("count", std::size_t{0}), std::size_t{2});
+    FMT_CHECK_EQ(listed.data.value("scope", std::string{}), std::string("file"));
     FMT_CHECK_EQ(listed.data["shares"][0].value("share_id", std::string{}),
                  second.data.value("share_id", std::string{}));
+    // 每条都带「为什么不能下载」的独立标记（本次改动（未提交））
+    FMT_CHECK_EQ(listed.data["shares"][0].value("expired", true), false);
+    FMT_CHECK_EQ(listed.data["shares"][0].value("limit_reached", true), false);
+    FMT_CHECK_EQ(listed.data["shares"][0].value("downloads_left", 0), fmt::kDefaultShareDownloads);
+    FMT_CHECK_EQ(listed.data["shares"][0].value("file_name", std::string{}),
+                 std::string("payload.txt"));
+    FMT_CHECK_EQ(listed.data["shares"][0].value("bucket", std::string{}), std::string("工作"));
+    FMT_CHECK_EQ(listed.data.value("current_bucket", std::string{}), std::string("工作"));
+
+    // ---- 列出（**不带参数**：列全部，本次改动（未提交））----
+    {
+        fmt::ipc::Request list_all;
+        list_all.id = 35;
+        list_all.op = "share.list";
+        const fmt::ipc::Response all = runtime.handle(list_all);
+        FMT_CHECK(all.ok);
+        FMT_CHECK_EQ(all.data.value("scope", std::string{}), std::string("all"));
+        FMT_CHECK_EQ(all.data.value("count", std::size_t{0}), std::size_t{2});
+        FMT_CHECK(!all.data.contains("file_id"));  // 不带参数就没有「过滤的那个文件」
+        FMT_CHECK_EQ(all.data["shares"][0].value("file_name", std::string{}),
+                     std::string("payload.txt"));
+        FMT_CHECK(all.data["shares"][0].value("share_url", std::string{})
+                      .rfind("http://localhost:4122/api/share/", 0) == 0);
+    }
+
+    // ---- 按**文件名**创建与列出（本次改动（未提交）：与 file get / file delete 同一套规则）----
+    {
+        fmt::ipc::Request by_name;
+        by_name.id = 31;
+        by_name.op = "share.create";
+        by_name.args["argv"] = nlohmann::json::array({"payload.txt"});
+        const fmt::ipc::Response named = runtime.handle(by_name);
+        FMT_CHECK(named.ok);
+        FMT_CHECK_EQ(named.data.value("share_id", std::string{}).size(), std::size_t{12});
+        FMT_CHECK_EQ(named.data.value("file_id", std::string{}), file_id);
+        const std::string named_share_id = named.data.value("share_id", std::string{});
+
+        fmt::ipc::Request list_by_name;
+        list_by_name.id = 32;
+        list_by_name.op = "share.list";
+        list_by_name.args["argv"] = nlohmann::json::array({"payload.txt"});
+        const fmt::ipc::Response named_list = runtime.handle(list_by_name);
+        FMT_CHECK(named_list.ok);
+        FMT_CHECK_EQ(named_list.data.value("file_id", std::string{}), file_id);
+        FMT_CHECK_EQ(named_list.data.value("count", std::size_t{0}), std::size_t{3});
+        FMT_CHECK(named_list.data["shares"][0].value("share_url", std::string{})
+                       .rfind("http://localhost:4122/api/share/", 0) == 0);
+
+        // 名字不存在 → FMT-002（与 file get 的说法一致）
+        fmt::ipc::Request absent;
+        absent.id = 33;
+        absent.op = "share.create";
+        absent.args["argv"] = nlohmann::json::array({"nope.txt"});
+        const fmt::ipc::Response missing_file = runtime.handle(absent);
+        FMT_CHECK(!missing_file.ok);
+        FMT_CHECK(missing_file.error.code == fmt::ErrorCode::FileNotFound);
+
+        // 立刻撤销掉它：后面的「过期」断言按 share.json 的条数写，不想被这条影响
+        fmt::ipc::Request revoke_named;
+        revoke_named.id = 34;
+        revoke_named.op = "share.delete";
+        revoke_named.args["argv"] = nlohmann::json::array({named_share_id});
+        FMT_CHECK(runtime.handle(revoke_named).ok);
+    }
 
     // ---- 下载记账：20 次之后第 21 次必须被拒（§51）----
     const auto download = [&runtime, &share_id](int id) {
@@ -1063,6 +1371,185 @@ FMT_TEST(Service, 分享的创建查看列出撤销与计数) {
     FMT_CHECK(expired_view.ok);
     FMT_CHECK_EQ(expired_view.data.value("state", std::string{}), std::string("已过期"));
     FMT_CHECK(expired_view.data.value("message", std::string{}).find("过期") != std::string::npos);
+}
+
+FMT_TEST(Service, 永久删除后分享如实报文件不存在) {
+    fmt_test::TempDir temp("service-share-purged");
+    const auto root = temp / "root";
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(temp / "gone.txt", "gone soon")));
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 1;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"工作"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+
+    fmt::ipc::Request upload;
+    upload.id = 2;
+    upload.op = "file.upload";
+    upload.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(temp / "gone.txt")});
+    const fmt::ipc::Response uploaded = runtime.handle(upload);
+    FMT_CHECK(uploaded.ok);
+    const std::string file_id = uploaded.data.value("file_id", std::string{});
+    FMT_CHECK(!file_id.empty());
+
+    fmt::ipc::Request create;
+    create.id = 3;
+    create.op = "share.create";
+    create.args["argv"] = nlohmann::json::array({file_id});
+    const fmt::ipc::Response created = runtime.handle(create);
+    FMT_CHECK(created.ok);
+    const std::string share_id = created.data.value("share_id", std::string{});
+    FMT_CHECK_EQ(share_id.size(), std::size_t{12});
+
+    const auto view_share = [&runtime, &share_id](int id) {
+        fmt::ipc::Request request;
+        request.id = id;
+        request.op = "share.get";
+        request.args["argv"] = nlohmann::json::array({share_id});
+        return runtime.handle(request);
+    };
+
+    // ---- ① 软删除：文件还在回收站里 → 「在回收站里」----
+    fmt::ipc::Request soft_delete;
+    soft_delete.id = 4;
+    soft_delete.op = "file.delete";
+    soft_delete.args["argv"] = nlohmann::json::array({file_id});
+    FMT_CHECK(runtime.handle(soft_delete).ok);
+
+    const fmt::ipc::Response in_trash = view_share(5);
+    FMT_CHECK(in_trash.ok);  // 查得到（不是「不存在」），如实报告状态
+    FMT_CHECK(!in_trash.data.value("available", true));
+    FMT_CHECK_EQ(in_trash.data.value("state", std::string{}), std::string("关联文件不可用"));
+    FMT_CHECK(in_trash.data.value("message", std::string{}).find("回收站") != std::string::npos);
+
+    // ---- ② 恢复：文件回到正常状态 → 分享**重新可用**（不是"恢复了但分享仍废"）----
+    fmt::ipc::Request restore;
+    restore.id = 6;
+    restore.op = "trash.restore";
+    restore.args["argv"] = nlohmann::json::array({file_id});
+    FMT_CHECK(runtime.handle(restore).ok);
+
+    const fmt::ipc::Response restored = view_share(7);
+    FMT_CHECK(restored.ok);
+    FMT_CHECK(restored.data.value("available", false));
+    FMT_CHECK_EQ(restored.data.value("state", std::string{}), std::string("可用"));
+
+    // ---- ③ 再软删 + 永久删除：file.json 里那条记录被清掉 → 「已不存在」----
+    // 与 ① 的**原因**必须分开：同样是「关联文件不可用」，一个说"在回收站里"、
+    // 一个说"已不存在"，排障时这两句话指向完全不同的处理方式。
+    fmt::ipc::Request soft_delete_again;
+    soft_delete_again.id = 8;
+    soft_delete_again.op = "file.delete";
+    soft_delete_again.args["argv"] = nlohmann::json::array({file_id});
+    FMT_CHECK(runtime.handle(soft_delete_again).ok);
+
+    fmt::ipc::Request purge;
+    purge.id = 9;
+    purge.op = "trash.delete";
+    purge.args["argv"] = nlohmann::json::array({file_id});
+    purge.args["force"] = true;
+    FMT_CHECK(runtime.handle(purge).ok);
+
+    const fmt::ipc::Response gone = view_share(10);
+    FMT_CHECK(gone.ok);
+    FMT_CHECK(!gone.data.value("available", true));
+    FMT_CHECK_EQ(gone.data.value("state", std::string{}), std::string("关联文件不可用"));
+    FMT_CHECK(gone.data.value("message", std::string{}).find("已不存在") != std::string::npos);
+
+    // 下载被同一道闸拦住：是 FMT-503（分享的关联文件不可用），不是 FMT-002 / 404
+    fmt::ipc::Request download;
+    download.id = 11;
+    download.op = "share.download";
+    download.args["argv"] = nlohmann::json::array({share_id});
+    const fmt::ipc::Response refused = runtime.handle(download);
+    FMT_CHECK(!refused.ok);
+    FMT_CHECK(refused.error.code == fmt::ErrorCode::ShareFileUnavailable);
+    FMT_CHECK_EQ(fmt::exit_code(refused.error.code), 5);
+}
+
+FMT_TEST(Service, 并发最后一次下载不会超发) {
+    fmt_test::TempDir temp("service-share-race");
+    const auto root = temp / "root";
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(temp / "race.txt", "race me")));
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 1;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"工作"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+
+    fmt::ipc::Request upload;
+    upload.id = 2;
+    upload.op = "file.upload";
+    upload.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(temp / "race.txt")});
+    const fmt::ipc::Response uploaded = runtime.handle(upload);
+    FMT_CHECK(uploaded.ok);
+    const std::string file_id = uploaded.data.value("file_id", std::string{});
+    FMT_CHECK(!file_id.empty());
+
+    fmt::ipc::Request create;
+    create.id = 3;
+    create.op = "share.create";
+    create.args["argv"] = nlohmann::json::array({file_id});
+    const fmt::ipc::Response created = runtime.handle(create);
+    FMT_CHECK(created.ok);
+    const std::string share_id = created.data.value("share_id", std::string{});
+    FMT_CHECK_EQ(share_id.size(), std::size_t{12});
+    FMT_CHECK_EQ(created.data.value("max_download_count", 0), fmt::kDefaultShareDownloads);
+
+    // 先下满 19 次，只剩最后一次
+    const int nearly_done = fmt::kDefaultShareDownloads - 1;
+    for (int i = 0; i < nearly_done; ++i) {
+        fmt::ipc::Request request;
+        request.id = 100 + i;
+        request.op = "share.download";
+        request.args["argv"] = nlohmann::json::array({share_id});
+        FMT_CHECK(runtime.handle(request).ok);
+    }
+
+    // 两个线程同时抢最后一次（§51 的「19 + 两次 = 21」）：
+    // 业务锁（ServerRuntime::handle 全程持 mutex_）保证「检查 + 计数 + 落盘」是一次完成的，
+    // 所以只能有一个成功——没有锁的话这里会变成 21。
+    std::atomic<int> succeeded{0};
+    std::atomic<int> limited{0};
+    std::vector<std::thread> threads;
+    for (int worker = 0; worker < 2; ++worker) {
+        threads.emplace_back([&runtime, &share_id, &succeeded, &limited, worker] {
+            fmt::ipc::Request request;
+            request.id = 200 + worker;
+            request.op = "share.download";
+            request.args["argv"] = nlohmann::json::array({share_id});
+            const fmt::ipc::Response response = runtime.handle(request);
+            if (response.ok) {
+                ++succeeded;
+            } else if (response.error.code == fmt::ErrorCode::ShareDownloadLimitReached) {
+                ++limited;
+            }
+        });
+    }
+    for (std::thread& thread : threads) {
+        thread.join();
+    }
+
+    FMT_CHECK_EQ(succeeded.load(), 1);  // 最后一次只能给一个人
+    FMT_CHECK_EQ(limited.load(), 1);    // 另一个必须是 FMT-502，而不是也成功
+
+    fmt::ipc::Request final_view;
+    final_view.id = 300;
+    final_view.op = "share.get";
+    final_view.args["argv"] = nlohmann::json::array({share_id});
+    const fmt::ipc::Response view = runtime.handle(final_view);
+    FMT_CHECK(view.ok);
+    FMT_CHECK_EQ(view.data.value("download_count", -1), fmt::kDefaultShareDownloads);  // 20，不是 21
+    FMT_CHECK_EQ(view.data.value("state", std::string{}), std::string("下载次数已用尽"));
+    FMT_CHECK(!view.data.value("available", true));
 }
 
 FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {

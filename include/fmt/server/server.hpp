@@ -28,6 +28,14 @@ using BusinessHandler =
 // 但它必须默认是关着的，免得哪天忘了注入就变成裸奔。
 using TokenVerifier = std::function<std::string(const std::string& token)>;
 
+// 上传上限的**取值器**：每次上传请求现取一次（不是启动时的快照）。
+// 为什么是取值器而不是一个数：上限住在 config.json 里，`config set max_upload_size`
+// 只改服务进程里的值、不重启 HTTP 监听；拿快照会让「调大上限」当场失效
+//（HTTP 层还按旧的小值中止接收）。0 = 不限（测试可以这样传）。
+// HTTP 层判的是**收到的字节**（multipart 的普通字段也算），入库前业务层还会按
+// 配置里的值再判一次「文件本身」的大小，所以这一层偏大也不会放过超限文件。
+using UploadLimitProvider = std::function<std::uintmax_t()>;
+
 class HttpServer {
 public:
     HttpServer();
@@ -38,11 +46,9 @@ public:
 
     // 绑定端口并起监听线程。port 传 0 表示让系统分配（测试用）。
     // 绑定失败（端口被占用等）返回错误：调用方记 ERROR 日志，但**不中断**其他功能。
-    // max_upload_size 给流式上传做**边写边判**用（0 = 不限，测试可以这样传）；
-    // 服务端还会在入库前用配置里的值再判一次，所以它偏大也不会放过超限文件。
     Status start(const std::string& host, int port, std::string data_root, Logger* logger,
                  BusinessHandler handler, TokenVerifier verifier,
-                 std::uintmax_t max_upload_size = 0);
+                 UploadLimitProvider upload_limit = nullptr);
 
     // 停止监听并等线程结束；可重复调用。
     void stop();

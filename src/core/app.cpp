@@ -3,6 +3,7 @@
 #include <utility>
 #include <vector>
 
+#include "fmt/common/logger.hpp"
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/storage/storage.hpp"
@@ -160,6 +161,12 @@ Result<std::unique_ptr<AppContext>> initialize_service_context(const std::filesy
     auto context = std::make_unique<AppContext>();
     context->paths = std::move(std::get<std::unique_ptr<PathManager>>(initialized));
 
+    // 日志清理：服务是长期进程，启动时（以及换根之后）先收一次 log/。
+    // 必须在 Logger::open 之前——日志器一开就握着句柄，之后再改名/替换会被挡住。
+    const Result<LogCleanup> cleaned =
+        cleanup_logs(context->paths->log(), kDefaultLogBudgetBytes);
+    const bool log_cleaned = ok(cleaned) && std::get<LogCleanup>(cleaned).over_budget;
+
     Logger::Options options;
     options.info_to_console = false;         // 后台服务没有控制台
     options.warn_error_to_console = false;
@@ -168,6 +175,15 @@ Result<std::unique_ptr<AppContext>> initialize_service_context(const std::filesy
         return *error_of(logger);
     }
     context->logger = std::move(std::get<std::unique_ptr<Logger>>(logger));
+
+    if (log_cleaned) {
+        // 清理那几行写进**新**文件（顺序：先清、再开日志器、再报告）。
+        const LogCleanup& report = std::get<LogCleanup>(cleaned);
+        context->logger->info("Log", report.message);
+        for (const std::string& note : report.notes) {
+            context->logger->info("Log", note);
+        }
+    }
 
     Result<Config> config = load_config(*context->paths);
     if (!ok(config)) {

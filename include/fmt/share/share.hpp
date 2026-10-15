@@ -69,17 +69,27 @@ public:
     ShareService(const PathManager& paths, Config& config, Logger* logger);
 
     // 生成一条 share。文件必须存在、属于当前用户、且不在回收站（§47）。
-    Result<ShareRecord> create(std::string_view file_id);
+    // 参数可以是 `file_id`，也可以是**文件名**（本次改动（未提交））：与 `file get` /
+    // `file delete` 同一套定位规则——先当 file_id 查（全局唯一），查不到再当文件名查
+    // （当前用户 + 当前 Bucket 的正常文件；同名的在别的桶时报 FMT-002 并点名那个桶）。
+    Result<ShareRecord> create(std::string_view file_id_or_name);
     // 按 share_id 查。**过期 / 次数用尽 / 文件进回收站都如实返回状态**，不报「查不到」。
     Result<ShareView> get(std::string_view share_id) const;
-    // 某个文件的所有 share（最近创建的在前）。
-    Result<std::vector<ShareView>> list(std::string_view file_id) const;
+    // 列出 share（最近创建在前）。**参数可空**（本次改动（未提交））：
+    //   给了 key（file_id 或文件名）→ 只列这个文件的；
+    //   空字符串                    → 列出全部（`share list` 不带参数，便于一眼看谁过期/用尽）。
+    Result<std::vector<ShareView>> list(std::string_view file_id_or_name = {}) const;
     // 撤销一条 share（删记录）。
     Result<ShareRecord> remove(std::string_view share_id);
 
     // 下载前记账：全部检查通过才 +1 并落盘，返回要下载的文件（§50/§51）。
     // 由路由层在**业务锁内**调用，所以「19 加两次变 21」不会发生。
     Result<FileRecord> register_download(std::string_view share_id);
+
+    // 把一个「file_id 或文件名」定位到一条文件记录（本次改动（未提交））：
+    // 先当 file_id 查（全局唯一），查不到再当文件名查（当前用户 + 当前 Bucket 的正常文件）。
+    // `create()` 与 `share list` 都用它，保证两处定位规则**只有一份**。
+    Result<FileRecord> resolve(std::string_view file_id_or_name) const;
 
 private:
     Result<std::vector<ShareRecord>> load_shares() const;

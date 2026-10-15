@@ -170,3 +170,153 @@ FMT_TEST(Logger, 上限为零时不轮转) {
     // 全部行都在同一个文件里
     FMT_CHECK_EQ(read_lines(temp.path() / "fmt.log").size(), std::size_t{200});
 }
+
+// ---------------------------------------------------------------------------
+// log/ 的清理（cleanup_logs）：轮转管「单个文件别太大」，它管「整个目录别太大」。
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 造一份带行结构的日志内容：每行 64 字节左右。
+std::string make_log_content(std::size_t lines, const std::string& tag) {
+    std::string content;
+    content.reserve(lines * 80);
+    for (std::size_t i = 0; i < lines; ++i) {
+        content += "2026-10-12 10:00:00 [INFO] [Test] " + tag + " 第 " +
+                   std::to_string(i) + " 行" + std::string(40, 'x') + "\n";
+    }
+    return content;
+}
+
+std::uintmax_t size_of(const std::filesystem::path& path) {
+    std::error_code code;
+    return std::filesystem::file_size(path, code);
+}
+
+}  // namespace
+
+FMT_TEST(Logger, 未超预算时一个字节都不动) {
+    fmt_test::TempDir temp("logger-clean-under");
+    const auto log_dir = temp / "log";
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(log_dir)));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(log_dir / "fmt.log", make_log_content(100, "a"))));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(log_dir / "fmt.log.1", make_log_content(50, "b"))));
+
+    const std::uintmax_t before = size_of(log_dir / "fmt.log");
+    const std::uintmax_t backup_before = size_of(log_dir / "fmt.log.1");
+
+    const auto cleaned = fmt::cleanup_logs(log_dir, 1 * 1024 * 1024);  // 1 MB 预算，远大于占用
+    FMT_CHECK(fmt::ok(cleaned));
+    const fmt::LogCleanup& report = std::get<fmt::LogCleanup>(cleaned);
+    FMT_CHECK(!report.over_budget);
+    FMT_CHECK_EQ(report.removed_backups, std::size_t{0});
+    FMT_CHECK_EQ(report.trimmed_files, std::size_t{0});
+    FMT_CHECK_EQ(report.freed_bytes, std::uintmax_t{0});
+    FMT_CHECK_EQ(report.message.find("未超过上限") != std::string::npos, true);
+
+    // 备份也还在——「没超预算」就是不删不裁，连附加物都不动
+    FMT_CHECK_EQ(size_of(log_dir / "fmt.log"), before);
+    FMT_CHECK_EQ(size_of(log_dir / "fmt.log.1"), backup_before);
+}
+
+FMT_TEST(Logger, 超预算先删备份再裁活动文件) {
+    fmt_test::TempDir temp("logger-clean-over");
+    const auto log_dir = temp / "log";
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(log_dir)));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(log_dir / "fmt.log", make_log_content(4000, "a"))));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(log_dir / "fmt.log.1", make_log_content(2000, "b"))));
+    // 用户手放进 log/ 的东西：清理一律不动
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(log_dir / "notes.txt", "用户自己的笔记")));
+
+    const std::uintmax_t notes_before = size_of(log_dir / "notes.txt");
+    const std::uintmax_t budget = 300 * 1024;
+
+    const auto cleaned = fmt::cleanup_logs(log_dir, budget);
+    FMT_CHECK(fmt::ok(cleaned));
+    const fmt::LogCleanup& report = std::get<fmt::LogCleanup>(cleaned);
+    FMT_CHECK(report.over_budget);
+    FMT_CHECK_EQ(report.removed_backups, std::size_t{1});
+    FMT_CHECK_EQ(report.trimmed_files, std::size_t{1});
+    FMT_CHECK(report.freed_bytes > 0);
+    // 报出来的占用必须与磁盘对得上（**别按字节精确断言**：安全软件/文件系统会在这
+    // 两次 stat 之间碰一下文件，本机实测出现过 2 字节的抖动）。
+    {
+        const std::uintmax_t actual = size_of(log_dir / "fmt.log") + size_of(log_dir / "fmt.log.1") +
+                                      size_of(log_dir / "error.log") + size_of(log_dir / "notes.txt");
+        const std::uintmax_t diff =
+            report.remaining_bytes > actual ? report.remaining_bytes - actual : actual - report.remaining_bytes;
+        FMT_CHECK(diff <= 64);
+    }
+
+    // 备份没了；活动文件被裁到「预算的一半」，但不低于下限 kMinActiveLogBytes
+    //（预算小到一半还不如下限时，保留下限——本用例的 300KB 预算正好落在这个区间）
+    FMT_CHECK(!fmt::file_exists(log_dir / "fmt.log.1"));
+    const std::uintmax_t keep = std::max(budget / 2, fmt::kMinActiveLogBytes);
+    FMT_CHECK(size_of(log_dir / "fmt.log") <= keep + 512);  // +512：裁剪说明那一行
+    FMT_CHECK(size_of(log_dir / "fmt.log") < 354890 - 512);  // 确实比裁剪前（约 346 KB）小
+    const std::string trimmed = read_text(log_dir / "fmt.log");
+    FMT_CHECK(trimmed.find("日志已裁剪") != std::string::npos);
+    // 保留的是**最新**的一段：最后一行还在
+    FMT_CHECK(trimmed.find("第 3999 行") != std::string::npos);
+    FMT_CHECK(trimmed.find("第 0 行") == std::string::npos);
+
+    // 别的文件一个字节都没动
+    FMT_CHECK_EQ(size_of(log_dir / "notes.txt"), notes_before);
+}
+
+FMT_TEST(Logger, 预演只报告不动磁盘) {
+    fmt_test::TempDir temp("logger-clean-dry");
+    const auto log_dir = temp / "log";
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(log_dir)));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(log_dir / "fmt.log", make_log_content(4000, "a"))));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(log_dir / "fmt.log.1", make_log_content(2000, "b"))));
+
+    const std::uintmax_t before = size_of(log_dir / "fmt.log");
+    const std::uintmax_t backup_before = size_of(log_dir / "fmt.log.1");
+    const std::uintmax_t budget = 300 * 1024;
+
+    const auto cleaned = fmt::cleanup_logs(log_dir, budget, /*dry_run=*/true);
+    FMT_CHECK(fmt::ok(cleaned));
+    const fmt::LogCleanup& report = std::get<fmt::LogCleanup>(cleaned);
+    FMT_CHECK(report.dry_run);
+    FMT_CHECK(report.over_budget);
+    FMT_CHECK_EQ(report.removed_backups, std::size_t{1});
+    FMT_CHECK_EQ(report.trimmed_files, std::size_t{1});
+    FMT_CHECK(report.freed_bytes > 0);
+
+    // 磁盘一个字节都没动
+    FMT_CHECK_EQ(size_of(log_dir / "fmt.log"), before);
+    FMT_CHECK_EQ(size_of(log_dir / "fmt.log.1"), backup_before);
+    FMT_CHECK(fmt::file_exists(log_dir / "fmt.log.1"));
+}
+
+FMT_TEST(Logger, 预算为零只删备份不裁活动文件) {
+    fmt_test::TempDir temp("logger-clean-nobudget");
+    const auto log_dir = temp / "log";
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(log_dir)));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(log_dir / "fmt.log", make_log_content(100, "a"))));
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(log_dir / "error.log.1", make_log_content(50, "b"))));
+
+    const std::uintmax_t active_before = size_of(log_dir / "fmt.log");
+
+    const auto cleaned = fmt::cleanup_logs(log_dir, 0);  // 0 = 只删备份
+    FMT_CHECK(fmt::ok(cleaned));
+    const fmt::LogCleanup& report = std::get<fmt::LogCleanup>(cleaned);
+    FMT_CHECK(report.over_budget);
+    FMT_CHECK_EQ(report.removed_backups, std::size_t{1});
+    FMT_CHECK_EQ(report.trimmed_files, std::size_t{0});
+    FMT_CHECK(!fmt::file_exists(log_dir / "error.log.1"));
+    FMT_CHECK_EQ(size_of(log_dir / "fmt.log"), active_before);
+}
+
+FMT_TEST(Logger, 日志目录不存在不是错误) {
+    fmt_test::TempDir temp("logger-clean-missing");
+    const auto cleaned = fmt::cleanup_logs(temp / "log", 1024 * 1024);
+    FMT_CHECK(fmt::ok(cleaned));
+    const fmt::LogCleanup& report = std::get<fmt::LogCleanup>(cleaned);
+    FMT_CHECK(!report.over_budget);
+    FMT_CHECK_EQ(report.removed_backups, std::size_t{0});
+    FMT_CHECK_EQ(report.trimmed_files, std::size_t{0});
+    // 不创建目录：清理不该在磁盘上留下东西
+    FMT_CHECK(!std::filesystem::exists(temp / "log"));
+}
