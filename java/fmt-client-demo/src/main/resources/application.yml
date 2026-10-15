@@ -1,0 +1,51 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: fmt-bridge
+  servlet:
+    multipart:
+      # 上传走桥接 jar 时，Spring 会先把 multipart 落到临时目录；这里放宽到 1GB
+      max-file-size: 1GB
+      max-request-size: 1GB
+
+# ---- FMT 通道配置（starter 提供）----
+fmt:
+  enabled: true
+  # 写 localhost 而不是 127.0.0.1：FMT 默认 host 是 localhost，Windows 上常只绑 IPv6 的 ::1
+  base-url: ${FMT_BASE_URL:http://localhost:4122}
+  # token 三选一（优先上面）：fmt.token / fmt.token-file / fmt.data-root
+  # 推荐用 data-root：token 轮换、服务重装后 Java 侧不用改配置
+  #   fmt.data-root: D:/Tools/fmt
+  # 也可以完全不动配置，用环境变量：FMT_TOKEN=<token> 或 FMT_ROOT=D:/Tools/fmt
+  token: ${FMT_TOKEN:}
+  auth-scheme: X_FMT_TOKEN
+  connect-timeout: 3s
+  request-timeout: 30s
+  stream-timeout: 30m
+  max-connections: 16
+  retry-on-unauthorized: true
+
+# ---- 示例应用自己的开关 ----
+demo:
+  # FMT → Java 的定时拉取（FMT 没有回调，只能拉）
+  pull-enabled: false
+  pull-interval-ms: 60000
+  pull-initial-delay-ms: 5000
+  inbox-dir: ./inbox
+  # 启动时打一遍 ping/status/列文件
+  smoke: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: always
+
+logging:
+  level:
+    org.lazy.fmt.client: INFO

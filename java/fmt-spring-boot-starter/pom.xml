@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.lazy</groupId>
+    <artifactId>fmt-java-parent</artifactId>
+    <version>2.0.0</version>
+  </parent>
+
+  <artifactId>fmt-spring-boot-starter</artifactId>
+  <name>FMT Spring Boot Starter</name>
+  <description>把 FMT 通道接进 Spring Boot 3：一个 FmtChannel bean + 健康检查</description>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.lazy</groupId>
+      <artifactId>fmt-client-core</artifactId>
+    </dependency>
+
+    <!-- 自动配置基础设施 -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-autoconfigure</artifactId>
+    </dependency>
+
+    <!-- 日志桥：把通道的日志出口接到宿主的 slf4j -->
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+    </dependency>
+
+    <!-- 可选：宿主的 ObjectMapper（有就用来编解码，没有就退回内置 SimpleJson） -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <optional>true</optional>
+    </dependency>
+
+    <!-- 可选：Actuator 健康检查（org.springframework.boot.actuate.health.HealthIndicator） -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-actuator</artifactId>
+      <optional>true</optional>
+    </dependency>
+
+    <!-- 生成 fmt.* 的配置元数据，让 IDE 有提示 -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-configuration-processor</artifactId>
+      <optional>true</optional>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <argLine>-Dfile.encoding=UTF-8</argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+</project>

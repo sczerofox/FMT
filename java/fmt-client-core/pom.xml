@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.lazy</groupId>
+    <artifactId>fmt-java-parent</artifactId>
+    <version>2.0.0</version>
+  </parent>
+
+  <artifactId>fmt-client-core</artifactId>
+  <name>FMT Client Core</name>
+  <description>零第三方依赖的 FMT HTTP 通道 SDK（JDK 17 java.net.http）</description>
+
+  <!--
+    刻意**不声明任何 compile/runtime 依赖**：
+      · HTTP 用 JDK 自带的 java.net.http.HttpClient
+      · JSON 用自带的 SimpleJson（可换成 Jackson，见 FmtCodec）
+    这样这个 jar 丢进任何 Java 17 工程都不会和宿主的依赖打架。
+  -->
+  <dependencies>
+    <!--
+      可选：只为了在 FmtResult 上写 @JsonProperty/@JsonIgnore/@JsonInclude，把「直接返回给前端」
+      的 JSON 形状钉成 FMT 的信封（否则 Jackson 会把 isFailure() 当字段、
+      成功响应会丢 data —— 真机踩过）。
+      optional=true：**不会**传递到宿主，宿主没引 Jackson 也照样能用核心包。
+    -->
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-annotations</artifactId>
+      <optional>true</optional>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <argLine>-Dfile.encoding=UTF-8</argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+
+</project>

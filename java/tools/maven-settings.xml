@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  干净的 Maven settings：只走 HTTPS 的 Maven Central。
+
+  为什么需要它：本机 D:\apache-maven-3.8.4\conf\settings.xml 里配了一个
+  **HTTP** 的阿里云镜像（<id>nexus-aliyun</id>，url 以 http:// 开头）。
+  Maven 3.8.1+ 默认拦截外部 HTTP 仓库（maven-default-http-blocker），
+  构建会直接失败。用这份 settings 覆盖即可：
+
+      mvn -s tools/maven-settings.xml clean package
+
+  如果哪天你把 conf/settings.xml 里的镜像改成 https（或删掉），这个文件就可以不用了。
+-->
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 https://maven.apache.org/xsd/settings-1.0.0.xsd">
+
+  <mirrors>
+    <!--
+      默认用阿里云的 HTTPS 公共仓库（central + jcenter 的聚合代理）。
+      本机实测：repo.maven.apache.org 解析到 Cloudflare 的 141.11.77.46 时会连接超时，
+      而 repo1.maven.org 与阿里云都稳定；想换回官方仓库就把下面的 url 改成
+      https://repo1.maven.org/maven2 即可。
+    -->
+    <mirror>
+      <id>aliyun-public-https</id>
+      <mirrorOf>central</mirrorOf>
+      <name>Aliyun Public over HTTPS</name>
+      <url>https://maven.aliyun.com/repository/public</url>
+    </mirror>
+  </mirrors>
+
+</settings>

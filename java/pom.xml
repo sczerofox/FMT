@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  FMT Java 侧聚合工程。
+
+  fmt-client-core       零依赖的「通道」SDK：token 绑在通道上，业务代码不碰 token
+  fmt-spring-boot-starter  Spring Boot 3 自动配置（FmtChannel bean + 健康检查 + Jackson/SLF4J 桥）
+  fmt-client-demo        可执行示例 jar：REST 桥接 + 定时拉取 + 自检
+
+  构建：
+      mvn -s tools/maven-settings.xml clean package
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.3.5</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>org.lazy</groupId>
+  <artifactId>fmt-java-parent</artifactId>
+  <version>2.0.0</version>
+  <packaging>pom</packaging>
+
+  <name>FMT Java Parent</name>
+  <description>FMT（Windows 文件管理工具）的 Java 客户端与 Spring Boot 接入</description>
+
+  <modules>
+    <module>fmt-client-core</module>
+    <module>fmt-spring-boot-starter</module>
+    <module>fmt-client-demo</module>
+  </modules>
+
+  <properties>
+    <java.version>17</java.version>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <fmt.version>2.0.0</fmt.version>
+  </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.lazy</groupId>
+        <artifactId>fmt-client-core</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.lazy</groupId>
+        <artifactId>fmt-spring-boot-starter</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+</project>
