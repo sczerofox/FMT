@@ -8,10 +8,17 @@
 #  安全约定（很重要）：
 #    * 必须用**部署目录里的那个 exe**。用构建目录的 exe 会把服务的数据库
 #      切换到构建目录去（数据根跟着 exe 走），测试完你就"看不到自己的文件"了。
+#    * **对着有真实数据的数据根跑，它会把真实数据搅乱**（这不是猜测，2026-10-16 实测）：
+#      脚本会 `bucket use` 切桶、`file delete` 真实文件（软删除进回收站）、
+#      `trash delete` 永久删掉回收站里原有条目、并往 `data/share.json` 写测试分享。
+#      所以**要么用一次性的数据根**（复制一份 `config/` + `data/` + 空的 `repository/`），
+#      要么跑完后按下面第 14 行的清单逐项复原（`trash list` + `trash restore` 能把软删除的
+#      file 找回来；被永久删除的**找不回来**）。对着真实数据根跑时请先备份 `data/` 与 `trash/`。
 #    * 所有增删都发生在自己创建的测试 Bucket 里，结束时连桶一起删掉。
 #    * **不做 `trash empty` 的实操**：那会连回收站里原有的文件一起永久删除。
 #      只测它的预检与拒绝路径（不带 --yes 必须 FMT-016），并确认原有条目还在。
 #    * 结束时核对：原 Bucket、原文件数、原回收站条目、user.json、share.json、temp/ 全部没变。
+#      **核对只是"报告"，不会自动复原**——这几项一旦不一致，需要你自己按上面的说明收拾。
 # ============================================================================
 param(
     [string]$Exe = 'D:\Data\Temp\JMT\fmt\fmt.exe',
@@ -137,10 +144,31 @@ $clashDir = Join-Path $tmpDir 'clash'
 New-Item -ItemType Directory -Path $clashDir -Force | Out-Null
 [System.IO.File]::WriteAllText((Join-Path $clashDir 'alpha.txt'), 'DIFFERENT-CONTENT-so-md5-differs')
 $clash = FmtRun @('file', 'upload', (Join-Path $clashDir 'alpha.txt'))
-CheckEq '同名（内容不同）被拒（FMT-105，退出码 4）' $script:code 4
-Check '  且报的是 FMT-105 而不是 FMT-304' ($clash -match 'FMT-105')
-CheckEq '同内容（改个名字）先命中 FMT-304' (CliCode @('file', 'upload', (Join-Path $tmpDir 'alpha.txt'), 'alpha-dup.txt')) 4
-CheckEq '内容重复（改个名字）被拒（FMT-304）' (CliCode @('file', 'upload', (Join-Path $tmpDir 'alpha.txt'), 'alpha2.txt')) 4
+CheckEq '内容不同 + 同名被拒（FMT-105，退出码 4）' $script:code 4
+Check '  报的是 FMT-105' ($clash -match 'FMT-105')
+Check '  并提示修改文件名' ($clash -match '修改文件名')
+# 桶内判重（本次改动（未提交））：**先看内容、再看名字**
+#   内容相同（不管名字同不同）→ FMT-304「文件已存在」，不提改名
+#   内容不同 + 名字相同       → FMT-105「文件名重复」，要提改名
+#   内容不同 + 名字不同       → 正常入库
+$sameContentOtherName = FmtRun @('file', 'upload', (Join-Path $tmpDir 'alpha.txt'), 'alpha-dup.txt')
+CheckEq '内容相同 + 换名字被拒（FMT-304，退出码 4）' $script:code 4
+Check '  报的是 FMT-304「文件已存在」' ($sameContentOtherName -match 'FMT-304.*文件已存在')
+Check '  **不**提示修改文件名' ($sameContentOtherName -notmatch '修改文件名')
+$sameContentSameName = FmtRun @('file', 'upload', (Join-Path $tmpDir 'alpha.txt'))
+CheckEq '内容相同 + 同名字被拒（FMT-304，退出码 4）' $script:code 4
+Check '  也**不**提示修改文件名' ($sameContentSameName -notmatch '修改文件名')
+Check '内容不同的新名字可以正常入库' (CliCode @('file', 'upload', (Join-Path $tmpDir 'gamma.txt'), 'brand-new.txt')) 0
+Check '  列表里能看到新文件' ((FmtRun @('file', 'list')) -match 'brand-new\.txt')
+$null = FmtRun @('file', 'delete', 'brand-new.txt', '--yes'); $null = FmtRun @('trash', 'delete', 'brand-new.txt', '--yes')
+# 另一个桶里可以有同名 + 同内容：切过去传，两边都成功
+$otherBucket = $testBucket + '-b'
+CheckEq '新建第二个桶' (CliCode @('bucket', 'create', $otherBucket)) 0
+CheckEq '切到第二个桶' (CliCode @('bucket', 'use', $otherBucket)) 0
+CheckEq '同内容 + 同名在另一个桶可以入库（退出码 0）' (CliCode @('file', 'upload', (Join-Path $tmpDir 'alpha.txt'), 'alpha.txt')) 0
+Check '  第二个桶里能看到它' ((FmtRun @('file', 'list')) -match '共 1 个文件')
+CheckEq '切回原桶' (CliCode @('bucket', 'use', $testBucket)) 0
+Check '原桶的 alpha.txt 还在' ((FmtRun @('file', 'list')) -match 'alpha\.txt')
 CheckEq '不存在的文件（FMT-002）' (CliCode @('file', 'upload', (Join-Path $tmpDir 'nope.bin'))) 3
 CheckEq '与 file_id 同形的名字（FMT-106）' (CliCode @('file', 'upload', (Join-Path $tmpDir 'beta.txt'), 'fmt-20260101-0')) 2
 CheckEq '查不到的文件退出码 3' (CliCode @('file', 'get', 'not-here.txt')) 3
@@ -151,10 +179,35 @@ Check '未知模块提示未实现' ((FmtRun @('server', 'nosuch')) -match 'FMT-
 # 5. 上传上限
 Section '5. 上传大小上限（config）'
 $cfg = FmtRun @('config', 'list')
-Check 'config list 含 token' ($cfg -match '访问 token')
 Check 'config list 含上传上限' ($cfg -match '上传上限')
-$script:token = ([regex]::Match($cfg, '访问 token：([0-9a-f]{32})')).Groups[1].Value
-Check '取到 32 位 token' ($script:token.Length -eq 32)
+Check 'config list 含当前用户（统一风格）' ($cfg -match '当前用户：')
+Check 'config list 含当前 Bucket（统一风格）' ($cfg -match '当前 Bucket：')
+# 大小单位与语言必须**各占一行**（以前挤在同一行）
+$unitLine = (($cfg -split "`n") | Select-String -SimpleMatch '大小单位：' | Select-Object -First 1).Line
+Check '大小单位这一行只放一个字段' ($null -ne $unitLine -and $unitLine -notmatch '语言')
+# Select-String 返回的是 MatchInfo 对象，Check 的第二个参数是 [bool] → 必须显式取布尔，
+# 否则 PowerShell 会抛「无法将 MatchInfo 转换为 Boolean」把整轮冒烟打断（真机踩过）。
+$langLine = ($cfg -split "`n") | Select-String -SimpleMatch '语言：' | Select-Object -First 1
+Check '语言单独一行' ($null -ne $langLine)
+# 两个配置文件按顺序：config.json 在前、server.json 在后
+$cfgAt = $cfg.IndexOf('配置文件：config/config.json')
+$srvAt = $cfg.IndexOf('网络服务配置：config/server.json')
+Check '两个配置文件按顺序输出（config.json 在前）' ($cfgAt -ge 0 -and $srvAt -gt $cfgAt)
+# 本次改动（未提交）：config list 也输出 config/server.json 的公共字段
+Check 'config list 含网络服务 enabled 一行' ($cfg -match '网络服务 enabled：(true|false)')
+Check 'config list 含服务地址 host 一行' ($cfg -match '服务地址 host：')
+Check 'config list 含服务端口 port 一行' ($cfg -match '服务端口 port：\d+')
+# token **默认不打印**（会暴露在屏幕/日志/工单/截图里）
+Check 'config list 默认不打印 token' ($cfg -notmatch '访问 token：[0-9a-f]{32}')
+Check '  且说明怎么显示它' ($cfg -match '已隐藏')
+# 注意：**不在这里动 server_enabled / server_host / server_port**——那会触发
+# 「改完自动重启服务」（提权重装），冒烟脚本不该去动用户的真实服务。
+CheckEq '非法布尔被拒（FMT-001，退出码 2）' (CliCode @('config', 'set', 'server_enabled', 'maybe')) 2
+CheckEq '非法端口被拒（FMT-001，退出码 2）' (CliCode @('config', 'set', 'server_port', '70000')) 2
+# 要 token 得显式加 --show-token（这里只用它取 token，不改任何配置）
+$cfgToken = FmtRun @('config', 'list', '--show-token')
+$script:token = ([regex]::Match($cfgToken, '访问 token：([0-9a-f]{32})')).Groups[1].Value
+Check '--show-token 才给出 token' ($script:token.Length -eq 32)
 CheckEq 'config set 1MB' (CliCode @('config', 'set', 'max_upload_size', '1MB')) 0
 Check 'config list 反映 1048576' ((FmtRun @('config', 'list')) -match '1048576')
 $big = Join-Path $tmpDir 'big.bin'
@@ -185,6 +238,21 @@ Check 'share create 默认 20 次' ($created -match '下载次数：0/20')
 Check 'share create 默认 7 天到期' ($created -match '到期：\d{4}-\d{2}-\d{2}T')
 Check 'share get 状态可用' ((FmtRun @('share', 'get', $shareId)) -match '状态：可用')
 Check 'share list 一条' ((FmtRun @('share', 'list', $alphaId)) -match '共 1 条分享')
+# 完整分享链接（本次改动（未提交））：无论 HTTP 服务有没有开都给
+$shareLink = 'http://localhost:4122/api/share/' + $shareId + '/download'
+Check 'share create 打印完整分享链接' ($created -match [regex]::Escape("分享链接：$shareLink"))
+Check 'share get 也带完整分享链接' ((FmtRun @('share', 'get', $shareId)) -match [regex]::Escape("分享链接：$shareLink"))
+# 按**文件名**创建分享（本次改动（未提交）：与 file get / file delete 同一套定位规则）
+$byName = FmtRun @('share', 'create', 'alpha.txt')
+CheckEq 'share create 收文件名' $script:code 0
+Check '  按文件名创建也回链接' ($byName -match 'api/share/[0-9a-f]{12}/download')
+$byNameId = ([regex]::Match($byName, '(?m)^share_id：([0-9a-f]{12})')).Groups[1].Value
+CheckEq '  名字不存在 → FMT-002（退出码 3）' (CliCode @('share', 'create', 'nope.txt')) 3
+$null = FmtRun @('share', 'delete', $byNameId)
+# file get 的预览 / 下载链接（本次改动（未提交））
+$detail2 = FmtRun @('file', 'get', $alphaId)
+Check 'file get 打印预览链接' ($detail2 -match [regex]::Escape("预览链接：http://localhost:4122/api/file/$alphaId/preview"))
+Check 'file get 打印下载链接' ($detail2 -match [regex]::Escape("下载链接：http://localhost:4122/api/file/$alphaId/download"))
 CheckEq 'share download 记账' (CliCode @('share', 'download', $shareId)) 0
 Check '计数变成 1/20' ((FmtRun @('share', 'get', $shareId)) -match '1/20')
 CheckEq '未知 share get 退出码 3' (CliCode @('share', 'get', '000000000000')) 3
@@ -217,9 +285,34 @@ CheckEq '不带 token 的管理接口 401' $noAuth.StatusCode 401
 CheckEq '错误码是 FMT-018' ((Json $noAuth).error.code) 'FMT-018'
 $bearer = Invoke-WebRequest -Uri "http://localhost:$Port/api/status" -Headers @{ Authorization = "Bearer $script:token" } -SkipHttpErrorCheck
 CheckEq 'Authorization: Bearer 也认（200）' $bearer.StatusCode 200
-$bucket404 = Http '/api/bucket'
-CheckEq '桶接口已下线（404 + FMT-017）' $bucket404.StatusCode 404
-CheckEq '  错误码 FMT-017' ((Json $bucket404).error.code) 'FMT-017'
+# Bucket：只读列表回到 HTTP 面，写接口仍然故意不做
+$bucketList = Json (Http '/api/bucket')
+CheckEq 'GET /api/bucket 只读列表（200）' $bucketList.ok $true
+Check '  带 buckets 与 current_bucket' (($null -ne $bucketList.data.buckets) -and ($null -ne $bucketList.data.current_bucket))
+$bucketWrite = Http '/api/bucket/x'
+CheckEq '桶的写接口仍然没有（404 + FMT-017）' $bucketWrite.StatusCode 404
+CheckEq '  错误码 FMT-017' ((Json $bucketWrite).error.code) 'FMT-017'
+
+# 配置：只读，而且**任何情况下都不回传 token**（连 ?include_token=1 这种开关都不提供）
+$cfg = Json (Http '/api/config')
+CheckEq 'GET /api/config 200（只读）' $cfg.ok $true
+Check '  默认不返回 token' ($null -eq $cfg.data.token)
+Check '  带 max_upload_size' ($cfg.data.max_upload_size -gt 0)
+Check '  塞 ?include_token=1 也不给 token' ($null -eq (Json (Http '/api/config?include_token=1')).data.token)
+
+# 清空回收站：**只测预检与拒绝路径**——真删会把回收站里原有条目一起清掉（见脚本头部约定）
+$trashBefore = (Json (Http '/api/trash')).data.count
+$emptyPlan = Json (Http '/api/trash/empty?dry_run=1' -Method DELETE)
+CheckEq 'DELETE /api/trash/empty?dry_run=1 预检 200' $emptyPlan.ok $true
+Check '  预检的 needs_confirm 与条目数自洽' ($emptyPlan.data.needs_confirm -eq (($emptyPlan.data.files + $emptyPlan.data.buckets) -gt 0))
+if ($emptyPlan.data.needs_confirm) {
+    $refused = Http '/api/trash/empty' -Method DELETE
+    CheckEq '有内容不给 force → 400 + FMT-016' $refused.StatusCode 400
+    CheckEq '  错误码 FMT-016' ((Json $refused).error.code) 'FMT-016'
+} else {
+    CheckEq '回收站为空：不带 force 也直接成功（不为空操作要确认）' (Http '/api/trash/empty' -Method DELETE).StatusCode 200
+}
+CheckEq '预检与拒绝都没动数据（回收站条目数不变）' (Json (Http '/api/trash')).data.count $trashBefore
 $unknown = Http '/api/nosuchthing'
 CheckEq '完全未知路径 404 + FMT-017' $unknown.StatusCode 404
 $fileList = Json (Http "/api/file?search=alpha&page=1&page_size=2")
@@ -244,6 +337,43 @@ $binFile = Join-Path $tmpDir 'probe.bin'
 $upBin = Http '/api/file/upload?name=probe.bin' -Method POST -Body ([System.IO.File]::ReadAllBytes($binFile)) -ContentType 'application/octet-stream'
 $binId = ([regex]::Match($upBin.Content, 'fmt-\d{8}-\d+')).Value
 CheckEq '二进制预览被拒（FMT-701 → 400）' (Http "/api/file/$binId/preview").StatusCode 400
+
+# multipart/form-data：Postman 默认的 form-data、浏览器表单、Spring 的 MultipartFile 那个形状。
+# 用系统自带的 curl.exe（Invoke-WebRequest 要自己算 boundary 与 part 头，太长）。
+# 口径：取**第一个带 filename 的 part**，普通文本字段读掉但不落盘；没有文件 part → FMT-100。
+$mpId = ''
+if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+    $mpFile = Join-Path $tmpDir 'multipart-probe.txt'
+    Set-Content -LiteralPath $mpFile -Value 'multipart-body-0123456789' -NoNewline -Encoding utf8
+    $mpRaw = (& curl.exe -s -X POST "http://localhost:$Port/api/file/upload" `
+            -H "X-FMT-Token: $($script:token)" `
+            -F "file=@$mpFile" -F 'note=这个普通字段不该进文件') | Out-String
+    $mp = $mpRaw | ConvertFrom-Json
+    CheckEq 'multipart 上传 200' $mp.ok $true
+    CheckEq '  part 的 filename 就是落库的名字' $mp.data.file_name 'multipart-probe.txt'
+    CheckEq '  普通字段不落盘（大小就是文件大小）' $mp.data.size 27
+    $mpId = $mp.data.file_id
+    $mpOut = Join-Path $tmpDir 'multipart-out.txt'
+    Invoke-WebRequest -Uri "http://localhost:$Port/api/file/$mpId/download" -Headers @{ 'X-FMT-Token' = $script:token } -OutFile $mpOut -SkipHttpErrorCheck | Out-Null
+    Check '  下载字节与原内容一致' ([System.IO.File]::ReadAllText($mpOut) -eq 'multipart-body-0123456789')
+    $onlyText = ((& curl.exe -s -X POST "http://localhost:$Port/api/file/upload" `
+                -H "X-FMT-Token: $($script:token)" -F 'note=只有文本字段') | Out-String) | ConvertFrom-Json
+    CheckEq '只有普通字段（没有文件 part）→ FMT-100' $onlyText.error.code 'FMT-100'
+} else {
+    Write-Host '  [SKIP] 没找到 curl.exe：跳过 multipart 探针' -ForegroundColor Yellow
+}
+
+# 上限：HTTP 层也吃 config 里的那个值，而且是**每次请求现取**——`config set` 之后
+# 不用重启服务。超限时应该在**收的过程中**就中止：消息是 HTTP 层那句
+# 「请求体超过上传上限（已收 …）」，而不是收完再被业务层拒的「文件超过上传上限（… > … 字节）」。
+CheckEq '把上限降到 1KB' (CliCode @('config', 'set', 'max_upload_size', '1KB')) 0
+$overBody = New-Object byte[] 4096
+$overResp = Http '/api/file/upload?name=http-over-limit.bin' -Method POST -Body $overBody -ContentType 'application/octet-stream'
+CheckEq 'HTTP 超限 → 400' $overResp.StatusCode 400
+$overJson = Json $overResp
+CheckEq '  错误码 FMT-303' $overJson.error.code 'FMT-303'
+Check '  消息来自 HTTP 层（收的过程中就中止，不是收完再拒）' ($overJson.error.message -match '请求体超过上传上限')
+CheckEq '恢复上限 50MB' (CliCode @('config', 'set', 'max_upload_size', '50MB')) 0
 $trashHttp = Json (Http '/api/trash')
 Check 'GET /api/trash 可达且有 entries' ($null -ne $trashHttp.data.entries)
 $shareHttp = Json (Http '/api/share' -Method POST -Body (@{ file_id = $alphaId } | ConvertTo-Json) -ContentType 'application/json')
@@ -259,11 +389,20 @@ CheckEq 'DELETE /api/share 撤销' ((Json (Http "/api/share/$httpShareId")).erro
 
 # 9. 清理
 Section '9. 清理测试数据'
-foreach ($id in @($probeId, $binId)) {
+foreach ($id in @($probeId, $binId, $mpId) | Where-Object { -not [string]::IsNullOrEmpty($_) }) {
     $null = FmtRun @('file', 'delete', $id, '--yes')
     $null = FmtRun @('trash', 'delete', $id, '--yes')
 }
-foreach ($n in $names) { $null = FmtRun @('file', 'delete', $n, '--yes'); $null = FmtRun @('trash', 'delete', $n, '--yes') }
+foreach ($n in @($names)) {
+    $null = FmtRun @('file', 'delete', $n, '--yes')
+    $null = FmtRun @('trash', 'delete', $n, '--yes')
+}
+# 第二个桶里那份同名 + 同内容：整个桶软删除再永久删除
+CheckEq '清理：删掉第二个桶' (CliCode @('bucket', 'delete', $otherBucket, '--yes')) 0
+$otherTrash = ((FmtRun @('trash', 'list')) -split "`n") |
+    Select-String ([regex]::Escape($otherBucket)) | Select-Object -First 1
+$otherTrashName = ([regex]::Match($otherTrash.Line, '->\s+(\S+)')).Groups[1].Value
+CheckEq '清理：永久删除第二个桶的回收站条目' (CliCode @('trash', 'delete', $otherTrashName, '--yes')) 0
 $null = FmtRun @('bucket', 'use', 'lazy')
 $null = FmtRun @('bucket', 'delete', $testBucket, '--yes')   # 这一步是**软删除**（进回收站）
 $trashLine = ((FmtRun @('trash', 'list')) -split "`n") |
