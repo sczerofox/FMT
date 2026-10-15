@@ -6,6 +6,7 @@
 
 #include "fmt/common/string.hpp"
 #include "fmt/core/path.hpp"
+#include "fmt/version.hpp"   // 生成的头（PROJECT_VERSION），测试与程序同源
 #include "fmt_test.hpp"
 
 FMT_TEST(Cli, 版本文本只有一个来源) {
@@ -13,7 +14,10 @@ FMT_TEST(Cli, 版本文本只有一个来源) {
     //（以前窗口里敲 version 是「未知命令」，而 --version 能用）。
     const std::string text = fmt::cli::version_text();
     FMT_CHECK(text.find("File Manager Tool") != std::string::npos);
-    FMT_CHECK(text.find("v1.0") != std::string::npos);
+    // 从生成的 version.hpp 取，别钉死串：升版本（1.0 → 2.0）时这条断言不该跟着改
+    const std::string banner = "v" + std::string(fmt::version::MAJOR)
+            + "." + std::string(fmt::version::MINOR);
+    FMT_CHECK(text.find(banner) != std::string::npos);
     FMT_CHECK(text.find("build") != std::string::npos);
     // 构建日期由 CMake 在配置时生成，所以只断言长度，不钉具体日期
     FMT_CHECK(text.size() > 30);
