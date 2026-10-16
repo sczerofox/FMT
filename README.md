@@ -67,18 +67,23 @@ cmake --build --preset debug
 # 第一次：安装并启动服务（弹一次 UAC，之后不再需要）
 .\cmake-build-debug\bin\fmt.exe service install
 
-# 不带参数运行会进入交互式命令行
+# 不带参数运行会进入交互式命令行；首次启动会提示你建账号
 .\cmake-build-debug\bin\fmt.exe
+#   fmt> user create lazy      输两次密码（回显 *）
+#   fmt> login lazy            登录后才能用业务命令
 
-# 一次性命令
-.\cmake-build-debug\bin\fmt.exe bucket create 工作
-.\cmake-build-debug\bin\fmt.exe file upload D:\某处\报表.xlsx
-.\cmake-build-debug\bin\fmt.exe file list
-.\cmake-build-debug\bin\fmt.exe share create fmt-20261009-0
+# 一次性命令：**业务命令要带登录**（-p 回车后隐藏输入密码）
+.\cmake-build-debug\bin\fmt.exe -u lazy -p bucket create 工作
+.\cmake-build-debug\bin\fmt.exe -u lazy -p file upload D:\某处\报表.xlsx
+.\cmake-build-debug\bin\fmt.exe -u lazy -p file list
+.\cmake-build-debug\bin\fmt.exe -u lazy -p share create fmt-20261009-0
+
+# 不需要登录的：service / log / help / version / user get / user create
+.\cmake-build-debug\bin\fmt.exe service status
 ```
 
 在窗口里 `help` 看全部命令，`help <命令>` 看某一组命令的详细说明
-（例如 `help file`、`help trash`、`help share`、`help config`）。
+（例如 `help file`、`help trash`、`help share`、`help config`、`help login`、`help user`）。
 
 ---
 
@@ -86,13 +91,47 @@ cmake --build --preset debug
 
 | 组 | 子命令 |
 |---|---|
+| `login` | `login [用户名]` `logout`（**业务命令要先登录**） |
 | `service` | `install` `uninstall` `start` `stop` `reinstall` `status` |
+| `user` | `create` `get` `update password` `delete` |
 | `bucket` | `create` `list` `get` `use` `delete` |
 | `file` | `upload` `list` `get` `delete` |
 | `trash` | `list` `get` `restore` `delete` `empty` |
 | `share` | `create` `get` `list` `delete` |
 | `config` | `list` `set` |
 | 其他 | `help [命令]` `version` `exit` / `quit` |
+
+### 账号与登录（一个数据根一个账号）
+
+**账号不再自动创建**：第一次启动会提示你建账号，口令输入时只回显 `*`。
+
+```text
+fmt.exe                       # 首次启动会提示：请先执行 user create <用户名>
+fmt> user create lazy         # 输两次密码（回显 *）→ 写 data/user.json
+fmt> login lazy               # 窗口内登录（回车后隐藏输入密码）
+fmt> file list                # 登录后才能用业务命令
+fmt> logout                   # 退出登录
+
+fmt.exe -u lazy -p            # 等价的命令行方式：输密码后直接进窗口（已登录）
+fmt.exe -u lazy -p file list  # 一次性命令也可以带登录
+```
+
+- **登录态只在本次窗口的内存里**：窗口一关就要重新登录。
+- **不需要登录**：`service *`、`log clean`、`help`、`version`、`exit`、
+  `user get`（看账号状态）、`user create`（还没有账号时得先建）。
+- `user update password` 改密码：**只能改一次**（用 `config.json` 的 `uuid` 判定）；
+  之后要用 `user delete` 删号重建。`user get` 会告诉你还能不能改。
+- `user delete`：先验密码，再**逐字输入 `delete`** 才真删；删除
+  `repository/ trash/ config/ data/ temp/`（只留 `fmt.exe` 与 `log/`），
+  **永久删除、不进回收站、不可撤销**。
+- **口令明文不出 CLI 进程**：CLI 先向服务要口令盐、本地算 PBKDF2 摘要，
+  只把摘要交出去比对。
+- `data/` 下 `user.json`、`file.json`、`share.json`、`trash.json` **缺任何一个**时，
+  程序**一个字节都不写**，报 `FMT-002` 并提示先恢复文件。
+
+> **token 是「临时备用钥匙」**：HTTP 接口的认证协议没有变，`/api/*` 仍然只认
+> `data/user.json` 里的 token（`config list --show-token` 可以看），
+> 所以 Java SDK / Postman / curl 直连照旧可用，不受登录门禁影响。
 
 几个值得知道的：
 
@@ -216,7 +255,7 @@ Authorization: Bearer <你的 token>
 
 或者读数据根下的 `data/user.json`——一个数据根只有一个账号，那个文件**就是这个用户**
 （字段平铺，没有 `users` 数组），token 存在 `token` 字段里，**默认永久有效**；
-密码只存哈希（PBKDF2-SHA256 + 每用户随机盐），明文从不落盘。
+密码只存哈希（PBKDF2-SHA256，10 万轮），明文从不落盘、也从不跨进程。
 
 **每个数据根一个 token，别照抄文档里的值**：文档与 SDK 示例里的 32 位十六进制串都是
 占位符，服务端只认**它自己数据根** `data/user.json` 里那一个。抄错了会拿到
@@ -363,12 +402,14 @@ pwsh -File tools/build.ps1 -Test
 #   String  Time  Trash  Validation
 ```
 
-173 个用例，覆盖文件名与路径校验、Bucket/File/Trash/Share 全流程、错误码与退出码、
-配置与存储的并发写、日志轮转、命名管道协议、HTTP 路由与状态码、认证、流式上传下载、
+180 个用例，覆盖文件名与路径校验、Bucket/File/Trash/Share 全流程、错误码与退出码、
+账号（建号 / 改密只能一次 / 老账号随机盐兼容）、登录门禁、配置与存储的并发写、
+日志轮转、命名管道协议、HTTP 路由与状态码、认证、流式上传下载、
 以及**用真实 exe + 真实管道**跑的端到端用例。
 
-> 端到端测试会把管道名换成唯一的 `FMT_PIPE`，并用 `FMT_NO_SERVICE=1` 禁止子进程
-> 触碰 Windows 服务管理——测试**不能**改动你机器上已安装的服务。
+> 端到端测试会把管道名换成唯一的 `FMT_PIPE`、把单实例互斥体换成唯一的 `FMT_MUTEX`，
+> 并用 `FMT_NO_SERVICE=1` 禁止子进程触碰 Windows 服务管理——测试**不能**改动你机器上
+> 已安装的服务，也不会因为你正开着 FMT 窗口而失败。
 
 ---
 
@@ -405,6 +446,8 @@ docx/            设计文档
 - **HTTP 客户端形态的 CLI**（CLI 走管道；HTTP 可关闭、端口可能被占）
 - **多用户与权限系统**（`data/user.json` 就是那一个账号，字段平铺；`current_user` 目前是占位名
   `user`。HTTP 侧只有这个账号 + token，不是多用户体系，也没有角色与权限）
+- **HTTP 侧的登录接口**（CLI 已有登录门禁，但 HTTP 仍然只认 token——token 就是那颗
+  「临时备用钥匙」；要做「像 MySQL 那样用 jar 登录」时会**新增**接口，不动现有认证）
 - **HTTP 的 Bucket 写接口**（创建/切换/删除桶由 CLI 管，HTTP 只有 `GET /api/bucket` 这个只读列表；
   HTTP 的文件类接口都作用在**当前** Bucket 上）
 

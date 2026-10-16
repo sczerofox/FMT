@@ -64,6 +64,13 @@ void log_error(std::string_view module, const std::string& message);
 struct Options {
     std::string self_path;  // 本进程 exe 的绝对路径（提权副本要用同一个文件）
     std::string data_root;  // 要声明的数据根 = 本 exe 所在目录
+
+    // `fmt -u <用户名> -p`：进入交互模式前先登录。
+    //
+    // 登录态只活在本次进程的内存里（用户要求：窗口关掉就要重新登录），
+    // 所以这里只带"用户名 + 要不要登录"，口令由 read_password_masked 当场读。
+    bool login_requested = false;
+    std::string login_user;
 };
 
 // 进程入口的 CLI 分支：带参数执行一次，无参数进入交互循环。
@@ -95,6 +102,15 @@ std::string version_text();
 // 的数据根换成它自己所在目录——桶、文件、回收站会整体变成另一个目录的内容，
 // 而这件事原来只写进日志，用户在控制台上看不到。
 std::string root_switch_notice(const std::string& previous, const std::string& current);
+
+// 隐藏输入口令：逐字符读，回显只用 `*`，支持退格。
+//
+// Windows 控制台走 `_getch()`，所以输入期间控制台里**不会出现明文**（历史、截图、
+// 录屏都拿不到）。stdin 被重定向时（脚本、自动化测试）退回按行读——那些场景本来就
+// 没有"屏幕"，交互式回显无从谈起。
+//
+// 返回 false 表示输入被中断（Ctrl+C / EOF），调用方应放弃本次操作。
+bool read_password_masked(const char* prompt, std::string* out);
 
 // 提权执行一条 service 命令，结果经临时文件回传（见 §13.8.5）。
 struct ElevatedOutcome {

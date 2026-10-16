@@ -28,6 +28,16 @@ struct Config {
     std::uint64_t max_upload_size = 52428800;  // 50 MB
     std::string size_unit = "MB";
     std::string language = "zh-CN";
+
+    // data/user.json 的 MD5（32 位小写十六进制）。用途只有一个：
+    // **判定「密码是否已经改过一次」**。
+    //   * `user create` 写完账号后，把当时 user.json 的 MD5 记在这里；
+    //   * `user update password` 先比对：一致 == 还是原始文件，允许改一次；
+    //     改完把新的 MD5 写回来，于是它与 user.json 再也不一致，
+    //     下一次改密就被拒绝，提示「删除用户重新创建」。
+    // 空串表示「还没记过」（老数据根）——那种情况按「允许改一次」处理，
+    // 改完立刻把 MD5 补上。
+    std::string uuid;
 };
 
 // config/server.json

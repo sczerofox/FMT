@@ -8,6 +8,7 @@
 #include <system_error>
 #include <vector>
 
+#include "fmt/common/hash.hpp"
 #include "fmt/common/string.hpp"
 #include "fmt/common/time.hpp"
 #include "fmt/core/path.hpp"
@@ -91,17 +92,8 @@ nlohmann::json to_json(const UserRecord& record) {
     return item;
 }
 
-// 常量时间比较：token / 密码哈希都不该因为比较提前返回而泄漏信息。
-bool constant_time_equal(std::string_view left, std::string_view right) {
-    if (left.size() != right.size()) {
-        return false;
-    }
-    unsigned char diff = 0;
-    for (std::size_t i = 0; i < left.size(); ++i) {
-        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
-    }
-    return diff == 0;
-}
+// 口令盐的固定派生盐：换个字符串就等于换一套盐，改了要当成不兼容变更。
+constexpr const char* kDirectorySaltContext = "fmt:user-salt:v1";
 
 // 文件是不是还停在老形状上：多用户时期的 `"users"` 数组，或者更老的 `"buckets"`
 // 副本（桶以 repository/<user>/ 下的真实目录为准，这份副本早就不该存在）。
@@ -112,6 +104,18 @@ bool needs_rewrite(const std::string& raw) {
 }
 
 }  // namespace
+
+// 常量时间比较：token / 口令摘要 / 应答值都不该因为比较提前返回而泄漏信息。
+bool constant_time_equal(std::string_view left, std::string_view right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
+    }
+    return diff == 0;
+}
 
 std::string random_hex(int bytes) {
     if (bytes <= 0) {
@@ -148,6 +152,28 @@ std::string password_hash(std::string_view password, std::string_view salt_hex, 
         return {};
     }
     return to_hex(digest, sizeof(digest));
+}
+
+std::string directory_salt(std::string_view username) {
+    // 用用户名当"口令"、固定串当"盐"跑一次 PBKDF2：结果确定、16 字节、十六进制。
+    const std::string derived = password_hash(username, md5_hex(kDirectorySaltContext),
+                                             kDefaultUserIterations);
+    return derived.empty() ? std::string{} : derived.substr(0, kSaltBytes * 2);
+}
+
+std::string password_digest(std::string_view password, std::string_view salt_hex) {
+    if (salt_hex.empty()) {
+        return {};
+    }
+    return password_hash(password, salt_hex, kDefaultUserIterations);
+}
+
+bool verify_password_digest(std::string_view stored_digest_hex,
+                            std::string_view presented_digest_hex) {
+    if (stored_digest_hex.empty() || presented_digest_hex.size() != 64) {
+        return false;
+    }
+    return constant_time_equal(stored_digest_hex, presented_digest_hex);
 }
 
 UserStore::UserStore(const PathManager& paths, Config& config) : paths_(paths), config_(config) {}
@@ -192,57 +218,10 @@ Status UserStore::save(const UserRecord& record) const {
     return write_json_file(paths_.user_data(), document);
 }
 
-Result<UserRecord> UserStore::ensure_default(std::string* created_password) {
-    Result<UserRecord> loaded = load();
-    if (!ok(loaded)) {
-        return *error_of(loaded);
-    }
-    const UserRecord existing = std::get<UserRecord>(loaded);
-
-    if (!existing.empty()) {
-        // 已经建过：**不覆盖**（token 与密码都不动）。单用户文件里的那条记录就是
-        // 这个数据根的账号，`config.current_user` 只决定创建时叫什么名字。
-        //
-        // 顺手做一次性迁移：文件还停在老形状（多用户时期的 `"users"` 数组，或更老的
-        // `"buckets"` 副本——桶以 repository/<user>/ 下的真实目录为准）时，用单用户
-        // 形状重写一遍。只在真的还要改时才写，免得每次启动都白写一遍。
-        if (Result<std::string> raw = read_text_file(paths_.user_data());
-            ok(raw) && needs_rewrite(std::get<std::string>(raw))) {
-            if (const Status saved = save(existing); !ok(saved)) {
-                return *error_of(saved);
-            }
-        }
-        return existing;
-    }
-
-    const std::string wanted =
-        config_.current_user.empty() ? std::string("user") : config_.current_user;
-
-    UserRecord created;
-    created.username = wanted;
-    created.user_id = "u-" + random_hex(4);
-    created.password_salt = random_hex(kSaltBytes);
-    const std::string password = random_hex(8);  // 16 位十六进制
-    created.password_hash = password_hash(password, created.password_salt);
-    created.token = random_hex(kTokenBytes);
-    created.created_at = local_datetime_iso();
-    created.updated_at = created.created_at;
-    if (created.user_id.empty() || created.token.empty() || created.password_hash.empty()) {
-        return make_error(ErrorCode::StorageError, "无法生成默认用户的凭证（CSPRNG 失败）");
-    }
-
-    // current_bucket 只是快照（运行时权威是 config.json）。
-    // **桶列表不存副本**：以 repository/<user>/ 下的真实目录为准（用户要求）。
-    created.current_bucket = config_.current_bucket;
-
-    if (const Status saved = save(created); !ok(saved)) {
-        return *error_of(saved);
-    }
-    if (created_password != nullptr) {
-        // 明文只在这里出现一次：调用方负责写进日志，让机主拿得到。
-        *created_password = password;
-    }
-    return created;
+std::string UserStore::record_json_text(const UserRecord& record) {
+    nlohmann::json document = to_json(record);
+    document["version"] = kVersion;
+    return document.dump();
 }
 
 Result<UserRecord> UserStore::find_by_token(std::string_view token) const {

@@ -1285,7 +1285,7 @@ Bucket 级记录**不使用 `file_id`**，用 Bucket 名称标识。常量在
 ```json
 { "version": 1,
   "user_id": "u-b1e7c28f", "username": "user",
-  "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节随机盐>",
+  "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节十六进制盐>",
   "token": "<32 位十六进制，永久有效>", "current_bucket": "lazy",
   "created_at": "…", "updated_at": "…", "last_login_at": "" }
 ```
@@ -1296,16 +1296,19 @@ Bucket 级记录**不使用 `file_id`**，用 Bucket 名称标识。常量在
           **下一次初始化会把老文件里的它清掉**（线上已验证清掉了）。
 current_bucket 保留（用户说以后可能有用），但它只是**快照**——
           运行时的权威仍是 config.json 的 current_bucket。
-密码      只存哈希：PBKDF2-SHA256 **10 万轮** + 每用户盐；初始密码生成后**不落地明文**。
-          V1 没有登录接口，所以拿不到也不影响——**真正的凭证是 token**。
-token     32 位十六进制、**永久有效**；`config list` 会打印它（机主唯一方便拿到的地方）。
-「还没账号」 文件里只有 {"version":1}；补建缺失文件时写的就是它，账号由
-          UserStore::ensure_default() 随后建出来。
-默认账号  在数据根初始化时创建（initialize_root）：**新根会建**；
-          **老根（空数组，或还套着 users 的）也会补建 / 改写**（线上就是这种情况）；
-          **已存在则绝不覆盖**——token、密码哈希与时间戳一个都不动。
-老形状     `{"version":1,"users":[{…}]}` 照读（取第一条）；下一次 ensure_default()
-          顺手把它改写成单用户形状。空的老数组等价于「还没有账号」。
+密码      只存哈希：PBKDF2-SHA256 **10 万轮**；口令明文从不落盘、也从不跨进程。
+盐        **新账号**是 `directory_salt(username)`（确定性派生）；**v1.0 老账号**是
+          16 字节**随机盐**，照读照用。`password_salt` 一律保留，并且**口令派生
+          用的盐始终取自它**——这样老账号升级后口令不会被锁死。
+token     32 位十六进制、**永久有效**；HTTP 的 `/api/*` 就靠它认证。
+          **CLI 日常走登录（`login` / `-u -p`），token 是「临时备用钥匙」**：
+          Java/REST 直连仍然只用 token，服务端认证协议没有变。
+「还没账号」 文件里只有 {"version":1}；补建缺失文件时写的就是它。
+          **账号不再自动创建**：必须由机主 `user create <用户名>`。
+默认账号  **已取消**：`initialize_root` 不再建账号，`UserStore::ensure_default()`
+          已删除（老版本那个账号的口令是随机生成的、谁也不知道，不构成凭证）。
+老形状     `{"version":1,"users":[{…}]}` 照读（取第一条）；下一次初始化会把它
+          改写成单用户形状。空的老数组等价于「还没有账号」。
 ```
 
 > **原口径「V1 不实现完整用户系统，只保留 `{"username":"user"}` 作为扩展入口」已作废**
@@ -9142,19 +9145,24 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
    GET    /api/share/<id>/download   公开（不要 token）；**流式下载第 3 步才做**，
                                      现在 501 + FMT-602
 
-⑤ data/user.json 的最终 schema（**没有桶列表**，提交 bfd89f7）
-   { "version": 1, "users": [ { "user_id": "u-b1e7c28f", "username": "user",
-     "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节随机盐>",
+⑤ data/user.json 的最终 schema（**没有桶列表**，提交 bfd89f7；账号改为机主自建见下）
+   **单用户文件**（一个数据根一个账号，字段平铺在根上）：
+   { "version": 1, "user_id": "u-b1e7c28f", "username": "user",
+     "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节十六进制盐>",
      "token": "<32 位十六进制，永久有效>", "current_bucket": "lazy",
-     "created_at": "…", "updated_at": "…", "last_login_at": "" } ] }
+     "created_at": "…", "updated_at": "…", "last_login_at": "" }
    **buckets 字段已删除**：桶以磁盘上的 repository/<user>/<bucket>/ 为准；
    读的时候忽略老字段，**下一次初始化会把老文件里的它清掉**（线上已验证清掉了）。
    current_bucket 保留（以后可能有用），但只是**快照**——运行时权威仍是 config.json。
-   密码只存哈希（PBKDF2-SHA256 **10 万轮** + 每用户盐），初始密码不落地明文；
-   V1 没有登录接口，**真正的凭证是 token**。
-   默认账号在**数据根初始化**时创建（initialize_root）：新根会建；
-   **已经是 {"users":[],"version":1} 的老根也会补建**（线上就是这种情况）；
-   已存在则**绝不覆盖**。
+   密码只存哈希（PBKDF2-SHA256 **10 万轮**）；口令明文不落地**也不跨进程**。
+   盐：**新账号** `directory_salt(username)`（确定性）；**v1.0 老账号**随机盐照读照用，
+   且口令派生**始终用 password_salt 里那个**——否则老账号口令会被锁死。
+   **账号不再自动创建**（`ensure_default()` 已删除）：必须由机主
+   `user create <用户名>`（提示两次口令、回显 `*`）。
+   **CLI 日常走登录**：`fmt.exe -u <用户名> -p` 或窗口内 `login`；登录态只在内存里
+   （窗口一关就要重新登录）。**服务端认证协议没有变**：管道与 HTTP 仍每请求认 token，
+   所以 Java/REST 直连照旧可用——**token 是「临时备用钥匙」**。
+   「密码只能改一次」靠 config.json 的 `uuid`（user.json 的 MD5）判定，见开发文档 18.5。
 
 ⑥ ⚠ 真事故与防护：FMT_NO_SERVICE（提交 ff237d5）
    端到端交互测试用**无参数**跑真的 fmt.exe → 那是**双击引导** → 引导会装/启动/
@@ -9337,17 +9345,21 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
    账号，数组是多余的一层。JSON 归类因此从「集合」移到「单例」（6.1、7.4）。
 
 ② 「还没有账号」的定义
-   文件里只有 {"version":1}（ensure_root 补建缺失文件时写的就是它）；
-   账号由 initialize_root → UserStore::ensure_default() 建出来。
+   文件里只有 {"version":1}（ensure_root 补建缺失文件时写的就是它）。
+   **账号不再自动创建**（2026-10-17）：必须由机主执行 `user create <用户名>`；
+   `UserStore::ensure_default()` 已删除（老版本那个账号的口令是随机生成的、
+   谁也不知道，不构成凭证）。
    代码侧用**空记录**表示同一件事：UserRecord::empty()（user_id 与 username 都为空）。
 
 ③ 老文件照读 + 一次性改写
-   {"version":1,"users":[{…}]} 仍读得进来（取第一条）；下一次 ensure_default() 发现
+   {"version":1,"users":[{…}]} 仍读得进来（取第一条）；下一次初始化发现
    原文里还有 "users"（或更老的 "buckets"）就按新形状重写一遍——**token、密码哈希、
    创建/更新时间一个都不动**。只在真的还要改时才写，免得每次启动都白写一遍。
-   空的老数组（"users":[]）等价于「还没有账号」，会补建。
+   空的老数组（"users":[]）等价于「还没有账号」。
    数据安全的理由：v1.0 已经发出去，老数据根升级后 token 必须不变——否则 HTTP 调用方
    手里那个 token 会一夜之间 401。
+   **老账号的随机盐同理必须照用**：口令派生始终取 `password_salt`，绝不改写成
+   用户名派生盐——否则老账号的口令会当场验不过（见开发文档 18.4）。
 
 ④ 接口随之收敛
    UserStore::load() -> Result<UserRecord>（原来是 vector）、save(const UserRecord&)
@@ -9357,9 +9369,9 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
    新增 Storage::make_document(1)：{"version":1}，单对象默认结构的唯一来源。
 
 ⑤ 行为口径的一处变化（有意）
-   ensure_default() 不再按 config.current_user 找名字。单用户文件里那条记录**就是**
-   这个数据根的账号，current_user 只决定**创建时**叫什么。名字不一致时**不新建**
-   （旧行为会为「小谷」再建一条，与单用户的前提自相矛盾）。
+   账号名由 `user create <用户名>` 决定，`config.current_user` 只跟随记录；
+   单用户文件里那条记录**就是**这个数据根的账号。
+   名字不一致时**不新建**（旧行为会为「小谷」再建一条，与单用户的前提自相矛盾）。
 
 ⑥ 测试
    共 **158 项**（157 + 净 +1）：`App.老的多用户文件会被改写成单用户形状`、

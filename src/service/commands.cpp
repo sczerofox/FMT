@@ -13,6 +13,7 @@
 #include "fmt/share/share.hpp"
 #include "fmt/trash/trash.hpp"
 #include "fmt/user/user.hpp"
+#include "fmt/user/user_service.hpp"
 
 namespace fmt::service {
 namespace {
@@ -1202,9 +1203,113 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
     return make_error(ErrorCode::InvalidArgument, "未知的分享操作：" + operation);
 }
 
+// 校验「旧口令的摘要」：CLI 侧算好送过来，服务只做常量时间比对。
+//
+// 明文不参与：服务只存单向摘要（见 user.hpp 的 verify_password_digest 说明）。
+Result<UserRecord> take_verified_user(AppContext& context, const nlohmann::json& args,
+                                      const char* operation) {
+    const std::string digest = text_arg(args, "current_digest", std::string{});
+    if (digest.size() != 64) {
+        return make_error(ErrorCode::InvalidArgument,
+                          std::string(operation) + " 缺少当前口令的摘要");
+    }
+    user::UserService users(*context.paths, context.config);
+    return users.verify_digest(digest);
+}
+
+// 用户域：账号的创建 / 查看 / 改密 / 删除前的口令校验。
+//
+// **口令明文从不进这里**：CLI 用 `password_digest(用户名, 口令)` 自己算摘要，
+// 只把摘要发过来。`user.delete` 在这里只做「口令对不对」这一步，
+// 真正删目录由 CLI 本地完成（服务正在跑、持有 log/ 句柄，让它删自己的数据根是踩自己的脚）。
+Result<nlohmann::json> user_command(AppContext& context, const std::string& operation,
+                                    const nlohmann::json& args) {
+    user::UserService users(*context.paths, context.config);
+
+    if (operation == "user.create") {
+        const std::string username = text_arg(args, "username", std::string{});
+        const std::string digest = text_arg(args, "password_digest", std::string{});
+        if (username.empty()) {
+            return make_error(ErrorCode::InvalidArgument, "用法：user create <用户名>");
+        }
+        const Result<UserRecord> created = users.create(username, digest);
+        if (!ok(created)) {
+            return *error_of(created);
+        }
+        const UserRecord& record = std::get<UserRecord>(created);
+
+        nlohmann::json data = nlohmann::json::object();
+        // 口径与 HTTP 的 /api/config 一致：这里**不给 token**（要它用 `config list`）。
+        data["username"] = record.username;
+        data["user_id"] = record.user_id;
+        data["created_at"] = record.created_at;
+        data["path"] = "data/user.json";
+        data["password_changed"] = false;
+        data["message"] = "账号已创建：" + record.username +
+                          "（密码只能修改一次；再次修改需要 user delete 后重建）";
+        return data;
+    }
+
+    if (operation == "user.get") {
+        return users.describe();
+    }
+
+    // 口令校验：CLI 用 user.salt 算好摘要送过来，这里只做常量时间比对。
+    // 登录（`fmt -u <用户名> -p`）与「删除用户前先验口令」都走它。
+    if (operation == "user.verify") {
+        const Result<UserRecord> verified = take_verified_user(context, args, "user verify");
+        if (!ok(verified)) {
+            return *error_of(verified);
+        }
+        nlohmann::json data = nlohmann::json::object();
+        data["username"] = std::get<UserRecord>(verified).username;
+        data["user_id"] = std::get<UserRecord>(verified).user_id;
+        data["path"] = "data/user.json";
+        data["message"] = "登录成功";
+        return data;
+    }
+
+    if (operation == "user.salt") {
+        const Result<std::string> salt = users.password_salt();
+        if (!ok(salt)) {
+            return *error_of(salt);
+        }
+        nlohmann::json data = nlohmann::json::object();
+        data["salt"] = std::get<std::string>(salt);
+        return data;
+    }
+
+    if (operation == "user.update") {
+        const std::string current = text_arg(args, "current_digest", std::string{});
+        const std::string fresh = text_arg(args, "password_digest", std::string{});
+        const Result<std::string> changed = users.update_password(current, fresh);
+        if (!ok(changed)) {
+            return *error_of(changed);
+        }
+        nlohmann::json data = nlohmann::json::object();
+        data["message"] = std::get<std::string>(changed);
+        data["password_changed"] = true;
+        return data;
+    }
+
+    if (operation == "user.delete") {
+        const Result<UserRecord> proved = take_verified_user(context, args, "user delete");
+        if (!ok(proved)) {
+            return *error_of(proved);
+        }
+        nlohmann::json data = nlohmann::json::object();
+        data["username"] = std::get<UserRecord>(proved).username;
+        data["path"] = "data/user.json";
+        data["message"] = "口令已确认，可以删除数据根";
+        return data;
+    }
+
+    return make_error(ErrorCode::InvalidArgument, "未知的用户操作：" + operation);
+}
+
 bool is_known_business(const std::string& operation) {
     for (const std::string_view prefix :
-         {"bucket.", "file.", "share.", "trash.", "config.", "server."}) {
+         {"bucket.", "file.", "share.", "trash.", "config.", "server.", "user."}) {
         if (starts_with(operation, prefix)) {
             return true;
         }
@@ -1236,6 +1341,10 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
 
     if (starts_with(operation, "share.")) {
         return share_command(context, operation, args);
+    }
+
+    if (starts_with(operation, "user.")) {
+        return user_command(context, operation, args);
     }
 
     // 已经登记、还没实现的模块（只剩 server.*）。

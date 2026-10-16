@@ -136,14 +136,14 @@ Result<std::unique_ptr<PathManager>> initialize_root(const std::filesystem::path
         }
     }
 
-    // 账号：HTTP 管理接口的 token 来自 data/user.json。首次运行在这里建默认用户
-    // （用户名取 current_user，默认 "user"），已存在就原样留着、**不覆盖**。
-    // 初始密码不在这里回报：V1 没有登录接口，真正当凭证用的是 token，
-    // 而 token 可以用 `config list` 读出来。
-    if (const Result<UserRecord> user = UserStore(*paths, loaded).ensure_default(nullptr);
-        !ok(user)) {
-        return *error_of(user);
-    }
+    // 账号**不在这里自动建**（用户要求：第一次启动 CLI 时由用户自己 `user create <用户名>`
+    // 并输入密码）。以前这里调 ensure_default() 建一个随机密码的默认账号，那个密码从没
+    // 告诉过任何人，等于每次装完都留一个谁也不知道口令的账号。
+    //
+    // 代价与边界：数据根刚建出来（或 user delete 之后）时 user.json 里只有 `{"version":1}`，
+    // 这时 HTTP 侧没有任何可用 token——这是**预期状态**，CLI 会提示先建账号。
+    // 数据文件补齐仍由上面的 ensure_root 负责；这里只保证 config 的 current_user 有值，
+    // 否则 Bucket 没有落点（repository/<user>/）。
 
     if (auto server = load_server_config(*paths); !ok(server)) {
         return *error_of(server);

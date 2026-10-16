@@ -86,8 +86,20 @@ impl_->server->set_pre_routing_handler([verifier](const Request& request, Respon
 - token 来源：数据根 `data/user.json`。**两种形状都认**：现行是单用户文件、字段平铺
   （`{"user_id":…,"token":…}`），老版本是 `{"users":[{…}]}` 取第一条——客户端不能等服务端先升级
   （真机踩过：部署的 exe 比工作区旧，文件还是 `users` 数组）。人拿 token 靠
-  `fmt.exe config list`（会打印用户 ID / 访问 token / 建议的请求头）。
+  `fmt.exe config list --show-token`（默认隐藏，要显式加开关；会打印用户 ID / 访问 token /
+  建议的请求头）。
   **HTTP 侧拿不到 token**：`GET /api/config` 的响应里永远没有它（见 §2.4 第 2 条）。
+- **CLI 侧已经加了登录，但 HTTP 认证一个字没改**（2026-10-17）：
+  - CLI 现在支持 `fmt.exe -u <用户名> -p`（回车后隐藏输入口令、回显 `*`）与窗口内
+    `login` / `logout`，**业务命令要求先登录**（`service` / `log` / `help` / `version`
+    与 `user get` / `user create` 除外）；登录态**只在 CLI 内存里**，窗口一关就要重新登录。
+  - 那条链路用的是 `user.salt` + 本地 `password_digest()` + `user.verify`：**口令明文不出
+    CLI 进程**，过管道的只有 PBKDF2 摘要。
+  - **对 Java 侧的意义：token 是「临时备用钥匙」**。服务端依然每请求只认 token，本 SDK
+    的 `TokenProvider` / `applyToken()` 流程**完全不受影响**，不需要跟着登录走。
+  - 将来要做「像 MySQL 那样用 jar 登录」时，那是一次**新增接口**（例如
+    `POST /api/auth/login` 收用户名+口令、返回会话或 token），**不是**改用现有认证——
+    现有 token 通路必须保持可用，否则已发布的 SDK 会被一次性打翻。
 
 ### 2.3 信封与状态码
 

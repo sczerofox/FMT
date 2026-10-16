@@ -18,6 +18,7 @@ nlohmann::json to_json(const Config& config) {
     value["max_upload_size"] = config.max_upload_size;
     value["size_unit"] = config.size_unit;
     value["language"] = config.language;
+    value["uuid"] = config.uuid;
     return value;
 }
 
@@ -88,6 +89,7 @@ Result<Config> load_config(const PathManager& paths) {
     read_field(value, "max_upload_size", config.max_upload_size, patched);
     read_field(value, "size_unit", config.size_unit, patched);
     read_field(value, "language", config.language, patched);
+    read_field(value, "uuid", config.uuid, patched);
     config.version = Config::kVersion;
 
     if (patched) {
