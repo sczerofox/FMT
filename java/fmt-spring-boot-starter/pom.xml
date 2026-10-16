@@ -8,6 +8,8 @@
     <groupId>org.lazy</groupId>
     <artifactId>fmt-java-parent</artifactId>
     <version>2.0.0</version>
+    <!-- 见 fmt-client-core/pom.xml 的说明：显式给出，源码树与本地仓库两种布局都对。 -->
+    <relativePath>../pom.xml</relativePath>
   </parent>
 
   <artifactId>fmt-spring-boot-starter</artifactId>
@@ -15,9 +17,18 @@
   <description>把 FMT 通道接进 Spring Boot 3：一个 FmtChannel bean + 健康检查</description>
 
   <dependencies>
+    <!--
+      版本**显式写出来**，不靠父 pom 的 <dependencyManagement> 继承。
+      原因：starter 的 pom 会发布给下游工程读，而继承来的版本（带 ${...} 的那些）
+      **不会被 Maven 填进装好的 pom 里**——下游只看 starter 的 pom 时 core 就解析不出来
+      （真机踩过：把 GitHub Release 里的两个 jar 装到干净的本地仓库后，
+      编译直接「找不到 org.lazy.fmt.client」，core 根本没进 classpath）。
+      显式写在 own pom 里，starter 就自包含了。升级时这一行要跟父 pom 的 <version> 一起改。
+    -->
     <dependency>
       <groupId>org.lazy</groupId>
       <artifactId>fmt-client-core</artifactId>
+      <version>2.0.0</version>
     </dependency>
 
     <!-- 自动配置基础设施 -->
