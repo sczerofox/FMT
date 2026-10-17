@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -23,6 +24,11 @@ std::string local_datetime_iso();
 // share 的 expire_time 用它（到期判断走 parse_datetime_iso() 解析后比时间点，
 // 不靠字符串比较——两种格式只差一个字符，比字符串会踩坑）。
 std::string local_datetime_iso_after_days(int days);
+
+// 当前本地时间 + seconds 秒，格式同 local_datetime_iso()。
+// token 的有效期用它：token_ttl_seconds 是秒级的，按天算会丢掉小时/分钟。
+// 到期判断同样走 parse_datetime_iso() 比时间点，**不要**比字符串。
+std::string local_datetime_iso_after_seconds(std::int64_t seconds);
 
 // 本地日期片段，用于 repository/<user>/<bucket>/YYYY/MM/DD/ 这样的路径。
 struct DateParts {

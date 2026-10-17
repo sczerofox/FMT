@@ -41,8 +41,25 @@ bool username_ok(std::string_view username, std::string* reason) {
     return true;
 }
 
-// 规范化 JSON 文本的 MD5：config.json 的 uuid 存的就是它。
+// 「账号内容」的指纹：config.json 的 uuid 存的就是它，用来判定「密码是否已经改过一次」。
+//
+// **口径（必须守住）**：指纹要排除 **token 相关的三个字段**。
+// token 会因为 `user token renew` 而变，而换 token 与"改没改过密码"是两件事：
+//   * 若把 token 算进指纹，一次换 token 就会让 uuid 与当前记录不一致
+//     → 密码明明没改，却被判成"已经改过"，用户被永久锁死；
+//   * 反过来，若换 token 时重写 uuid，就会把"已改过"的状态抹掉，等于重新放开一次改密。
+// 所以：指纹只覆盖**账号本身**（用户名、口令哈希与盐、时间戳、桶快照），不覆盖凭证轮换。
 std::string record_md5(const UserRecord& record) {
+    UserRecord stable = record;          // 拷一份，只改拷贝
+    stable.token.clear();                // ← 排除
+    stable.token_issued_at.clear();      // ← 排除
+    stable.token_expires_at.clear();     // ← 排除
+    return md5_hex(UserStore::record_json_text(stable));
+}
+
+// 旧口径的指纹（把整份 user.json 都算进去）。只用于**兼容升级**：
+// 老版本写进 uuid 的是它，升级后要能认出"这个账号还没改过密码"。
+std::string record_md5_legacy(const UserRecord& record) {
     return md5_hex(UserStore::record_json_text(record));
 }
 
@@ -115,12 +132,12 @@ Result<UserRecord> UserService::create(std::string_view username,
     record.user_id = "u-" + random_hex(4);
     record.password_salt = directory_salt(record.username);
     record.password_hash = std::string(password_digest_hex);
-    record.token = random_hex(kTokenBytes);
+    // 按 config 的 token_ttl_seconds 签发 token（带有效期）。
     record.created_at = local_datetime_iso();
     record.updated_at = record.created_at;
     record.current_bucket = config_.current_bucket;  // 快照，运行时权威是 config.json
 
-    if (record.user_id.empty() || record.token.empty() || record.password_salt.empty()) {
+    if (!issue_token(config_, record)) {
         return make_error(ErrorCode::StorageError, "无法生成账号凭证（CSPRNG 失败）");
     }
 
@@ -202,7 +219,13 @@ Result<std::string> UserService::update_password(std::string_view current_digest
     // 而下一次进来加载到的正是它，于是"改之前指纹 == uuid"永远成立，可以无限改
     // （真踩过，被 App.初始化数据根不再自动建账号 这条用例钉住）。
     const std::string fingerprint_before_edit = record_md5(record);
-    if (!config_.uuid.empty() && !constant_time_equal(config_.uuid, fingerprint_before_edit)) {
+    // **兼容**：老版本把「整份 user.json 的 MD5」写进 uuid。新指纹不再覆盖 token
+    // 字段（见 record_md5 的说明），所以老账号两种口径都认——否则一个还没改过密码的
+    // 老账号会被判成"已经改过"，机主就被锁死了。
+    const bool never_changed =
+        config_.uuid.empty() || constant_time_equal(config_.uuid, fingerprint_before_edit) ||
+        constant_time_equal(config_.uuid, record_md5_legacy(record));
+    if (!never_changed) {
         return make_error(ErrorCode::PermissionDenied, kPasswordAlreadyChanged);
     }
 
@@ -219,6 +242,57 @@ Result<std::string> UserService::update_password(std::string_view current_digest
         return *error_of(saved);
     }
     return std::string("密码已更新。密码只能修改一次；再次修改需要先 user delete 再 user create。");
+}
+
+// 换发 token：**必须用密码**（用户要求 token 有时效，那就得有一条不依赖 token
+// 自身的续期路径——否则 token 一过期，除了删号重建就没别的办法了）。
+//
+// 与改密的关系：换 token **不消耗**「密码只能改一次」的那一次机会。
+// 因此这里不碰 `updated_at`（它属于"账号内容"），指纹又排除了 token 字段，
+// 换完之后"还没改过密码"的状态原样保留。
+Result<nlohmann::json> UserService::renew_token(std::string_view current_digest_hex) {
+    UserStore store(paths_, config_);
+    Result<UserRecord> loaded = store.load();
+    if (!ok(loaded)) {
+        return *error_of(loaded);
+    }
+    UserRecord record = std::get<UserRecord>(loaded);
+    if (record.empty()) {
+        return make_error(ErrorCode::FileNotFound, "这个数据根还没有账号，请先 user create");
+    }
+    if (!verify_password_digest(record.password_hash, current_digest_hex)) {
+        return make_error(ErrorCode::Unauthorized, "当前密码不正确");
+    }
+
+    // 换之前先记住"还没改过密码"这件事（老账号的 uuid 还是整份文件的 MD5，
+    // 换了 token 之后那个 MD5 就变了，所以必须现在就把它迁移成新指纹）。
+    const bool never_changed =
+        config_.uuid.empty() || constant_time_equal(config_.uuid, record_md5(record)) ||
+        constant_time_equal(config_.uuid, record_md5_legacy(record));
+
+    if (!issue_token(config_, record)) {
+        return make_error(ErrorCode::StorageError, "无法生成新 token（CSPRNG 失败）");
+    }
+    if (const Status saved = store.save(record); !ok(saved)) {
+        return *error_of(saved);
+    }
+    if (never_changed) {
+        config_.uuid = record_md5(record);
+        if (const Status saved = save_config(paths_, config_); !ok(saved)) {
+            return *error_of(saved);
+        }
+    }
+
+    nlohmann::json data = nlohmann::json::object();
+    data["username"] = record.username;
+    data["token"] = record.token;
+    data["token_issued_at"] = record.token_issued_at;
+    data["token_expires_at"] = record.token_expires_at;
+    data["token_expiry_text"] = token_expiry_text(record);
+    data["path"] = "data/user.json";
+    // 旧 token 立刻失效（同一个字段被覆盖），要把话说清楚，别让人拿着旧的到处试。
+    data["message"] = "新 token 已签发，旧 token 立即失效";
+    return data;
 }
 
 Result<nlohmann::json> UserService::describe() const {
@@ -248,6 +322,12 @@ Result<nlohmann::json> UserService::describe() const {
     // 再附一句"账号信息（密码还可以修改一次）"只是把同一件事说两遍
     // （真机测出来的重复行）。
     data["password_changed"] = changed;
+    // token 的**有效期**照实报（这不是凭证，是"什么时候要去换"的信息）。
+    // token 本身不给：要看走 `config list --show-token`。
+    data["token_issued_at"] = record.token_issued_at;
+    data["token_expires_at"] = record.token_expires_at;
+    data["token_expired"] = token_expired(record);
+    data["token_expiry_text"] = token_expiry_text(record);
     // 刻意**不含** password_hash / password_salt / token：读账号信息不该顺手吐凭证。
     return data;
 }

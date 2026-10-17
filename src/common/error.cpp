@@ -21,6 +21,7 @@ constexpr Entry kTable[] = {
     {ErrorCode::ConfirmRequired, "ConfirmRequired", 2, "该操作需要显式确认（force）"},
     {ErrorCode::RouteNotFound, "RouteNotFound", 3, "没有这个接口"},
     {ErrorCode::Unauthorized, "Unauthorized", 5, "缺少或无效的访问 token"},
+    {ErrorCode::TokenExpired, "TokenExpired", 5, "访问 token 已过期"},
     {ErrorCode::FileNotFound, "FileNotFound", 3, "文件不存在"},
     {ErrorCode::FileAlreadyExists, "FileAlreadyExists", 4, "文件已存在"},
     {ErrorCode::PermissionDenied, "PermissionDenied", 5, "权限不足"},

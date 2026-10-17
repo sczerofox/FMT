@@ -317,15 +317,19 @@ void ServerRuntime::restart_http() {
     auto created = std::make_unique<server::HttpServer>();
 
     // token 校验：HTTP 层不认识账号，把这件事交给服务——只有它拿得到
-    // data/user.json 与 config。找不到用户就返回空串，HTTP 层答 401。
-    server::TokenVerifier verifier = [this](const std::string& token) -> std::string {
+    // data/user.json 与 config。**过期也在这里判**（用户要求 token 有时效），
+    // 返回的错误直接变成 401 的信封，所以「过期」与「无效」是两个错误码。
+    server::TokenVerifier verifier = [this](const std::string& token) -> Result<std::string> {
         std::lock_guard<std::mutex> guard(mutex_);
         if (context_ == nullptr) {
-            return {};
+            return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
         }
         UserStore store(*context_->paths, context_->config);
         const Result<UserRecord> found = store.find_by_token(token);
-        return ok(found) ? std::get<UserRecord>(found).username : std::string{};
+        if (!ok(found)) {
+            return *error_of(found);
+        }
+        return std::get<UserRecord>(found).username;
     };
 
     // 上传上限：HTTP 层「边收边判」要用它，而且**每次上传请求现取**——拿启动时的

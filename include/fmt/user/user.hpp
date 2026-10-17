@@ -10,7 +10,9 @@
 //     "username": "user",
 //     "password_hash": "<PBKDF2-SHA256 的十六进制>",
 //     "password_salt": "<16 字节随机盐的十六进制>",
-//     "token": "<32 位十六进制，**永久有效**>",
+//     "token": "<32 位十六进制>",
+//     "token_issued_at": "2026-10-17T03:00:00",
+//     "token_expires_at": "2026-10-24T03:00:00",   // 过期后 HTTP 一律 401（FMT-019）
 //     "current_bucket": "lazy",     // 快照：config.json 才是运行时权威
 //     "created_at": "2026-10-09T20:00:00",
 //     "updated_at": "…",
@@ -26,9 +28,11 @@
 // 空的老数组（`"users":[]`）等价于「还没有账号」。
 //
 // 三条口径：
-//   * **密码只存哈希**（PBKDF2-SHA256 + 每用户随机盐）。文件里永远看不到明文；
-//     初始密码在创建默认用户时生成，V1 没有登录接口，所以拿不到也不影响。
-//   * **token 是管理接口的凭证**：默认永久有效（用户明确要求），随机 32 位十六进制。
+//   * **密码只存哈希**（PBKDF2-SHA256）。文件里永远看不到明文；口令明文也从不跨进程
+//     （CLI 本地派生、只把摘要发过来，见 verify_password_digest）。
+//   * **token 是 HTTP 管理接口的凭证，并且有时效**：`token_ttl_seconds` 决定有效期，
+//     过期后服务一律拒绝（`FMT-019`），要换新得用密码执行 `fmt.exe user token renew`。
+//     没有 `token_expires_at` 的老文件按「已过期」处理，升级后必须换一次。
 //   * **没有「桶列表」字段**：桶以磁盘上真实存在的 `repository/<user>/<bucket>/`
 //     为准（用户要求删掉这份副本——第二份事实来源迟早会对不上）。
 //     `current_bucket` 保留（以后可能有用），但它也只是快照，运行时权威是 config.json。
@@ -52,6 +56,15 @@ struct UserRecord {
     std::string password_hash;
     std::string password_salt;
     std::string token;
+    // token 的签发与失效时间（"YYYY-MM-DDTHH:MM:SS"，本地时间）。
+    //
+    // **token 是有时效的**（用户要求「service 端实现 token 的时效性，过时不能用」）：
+    //   * 两个字段都由 `user create` / `user token renew` 按 `config.json` 的
+    //     `token_ttl_seconds` 写入；
+    //   * `token_expires_at` **为空 = 旧版本签发的永久 token**，按「已过期」处理
+    //     （升级后必须换一次新 token；没有有效期记录的凭证不该继续放行）。
+    std::string token_issued_at;
+    std::string token_expires_at;
     std::string current_bucket;
     std::string created_at;
     std::string updated_at;
@@ -60,6 +73,20 @@ struct UserRecord {
     // 空记录 = 这个数据根还没有账号（load() 用它表示「没有用户」）。
     bool empty() const { return user_id.empty() && username.empty(); }
 };
+
+// token 是否已经过期（含「根本没有 token」「没有有效期记录」「时间解析不了」三种情况：
+// 全都按**过期**处理——说不清有效期的凭证不放行）。
+//
+// 到期判断走 parse_datetime_iso() 比时间点，不靠字符串比较。
+bool token_expired(const UserRecord& record);
+
+// 有效期的可读说明，例如 "2026-10-25T01:30:00（还剩 6 天）"；
+// 已过期返回 "已过期（…）"；没有有效期记录返回 "旧 token 没有有效期记录（按已过期处理）"。
+std::string token_expiry_text(const UserRecord& record);
+
+// 按 config.token_ttl_seconds 生成新的 token 与有效期，写进 record。
+// 返回 false = CSPRNG 失败（record 不动）。
+bool issue_token(const Config& config, UserRecord& record);
 
 // PBKDF2-SHA256 的十六进制摘要；失败返回空串。
 std::string password_hash(std::string_view password, std::string_view salt_hex,

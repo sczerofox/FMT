@@ -289,7 +289,7 @@ void print_command_list() {
     std::printf("可用命令：\n");
     std::printf("  (login)    login [用户名]  logout   登录 / 退出登录（业务命令要先登录）\n");
     std::printf("  (service)  install  uninstall  start  stop  reinstall  status\n");
-    std::printf("  (user)     create  get  update password  delete\n");
+    std::printf("  (user)     create  get  update password  delete  token renew\n");
     std::printf("  (bucket)   create  list  get  use  delete\n");
     std::printf("  (file)     upload  list  get  delete\n");
     std::printf("  (trash)    list  get  restore  delete  empty\n");
@@ -325,9 +325,14 @@ bool print_command_help(const std::string& topic) {
             "                    用户名只允许字母、数字与 _ . -（它同时是目录名）。\n"
             "                    已有账号时拒绝重建——要重建先 user delete。\n"
             "  get               看账号信息（用户名 / 用户 ID / 创建时间 / 当前 Bucket /\n"
-            "                    密码是否还能改）。不打印口令哈希与 token。\n"
+            "                    密码是否还能改 / token 的有效期）。\n"
+            "                    不打印口令哈希与 token。\n"
             "  update password   改密码：先输入当前密码，再输两次新密码。\n"
             "                    密码只能修改一次；已经改过就提示删除用户重新创建。\n"
+            "  token renew       换发访问 token（要密码）。token 有时效，过期后 HTTP\n"
+            "                    一律 401（FMT-019），这条是唯一的续期路径：换完旧 token\n"
+            "                    立刻失效，且不打乱「密码只能改一次」。\n"
+            "                    有效期由 `config set token_ttl 7d` 决定（默认 7 天）。\n"
             "  delete            永久删除这个数据根的全部业务数据（账号、令牌、桶里的文件、\n"
             "                    回收站历史），只保留 fmt.exe 与 log/。\n"
             "                    必须先输入正确密码，再逐字输入 delete 才动手。\n"
@@ -676,6 +681,9 @@ struct Session {
     // 落盘会让"关掉重开"仍然算登录过，所以这里刻意什么都不存。
     bool logged_in = false;
     std::string username;
+    // 登录时算出的口令摘要：`user token renew` 要用它（服务凭摘要换发 token）。
+    // 它是摘要而不是明文——同一个窗口里再问一次密码纯属骚扰。
+    std::string password_digest;
 };
 
 }  // namespace
@@ -694,7 +702,8 @@ int run_user_command(const std::vector<std::string>& parts, Session& session,
 // 口令不出本进程：先向服务要 `user.salt`，本地算出摘要再发去比对（op = user.verify）。
 // 返回服务确认的用户名；调用方把它记进 Session（**只活在内存里**，窗口一关就没了）。
 Result<std::string> verify_login(Session& session, const Options& options,
-                                 const std::string& username, const std::string& password);
+                                 const std::string& username, const std::string& password,
+                                 std::string* digest_out = nullptr);
 
 namespace {
 
@@ -961,6 +970,21 @@ void print_business_data(const nlohmann::json& data, bool show_token = false) {
                             ? "已经修改过一次，不能再改（要重设请 user delete 后 user create）"
                             : "还可以修改一次（user update password）");
         }
+        // token 的有效期：**不给 token 本身**（要看走 config list --show-token），
+        // 但「什么时候过期」必须给——否则用户看到 token 却不知道它还能用多久。
+        if (const auto expiry = data.find("token_expiry_text");
+            expiry != data.end() && expiry->is_string()) {
+            std::printf("token 有效期：%s\n", expiry->get<std::string>().c_str());
+        }
+        // `user token renew` 的响应会带新 token：换发之后不把新值打出来就等于白换。
+        if (const auto token = data.find("token"); token != data.end() && token->is_string()) {
+            std::printf("访问 token：%s\n", token->get<std::string>().c_str());
+            if (const auto issued = data.find("token_issued_at");
+                issued != data.end() && issued->is_string()) {
+                std::printf("token 签发时间：%s\n", issued->get<std::string>().c_str());
+            }
+            std::printf("请求头：X-FMT-Token: %s\n", token->get<std::string>().c_str());
+        }
         // 服务端的提示（例如「密码只能修改一次」）放最后一行。
         if (const auto message = data.find("message");
             message != data.end() && message->is_string()) {
@@ -989,6 +1013,17 @@ void print_business_data(const nlohmann::json& data, bool show_token = false) {
                     static_cast<std::size_t>(max_bytes));
         std::printf("大小单位：%s\n", data.value("size_unit", std::string{}).c_str());
         std::printf("语言：%s\n", data.value("language", std::string{}).c_str());
+        // token 的有效期：**下次签发**用时多长，以及当前这个 token 到什么时候失效。
+        // 放在 token 之前——先让用户知道"还能用多久"，再看凭证本身。
+        if (data.contains("token_ttl_seconds")) {
+            const auto ttl = data.value("token_ttl_seconds", std::uint64_t{0});
+            std::printf("token 有效期（下次签发）：%llu 秒\n",
+                        static_cast<unsigned long long>(ttl));
+        }
+        if (const auto expiry = data.find("token_expiry_text");
+            expiry != data.end() && expiry->is_string()) {
+            std::printf("token 当前有效期：%s\n", expiry->get<std::string>().c_str());
+        }
 
         // 网络服务（config/server.json）：文件路径 + 开关 / 监听地址 / 端口。
         // 格式按用户要求：`网络服务 enabled：true`、`服务地址 host：localhost`、
@@ -1442,7 +1477,8 @@ bool ask_password_twice(const char* what, std::string* out) {    std::string fir
 // 三步：要口令盐（user.salt）→ 本地算摘要 → 发去比对（user.verify）。
 // **口令明文不出本进程**；登录态由调用方写进 Session 的内存字段。
 Result<std::string> verify_login(Session& session, const Options& options,
-                                 const std::string& username, const std::string& password) {
+                                 const std::string& username, const std::string& password,
+                                 std::string* digest_out) {
     if (username.empty()) {
         return make_error(ErrorCode::InvalidArgument, "请给出用户名：fmt -u <用户名> -p");
     }
@@ -1474,6 +1510,9 @@ Result<std::string> verify_login(Session& session, const Options& options,
     const std::string digest = fmt::password_digest(password, salt);
     if (digest.empty()) {
         return make_error(ErrorCode::StorageError, "无法计算口令摘要（CSPRNG/PBKDF2 失败）");
+    }
+    if (digest_out != nullptr) {
+        *digest_out = digest;  // 供同一窗口内的 user token renew 复用，免得再问一次密码
     }
 
     // ③ 比对
@@ -1595,6 +1634,69 @@ int run_user_command(const std::vector<std::string>& parts, Session& session,
         request.args["password_digest"] = digest;  // 只有摘要过管道，没有明文
     } else if (verb == "get") {
         request.op = "user.get";
+    } else if (verb == "token") {
+        // `user token renew`：换发访问 token。**token 有时效**（用户要求「过时不能用」），
+        // 过期后这是唯一的续期路径——凭密码，不凭旧 token（旧 token 已经不能用了）。
+        if (parts.size() < 3 || parts[2] != "renew") {
+            std::fprintf(stderr, "用法：user token renew\n");
+            return exit_code(ErrorCode::InvalidArgument);
+        }
+
+        // 摘要优先用登录时算好的那一份（同一个窗口里不用再问一遍密码）；
+        // 没登录过就当场问一次。明文始终不出本进程。
+        std::string digest = session.password_digest;
+        if (digest.empty()) {
+            std::string username;
+            std::string salt;
+            {
+                ipc::Request who = request;
+                who.op = "user.get";
+                who.id = session.next_id++;
+                Result<ipc::Response> named = session.client.call(who, ipc::kCommandTimeoutMs);
+                if (!ok(named)) {
+                    session.connected = false;
+                    print_failure(*error_of(named));
+                    return exit_code(error_of(named)->code);
+                }
+                if (!std::get<ipc::Response>(named).ok) {
+                    print_failure(std::get<ipc::Response>(named).error);
+                    return exit_code(std::get<ipc::Response>(named).error.code);
+                }
+                username = std::get<ipc::Response>(named).data.value("username", std::string{});
+            }
+            {
+                ipc::Request want = request;
+                want.op = "user.salt";
+                want.id = session.next_id++;
+                Result<ipc::Response> got = session.client.call(want, ipc::kCommandTimeoutMs);
+                if (!ok(got)) {
+                    session.connected = false;
+                    print_failure(*error_of(got));
+                    return exit_code(error_of(got)->code);
+                }
+                if (!std::get<ipc::Response>(got).ok) {
+                    print_failure(std::get<ipc::Response>(got).error);
+                    return exit_code(std::get<ipc::Response>(got).error.code);
+                }
+                salt = std::get<ipc::Response>(got).data.value("salt", std::string{});
+            }
+            std::string password;
+            if (!read_password_masked("请输入密码：", &password)) {
+                return exit_code(ErrorCode::InvalidArgument);
+            }
+            digest = fmt::password_digest(password, salt);
+            password.assign(password.size(), '\0');
+            if (digest.empty()) {
+                std::fprintf(stderr, "无法计算口令摘要（CSPRNG/PBKDF2 失败）\n");
+                return exit_code(ErrorCode::StorageError);
+            }
+            session.logged_in = true;
+            session.username = username;
+            session.password_digest = digest;
+        }
+
+        request.op = "user.token.renew";
+        request.args["current_digest"] = digest;
     } else if (verb == "update") {
         // update 目前只有 password 一项（用户的原话是「user update password」），
         // 命令里仍然显式写出来：以后加别的可改项时，这条语法不用改。
@@ -2082,7 +2184,8 @@ int run_interactive(const Options& options, service::State state, Session& sessi
                 print_failure(*error_of(status));
             } else {
                 const Result<std::string> who =
-                    verify_login(session, options, options.login_user, password);
+                    verify_login(session, options, options.login_user, password,
+                                 &session.password_digest);
                 if (ok(who)) {
                     session.logged_in = true;
                     session.username = std::get<std::string>(who);
@@ -2165,7 +2268,8 @@ int run_interactive(const Options& options, service::State state, Session& sessi
             if (!read_password_masked("请输入密码：", &password)) {
                 continue;
             }
-            const Result<std::string> verified = verify_login(session, options, who, password);
+            const Result<std::string> verified =
+                verify_login(session, options, who, password, &session.password_digest);
             password.assign(password.size(), '\0');
             if (ok(verified)) {
                 session.logged_in = true;
@@ -2222,8 +2326,10 @@ int run_interactive(const Options& options, service::State state, Session& sessi
         // 还得靠它们把机器救回来。
         //
         // 例外：`user create`（还没有账号时得先能建）与 `user get`（看账号状态）。
+        // `token renew` 自带密码校验（服务端凭摘要签发），所以不需要先登录。
         const bool user_readonly_ok =
-            (head == "user" && parts.size() >= 2 && (parts[1] == "create" || parts[1] == "get"));
+            (head == "user" && parts.size() >= 2 &&
+             (parts[1] == "create" || parts[1] == "get" || parts[1] == "token"));
         if (!session.logged_in && !user_readonly_ok && !business_allowed(head, !need_account)) {
             // 提示要**能照着做**：窗口里直接 `login` 就行。
             // 曾经写的是「请重新打开窗口并登录：fmt -u <用户名> -p」——那时候窗口内
@@ -2231,7 +2337,7 @@ int run_interactive(const Options& options, service::State state, Session& sessi
             std::printf(
                 "需要先登录才能执行 %s。\n"
                 "本窗口内登录：login <用户名>      （回车后隐藏输入密码）\n"
-                "不需要登录：service / log / help / version / user get / user create\n",
+                "不需要登录：service / log / help / version / user get / user create / user token renew\n",
                 command_label(parts).c_str());
             continue;
         }
@@ -2480,7 +2586,8 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
                 print_failure(*error_of(status));
                 return exit_code(error_of(status)->code);
             }
-            const Result<std::string> who = verify_login(session, options, login_user, password);
+            const Result<std::string> who =
+                verify_login(session, options, login_user, password, &session.password_digest);
             password.assign(password.size(), '\0');
             if (!ok(who)) {
                 print_failure(*error_of(who));
@@ -2497,7 +2604,7 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
             // `user get`（看账号状态）不需要登录。
             const bool user_readonly_ok =
                 (rest[0] == "user" && rest.size() >= 2 &&
-                 (rest[1] == "create" || rest[1] == "get"));
+                 (rest[1] == "create" || rest[1] == "get" || rest[1] == "token"));
             if (!user_readonly_ok) {
                 const std::string label = command_label(rest);
                 std::fprintf(stderr,

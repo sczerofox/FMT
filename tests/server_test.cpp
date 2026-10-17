@@ -24,8 +24,11 @@ namespace {
 constexpr const char* kTestToken = "test-token-0123456789abcdef";
 
 fmt::server::TokenVerifier test_verifier() {
-    return [](const std::string& token) -> std::string {
-        return token == kTestToken ? std::string("user") : std::string{};
+    return [](const std::string& token) -> fmt::Result<std::string> {
+        if (token == kTestToken) {
+            return std::string("user");
+        }
+        return fmt::make_error(fmt::ErrorCode::Unauthorized, "token 无效");
     };
 }
 
@@ -190,6 +193,33 @@ FMT_TEST(Server, 管理接口要token且桶写接口未提供) {
         }
     }
 
+    server.stop();
+}
+
+// token 过期与「token 不对」必须是**两个错误码**：前者客户端该去 renew，
+// 后者是凭证抄错了。HTTP 层只负责把校验器给的错误原样装进 401 信封。
+FMT_TEST(Server, token过期返回FMT019而不是FMT018) {
+    fmt_test::TempDir temp("server-token-expired");
+    const auto root = temp / "root";
+    fmt::server::HttpServer server;
+    // 校验器把"过期"这件事说清楚（生产里由 UserStore::find_by_token 给出）。
+    fmt::server::TokenVerifier expired = [](const std::string&) -> fmt::Result<std::string> {
+        return fmt::make_error(fmt::ErrorCode::TokenExpired,
+                               "访问 token 已过期（2026-01-01T00:00:00）");
+    };
+    FMT_CHECK(fmt::ok(server.start("127.0.0.1", 0, fmt::path_to_utf8(root), nullptr, {}, expired)));
+
+    httplib::Client client("127.0.0.1", server.port());
+    client.set_default_headers({{"X-FMT-Token", kTestToken}});
+    const auto response = client.Get("/api/file");
+    FMT_CHECK(response != nullptr);
+    if (response != nullptr) {
+        FMT_CHECK_EQ(response->status, 401);
+        const nlohmann::json body = nlohmann::json::parse(response->body);
+        FMT_CHECK_EQ(body["error"]["code"].get<std::string>(), std::string("FMT-019"));
+        // 消息里要写明怎么办，否则客户端只知道"过期了"却不知道去哪换。
+        FMT_CHECK_EQ(body["ok"].get<bool>(), false);
+    }
     server.stop();
 }
 

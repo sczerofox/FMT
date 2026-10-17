@@ -5,6 +5,9 @@
 #include <bcrypt.h>
 
 #include <cstdio>
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <system_error>
 #include <vector>
 
@@ -70,6 +73,8 @@ UserRecord from_json(const nlohmann::json& item) {
     record.password_hash = item.value("password_hash", std::string{});
     record.password_salt = item.value("password_salt", std::string{});
     record.token = item.value("token", std::string{});
+    record.token_issued_at = item.value("token_issued_at", std::string{});
+    record.token_expires_at = item.value("token_expires_at", std::string{});
     record.current_bucket = item.value("current_bucket", std::string{});
     record.created_at = item.value("created_at", std::string{});
     record.updated_at = item.value("updated_at", std::string{});
@@ -85,6 +90,8 @@ nlohmann::json to_json(const UserRecord& record) {
     item["password_hash"] = record.password_hash;
     item["password_salt"] = record.password_salt;
     item["token"] = record.token;
+    item["token_issued_at"] = record.token_issued_at;
+    item["token_expires_at"] = record.token_expires_at;
     item["current_bucket"] = record.current_bucket;
     item["created_at"] = record.created_at;
     item["updated_at"] = record.updated_at;
@@ -176,6 +183,63 @@ bool verify_password_digest(std::string_view stored_digest_hex,
     return constant_time_equal(stored_digest_hex, presented_digest_hex);
 }
 
+bool token_expired(const UserRecord& record) {
+    if (record.token.empty()) {
+        return true;  // 没有 token 等于不能用
+    }
+    if (record.token_expires_at.empty()) {
+        // 旧版本签发的永久 token：**没有有效期记录的凭证不再放行**。
+        // 用户要求「过时不能用」，那就不能有"永远不过时"这条后门。
+        return true;
+    }
+    const auto expires = parse_datetime_iso(record.token_expires_at);
+    const auto now = parse_datetime_iso(local_datetime_iso());
+    if (!expires.has_value() || !now.has_value()) {
+        return true;  // 解析不了：宁可拒绝，也不要放过一个说不清有效期的凭证
+    }
+    return *now >= *expires;
+}
+
+std::string token_expiry_text(const UserRecord& record) {
+    if (record.token.empty()) {
+        return "没有 token";
+    }
+    if (record.token_expires_at.empty()) {
+        return "旧 token 没有有效期记录（按已过期处理）";
+    }
+    if (token_expired(record)) {
+        return "已过期（" + record.token_expires_at + "）";
+    }
+    // 剩余时间按秒算，再折成「天/小时/分钟」里最大的那一档，够用且不啰嗦。
+    const auto expires = parse_datetime_iso(record.token_expires_at);
+    const auto now = parse_datetime_iso(local_datetime_iso());
+    std::string left;
+    if (expires.has_value() && now.has_value()) {
+        const auto seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(*expires - *now).count();
+        if (seconds >= 86400) {
+            left = "还剩 " + std::to_string(seconds / 86400) + " 天";
+        } else if (seconds >= 3600) {
+            left = "还剩 " + std::to_string(seconds / 3600) + " 小时";
+        } else {
+            left = "还剩 " + std::to_string(std::max<std::int64_t>(seconds / 60, 1)) + " 分钟";
+        }
+    }
+    return record.token_expires_at + (left.empty() ? "" : "（" + left + "）");
+}
+
+bool issue_token(const Config& config, UserRecord& record) {
+    const std::string token = random_hex(kTokenBytes);
+    if (token.empty()) {
+        return false;
+    }
+    record.token = token;
+    record.token_issued_at = local_datetime_iso();
+    record.token_expires_at =
+        local_datetime_iso_after_seconds(static_cast<std::int64_t>(config.token_ttl_seconds));
+    return true;
+}
+
 UserStore::UserStore(const PathManager& paths, Config& config) : paths_(paths), config_(config) {}
 
 Result<UserRecord> UserStore::load() const {
@@ -236,6 +300,17 @@ Result<UserRecord> UserStore::find_by_token(std::string_view token) const {
     // 常量时间比较：token 是凭证，比较不该泄漏前缀信息。
     if (record.empty() || !constant_time_equal(record.token, token)) {
         return make_error(ErrorCode::Unauthorized, "token 无效");
+    }
+    // **时效**（用户要求「service 端实现 token 的时效性，过时不能用」）。
+    // 单独一个错误码 FMT-019，好让客户端把「过期」和「无效」分开处理：
+    // 前者该去 renew，后者是凭证抄错了。
+    if (token_expired(record)) {
+        // 消息要**自解释**：说清是过期（而不是抄错），并给出唯一的补救办法。
+        // 有效期用 token_expiry_text 统一描述——它在「没有有效期记录」时不会留下
+        // 一对空括号（真机踩过："访问 token 已过期（）。"）。
+        return make_error(ErrorCode::TokenExpired,
+                          "访问 token 已过期：" + token_expiry_text(record) +
+                              "。请用密码执行 `fmt.exe user token renew` 换新的");
     }
     return record;
 }

@@ -27,6 +27,7 @@
 | 通道建立 | 建 `FmtChannel` 时把凭证交给通道；通道内部一个 `HttpClient`（连接池） | 只看到 `FmtChannel fmt` |
 | 请求注入 | 通道内部**唯一一处** `applyToken()` 给每个请求写 `X-FMT-Token` | 看不到 token 参数 |
 | 凭证失效 | 收到 `401 + FMT-018` → 作废缓存 → 重取 → **自动重试一次** | 看不到，业务无感 |
+| 凭证过期 | 收到 `401 + FMT-019` → **不重试**（文件里那个 token 也已过期），抛出可识别的错误提示去跑 `fmt.exe user token renew` | 需要人工续期 |
 
 也就是说：
 
@@ -82,7 +83,15 @@ impl_->server->set_pre_routing_handler([verifier](const Request& request, Respon
   - `GET /api/ping` —— 健康检查；
   - `GET /api/share/<share_id>/download` —— 分享链接本身即凭证。
 - 请求头两种写法（服务端 `header_token()`）：`X-FMT-Token: <token>` 优先，其次 `Authorization: Bearer <token>`。
-- 校验失败：**`401` + `FMT-018`**。
+- 校验失败：**`401` + `FMT-018`**（缺 token / token 不对）。
+- **token 有时效**（2026-10-18 起）：过期后 **`401` + `FMT-019 TokenExpired`**。
+  - 有效期在 `data/user.json` 的 `token_expires_at`；默认 **7 天**（`config set token_ttl 7d`）。
+  - **`FMT-019` 不能靠"重读 user.json 再试一次"自愈**：文件里那个 token 本身就已经过期了。
+    这一条与 §4.2 的 401 自愈是两码事，SDK 必须把它当**不可恢复**处理。
+  - 唯一的续期路径是**用密码**在 CLI 执行 `fmt.exe user token renew`
+    （换完旧 token 立即失效）。也就是说：**Java 侧无法自行续期**，过期后需要人介入。
+    如果将来要「像 MySQL 那样用 jar 登录」，那是新增一个 HTTP 登录/换发接口，
+    不改变现有的 token 通路（见 §2.2 末条与 §8.1）。
 - token 来源：数据根 `data/user.json`。**两种形状都认**：现行是单用户文件、字段平铺
   （`{"user_id":…,"token":…}`），老版本是 `{"users":[{…}]}` 取第一条——客户端不能等服务端先升级
   （真机踩过：部署的 exe 比工作区旧，文件还是 `users` 数组）。人拿 token 靠
@@ -111,7 +120,7 @@ impl_->server->set_pre_routing_handler([verifier](const Request& request, Respon
 | HTTP | 含义 | 典型错误码 |
 |---|---|---|
 | 400 | 参数/校验 | FMT-001、FMT-303、FMT-701 |
-| 401 | 认证 | FMT-018 |
+| 401 | 认证 | FMT-018（缺/错 token）、**FMT-019（token 过期，不可自愈）** |
 | 403 | 权限与不可用 | FMT-004、FMT-501/502/503 |
 | 404 | 不存在（含"故意不提供"） | FMT-002、FMT-017、FMT-200 |
 | 409 | 冲突 | FMT-003、FMT-105（同桶同名但内容不同）、FMT-304（同桶同名且内容相同）、FMT-401、FMT-403（回退桶时的合并撞名，见 `FMT 技术文档.md` 18.44） |

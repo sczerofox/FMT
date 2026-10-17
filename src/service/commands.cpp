@@ -857,6 +857,47 @@ Result<std::uintmax_t> parse_size_value(const std::string& text) {
     return bytes;
 }
 
+// 解析「时长」：`30s` / `45m` / `12h` / `7d`，或者纯秒数（`3600`）。大小写不敏感。
+//
+// 为什么接受这些写法：token 的有效期让用户在命令行里手敲秒数太反人类
+//（`604800` 是 7 天），而 `7d` 一眼就懂。单位只取 s/m/h/d 四档，够用且不歧义。
+Result<std::uint64_t> parse_duration_seconds(const std::string& text) {
+    std::string value = to_lower(trim(text));
+    if (value.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "时长不能为空（例如 7d / 12h / 3600）");
+    }
+
+    std::uint64_t multiplier = 1;
+    for (const auto& unit : {std::pair<std::string, std::uint64_t>{"d", 24ULL * 60 * 60},
+                             {"h", 60ULL * 60}, {"m", 60ULL}, {"s", 1ULL}}) {
+        if (ends_with(value, unit.first)) {
+            multiplier = unit.second;
+            value = trim(value.substr(0, value.size() - unit.first.size()));
+            break;
+        }
+    }
+    if (value.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "时长缺少数字：" + text);
+    }
+
+    std::uint64_t number = 0;
+    for (const char ch : value) {
+        if (ch < '0' || ch > '9') {
+            return make_error(ErrorCode::InvalidArgument,
+                              "时长只能是数字（可带 s/m/h/d）：" + text);
+        }
+        const std::uint64_t digit = static_cast<std::uint64_t>(ch - '0');
+        if (number > (UINT64_MAX - digit) / 10) {
+            return make_error(ErrorCode::InvalidArgument, "时长超出可表示范围：" + text);
+        }
+        number = number * 10 + digit;
+    }
+    if (number > UINT64_MAX / multiplier) {
+        return make_error(ErrorCode::InvalidArgument, "时长超出可表示范围：" + text);
+    }
+    return number * multiplier;
+}
+
 // 解析布尔写法（本次改动（未提交））：true/false、1/0、yes/no、on/off，大小写不敏感。
 Result<bool> parse_bool_value(const std::string& text) {
     const std::string value = to_lower(trim(text));
@@ -923,9 +964,17 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
             const UserRecord& record = std::get<UserRecord>(user);
             data["user_id"] = record.user_id;
             data["token"] = record.token;
+            // token 的时效：CLI 要能把「什么时候过期」一起打出来，
+            // 否则用户看到 token 却不知道它还能用多久。
+            data["token_issued_at"] = record.token_issued_at;
+            data["token_expires_at"] = record.token_expires_at;
+            data["token_expired"] = token_expired(record);
+            data["token_expiry_text"] = token_expiry_text(record);
             data["user_created_at"] = record.created_at;
             data["last_login_at"] = record.last_login_at;
         }
+        // 新签发 token 时用的有效期（秒）：0 是不允许的，见 Config::token_ttl_seconds。
+        data["token_ttl_seconds"] = context.config.token_ttl_seconds;
         return data;
     }
 
@@ -998,9 +1047,41 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
             return data;
         }
 
+        // 新签发 token 的有效期（秒）。改它只影响**下一次签发**，不动已经发出的
+        // token（有效期在签发时就写死在 user.json 里了）——行为可预测，
+        // 也不会让正在用的客户端突然失效。
+        if (name == "token_ttl") {
+            const Result<std::uint64_t> parsed = parse_duration_seconds(text);
+            if (!ok(parsed)) {
+                return *error_of(parsed);
+            }
+            const std::uint64_t seconds = std::get<std::uint64_t>(parsed);
+            if (seconds == 0) {
+                // 允许 0 就等于给「永不过期」留后门，而用户的要求正是「过时不能用」。
+                return make_error(ErrorCode::InvalidArgument,
+                                  "token_ttl 必须是正数（例如 7d / 12h / 3600）；"
+                                  "不允许 0（token 必须有时效）");
+            }
+            const std::uint64_t previous = context.config.token_ttl_seconds;
+            context.config.token_ttl_seconds = seconds;
+            if (const Status saved = save_config(*context.paths, context.config); !ok(saved)) {
+                context.config.token_ttl_seconds = previous;
+                return *error_of(saved);
+            }
+            if (context.logger != nullptr) {
+                context.logger->info("Config", "token_ttl_seconds：" + std::to_string(previous) +
+                                                   " -> " + std::to_string(seconds));
+            }
+            data["token_ttl_seconds"] = seconds;
+            data["previous"] = previous;
+            data["message"] = "token_ttl 已改为 " + std::to_string(seconds) +
+                              " 秒（下次签发 token 时生效；已有 token 的有效期不变）";
+            return data;
+        }
+
         if (name != "max_upload_size") {
             return make_error(ErrorCode::InvalidArgument,
-                              "只能改 max_upload_size / server_enabled / server_host / "
+                              "只能改 max_upload_size / token_ttl / server_enabled / server_host / "
                               "server_port（其余只读）：" + name);
         }
 
@@ -1277,6 +1358,17 @@ Result<nlohmann::json> user_command(AppContext& context, const std::string& oper
         nlohmann::json data = nlohmann::json::object();
         data["salt"] = std::get<std::string>(salt);
         return data;
+    }
+
+    // 换发 token（`user token renew`）：凭**密码摘要**，不凭旧 token。
+    // 这是 token 过期后唯一的续期路径——否则过期就只能删号重建。
+    if (operation == "user.token.renew") {
+        const std::string digest = text_arg(args, "current_digest", std::string{});
+        const Result<nlohmann::json> renewed = users.renew_token(digest);
+        if (!ok(renewed)) {
+            return *error_of(renewed);
+        }
+        return std::get<nlohmann::json>(renewed);
     }
 
     if (operation == "user.update") {

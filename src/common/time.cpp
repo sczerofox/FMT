@@ -48,6 +48,14 @@ std::string local_datetime_iso_after_days(int days) {
     return format_tm(value, "%Y-%m-%dT%H:%M:%S");
 }
 
+std::string local_datetime_iso_after_seconds(std::int64_t seconds) {
+    const std::time_t now = std::time(nullptr);
+    const std::time_t target = now + static_cast<std::time_t>(seconds);
+    std::tm value{};
+    localtime_s(&value, &target);
+    return format_tm(value, "%Y-%m-%dT%H:%M:%S");
+}
+
 DateParts local_date_parts() {
     const std::tm now = local_now();
     return DateParts{two_digits(now.tm_year + 1900), two_digits(now.tm_mon + 1),

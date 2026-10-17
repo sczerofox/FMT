@@ -973,7 +973,7 @@ Bucket 不生成 `file_id`；桶级记录**没有 `file_id`**，用原桶名标�
 { "version": 1,
   "user_id": "u-b1e7c28f", "username": "user",
   "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节十六进制盐>",
-  "token": "<32 位十六进制，永久有效>", "current_bucket": "lazy",
+  "token": "<32 位十六进制>", "token_issued_at": "…", "token_expires_at": "…", "current_bucket": "lazy",
   "created_at": "…", "updated_at": "…", "last_login_at": "" }
 ```
 
@@ -989,7 +989,7 @@ current_bucket 保留（以后可能有用），但它只是**快照**——运�
         的派生值（确定性）；**v1.0 建的老账号**是 16 字节**随机盐**，照读照用。
         `password_salt` 字段一律保留：它是**口令派生的权威来源**，
         验密与改密都用它——这样老账号升级后口令不会被锁死（见第 18.5 节）。
-token   32 位十六进制、**永久有效**；HTTP 的 `/api/*` 就靠它认证
+token   32 位十六进制、**有时效**（`config.token_ttl_seconds`，默认 7 天）；HTTP 的 `/api/*` 就靠它认证；过期回 FMT-019，用 `user token renew`（凭密码）换新
         （第 82 节、`FMT 技术文档.md` 第 12.3.2 节）。
         **CLI 日常用登录（`login` / `-u -p`），token 是「临时备用钥匙」**——
         Java/HTTP 直连仍然只用 token（见第 18.3 节）。
@@ -1136,6 +1136,37 @@ user update     ① 先验旧口令；② uuid 必须与**当前记录的 MD5**�
 
 ---
 
+## 18.7 token 的时效（**过期一律拒绝**）
+
+用户要求「service 端实现 token 的时效性，过时不能用」。token 不再永久有效。
+
+| 项 | 口径 |
+|---|---|
+| 字段 | `data/user.json` 的 `token_issued_at` / `token_expires_at`（本地时间 `YYYY-MM-DDTHH:MM:SS`） |
+| 有效期 | `config.json` 的 `token_ttl_seconds`，默认 **7 天**；`config set token_ttl 7d` / `12h` / `3600` 可改，**拒绝 0** |
+| 生效范围 | 只影响**下一次签发**；已签发的 token 有效期写死在 user.json 里，不会被配置改动影响 |
+| 过期判定 | `UserStore::find_by_token()`：先常量时间比对 token，再判时效；解析不了/没有记录也按过期 |
+| 错误码 | **`FMT-019 TokenExpired`**（与 `FMT-018` 区分：过期该续期，无效是凭证抄错） |
+| 续期 | `user token renew`（**凭密码摘要**，服务 op `user.token.renew`）；旧 token 立即失效 |
+| 老 token | **没有 `token_expires_at` 的按已过期处理**：升级后必须换一次（说不清有效期的凭证不放行） |
+
+**为什么不给「永不过期」**：`token_ttl` 为 0 被明确拒绝。留这么一条后门，等于这次改动白做。
+
+**为什么续期凭密码而不是凭旧 token**：凭旧 token 续期等于没有时效；而不给续期路径的话，
+token 一过期就只剩 `user delete`（数据全没）这一条路。密码是唯一「不依赖 token 自身」的凭证。
+
+### 与「密码只能改一次」的关系（**必须守住**）
+
+`config.json` 的 `uuid` 是「账号内容」的指纹，语义是**密码改没改过**。token 会轮换，
+轮换不该改变这个语义，所以：
+
+* 指纹**排除** `token` / `token_issued_at` / `token_expires_at`（`record_md5`）；
+* `user token renew` **不碰** `updated_at`，也不消耗那一次改密机会；
+* `update_password` 的「还没改过」判定额外接受**老口径**（整份文件 MD5），
+  这样升级前建的老账号不会被判成「已经改过」而锁死机主；
+  老账号续期时会把 uuid 迁移成新指纹，状态保持不变。
+
+---
 # 19. Path 模块
 
 所有实际文件路径必须由 FMT 统一生成。
@@ -10309,6 +10340,7 @@ blocked 的情况     歧义（file.delete）、同名冲突 / 随桶删除 / �
 | 45 | **账号改为机主自己创建：`user` 命令组 + 首启引导（本次改动，未提交）**：用户要求「第一次启动 CLI 提示要求用户创建账号 `user create <username>`，然后再要求用户输入密码，输入时显示 `*` 号，确认密码也是」，随后又定「`user delete` 删除用户数据与除 `fmt.exe`、`log/` 之外的所有文件夹，要输入密码和 `delete` 才放行（真永久删除、不进垃圾桶、要提醒不可撤销）」「`user get` 输出用户信息」。做法：**取消自动建号**（删掉 `UserStore::ensure_default()`；老版本那个账号的口令是随机生成的、谁也不知道，拿它当凭证本来就不安全），新增 `user::UserService`（`src/user/user_service.cpp`）承载 create / get / update / delete / salt / verify，CLI 加 `run_user_command()` 与 `read_password_masked()`（`ReadConsoleInputW` 逐字符读、回显 `*`、支持退格与 Ctrl+C；stdin 被重定向时按行读，脚本与 e2e 才能跑）。`user delete` 的目录删除**由 CLI 本地做**——服务正在跑、握着 `log/` 句柄，让它删自己的数据根是踩自己的脚；服务端只负责"口令对不对"这一步。**测试 173 → 180 项全绿**。见第 18.1、18.2 节 | 用户的原话是「第一次启动」，所以放在**交互模式**：一次性命令是脚本用的，卡在提示上会让脚本挂住，它们本来就在下一层拿到明确的 `FMT-002`。`user create` 在**问口令之前**先查账号（真机反馈：先让人输两遍密码、最后才说"已经有账号"），已有账号时拒绝重建并直接给出 `user delete` → `user create` 的下一步。`user get` 刻意不打印口令哈希、盐与 token：读账号信息不该顺手吐凭证 |
 | 46 | **口令明文不出 CLI 进程 + 登录门禁（本次改动，未提交）**：用户要求「使用 `fmt -u <username> -p` 回车输入密码登录（密码显示 `*`），本次 CLI 关闭后又要重新登录」「`service` 命令不被限制使用，但其他业务类型的数据就会被禁用，除非登录」，并指定「后续我要通过像 mysql 一样使用 jar 包登录和使用，token 做为临时备用钥匙」，门禁范围选**方案 A（只做在 CLI）**。做法：CLI 先向服务要 `user.salt` → 本地 `password_digest(口令, 盐)`（PBKDF2-SHA256 10 万轮）→ 只把摘要发给 `user.verify` 常量时间比对；登录态只存 `Session::logged_in`（**内存，不落盘**——落盘就不叫"关掉重开要重新登录"）；门禁在 `run_interactive()` 与 `dispatch_command()` 两处，`service` / `log` / `help` / `version` / `exit` / `user get` / `user create` 放行；窗口内也能 `login` / `logout`。**服务端认证协议一个字没改**（管道与 HTTP 仍每请求认 token）。**测试 179 → 180 项全绿**（含 `-u/-p` 进窗口、窗口内 login、logout 后又被拦、未登录被拒）。见第 18.3、18.4 节 | ① **挑战-应答在密码学上走不通**：服务只存单向摘要，而 PBKDF2 不可组合（`PBKDF2(P) ≠ PBKDF2(PBKDF2(P))`），服务端无法对随机 nonce 算出同一应答值——除非存明文或"口令等价值"，那更糟。所以是"CLI 用服务给的盐算摘要、只发摘要"。② **盐必须由服务给**：老账号是**随机盐**，若一律按用户名派生，老账号口令会当场验不过、等于把机主锁在门外（真踩过，已加 `App.老账号的随机盐依然能验密与改密` 钉住）。③ 门禁选方案 A：服务端协议不动，Java/token 直连不受影响，token 就是那颗"临时备用钥匙"；要做 jar 登录接口时只加接口、不改现有认证。④ `-u/-p` 不带命令必须**进窗口**（真踩过：登录完直接 `return 0`，表现为"登录成功但窗口里什么都没发生"）。⑤ 单实例互斥体加 `FMT_MUTEX` 覆盖：否则用户开着 FMT 窗口时，e2e 的无参数交互式子进程会撞上互斥体**静默退出**（表现为"输出里只有登录成功"） |
 | 47 | **`config.json` 的 `uuid` + 「密码只能改一次」（本次改动，未提交）**：用户要求「user update password 回车输入新密码确认密码，只能修改一次」，并指定判定办法「将已经创建的 `user.json` 生成一个 MD5，保存在 `config.json` 里字段 `uuid`，第一次改密码将 `user.json` 的 MD5 与 `config.json` 比对，一致说明是第一次修改允许改，改完的 MD5 肯定与之前的 `uuid` 不一致，下一次就提示不能修改、提示用户删除用户重新创建」。做法：`Config::uuid` 序列化为 `uuid`；`record_md5(record)` = `UserStore::record_json_text()`（与 `save()` 同一套序列化）的 MD5；建号/初始化写入；改密时"uuid 必须等于当前记录的 MD5"才放行，成功后把 uuid 置为**改动之前**那份记录的 MD5。**测试 178 → 179 项**（`App.初始化数据根不再自动建账号` 与新增的老账号用例）。见第 18.5、18.6 节 | 用户给的方案就是对的，直接照做。**踩过的坑必须记住**：uuid 只能取"**改之前**"的指纹——写成"保存之后再取"，等于把 uuid 设成"改完之后那份文件"的 MD5，而下一次进来加载到的正是它，于是"改前指纹 == uuid"永远成立，**可以无限次改密**（被用例钉住）。另一条隐含约束：`user.json` 在日常使用中**不能被改写**，否则指纹漂移、规则失效——`record_login` / `refresh_current_bucket` 因此都不能上请求路径 |
+| 48 | **访问 token 加时效：过期一律拒绝（本次改动，未提交）**：用户要求「service 端实现 token 的时效性，过时不能用」。落地：① `data/user.json` 新增 `token_issued_at` / `token_expires_at`（本地时间 `YYYY-MM-DDTHH:MM:SS`）；② `config.json` 新增 `token_ttl_seconds`（默认 **7 天**），`config set token_ttl 7d|12h|3600`（**拒绝 0**——允许 0 就等于留了「永不过期」的后门），改它只影响**下一次签发**；③ `UserStore::find_by_token()` 先比 token 再判时效，过期回**独立错误码 `FMT-019 TokenExpired`**（与 `FMT-018` 区分：前者该去续期，后者是凭证抄错），HTTP 401 信封里带着原因与补救命令；④ 新增 `user token renew`（**凭密码摘要**，`user.token.renew` 服务 op）换发 token，旧 token 立即失效；⑤ **没有 `token_expires_at` 的老 token 按已过期处理**（升级后必须换一次——「说不清有效期的凭证不放行」）；⑥ 指纹口径调整：`config.uuid` 的指纹**排除 token 三个字段**，否则换 token 会被判成「已经改过密码」（或反过来把「已改过」抹掉）；`update_password` 同时认老口径（整份文件 MD5）以保证老账号不被锁死。**测试 180 → 185 项全绿**（`User.新建账号的token带有效期且默认七天` / `User.token过期后服务拒绝` / `User.没有有效期记录的旧token按过期处理` / `User.换发token后旧的立刻失效且密码仍只能改一次` / `Server.token过期返回FMT019而不是FMT018`，以及 `config set token_ttl` 的解析与拒绝 0）。见第 18.7 节、`FMT 技术文档.md` 第 12.3.2 节 | 用户的原话是「过时不能用」，那就不能有「永久有效」这条后门：`token_ttl_seconds = 0` 被明确拒绝。**续期必须凭密码而不是凭旧 token**——否则 token 一过期就只剩 `user delete`（数据全没）这一条路；而凭旧 token 续期又等于没有时效。**指纹必须排除 token**：`uuid` 的语义是「密码改没改过」，轮换凭证与改密码是两件事，混在一起会互相踩（真踩过的坑：uuid 取错时点导致改密可以无限次）。老 token 按过期处理是刻意的：v1.0/v2.0 的 token 是永久凭证，继续放行等于这次改动白做；代价是升级后要跑一次 `user token renew`，错误消息里直接给了这条命令 |
 
 
 以下决策在第二阶段编码前确定，**不再扩展基础架构**，各模块按此实现。

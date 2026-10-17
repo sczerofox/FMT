@@ -93,7 +93,7 @@ cmake --build --preset debug
 |---|---|
 | `login` | `login [用户名]` `logout`（**业务命令要先登录**） |
 | `service` | `install` `uninstall` `start` `stop` `reinstall` `status` |
-| `user` | `create` `get` `update password` `delete` |
+| `user` | `create` `get` `update password` `delete` `token renew` |
 | `bucket` | `create` `list` `get` `use` `delete` |
 | `file` | `upload` `list` `get` `delete` |
 | `trash` | `list` `get` `restore` `delete` `empty` |
@@ -121,6 +121,9 @@ fmt.exe -u lazy -p file list  # 一次性命令也可以带登录
   `user get`（看账号状态）、`user create`（还没有账号时得先建）。
 - `user update password` 改密码：**只能改一次**（用 `config.json` 的 `uuid` 判定）；
   之后要用 `user delete` 删号重建。`user get` 会告诉你还能不能改。
+- `user token renew`：换发访问 token（要密码）。token **默认 7 天**过期，过期后 HTTP 一律
+  `401 + FMT-019`；换完旧 token 立刻失效，且**不消耗**「密码只能改一次」的机会。
+  有效期用 `config set token_ttl 7d`（或 `12h` / `3600`）改，只影响下一次签发。
 - `user delete`：先验密码，再**逐字输入 `delete`** 才真删；删除
   `repository/ trash/ config/ data/ temp/`（只留 `fmt.exe` 与 `log/`），
   **永久删除、不进回收站、不可撤销**。
@@ -254,7 +257,7 @@ Authorization: Bearer <你的 token>
 ```
 
 或者读数据根下的 `data/user.json`——一个数据根只有一个账号，那个文件**就是这个用户**
-（字段平铺，没有 `users` 数组），token 存在 `token` 字段里，**默认永久有效**；
+（字段平铺，没有 `users` 数组），token 存在 `token` 字段里，**有时效**（默认 7 天，见下）；
 密码只存哈希（PBKDF2-SHA256，10 万轮），明文从不落盘、也从不跨进程。
 
 **每个数据根一个 token，别照抄文档里的值**：文档与 SDK 示例里的 32 位十六进制串都是
@@ -454,8 +457,8 @@ docx/            设计文档
 ## 13. 已知边界
 
 - HTTP **默认打开**，且只监听本机（`localhost`）；开/关与改地址用 `config set server_enabled|server_host|server_port`（会顺手重启服务），或改 `config/server.json` 后自己重启服务。
-- token 默认**永久有效**（尚无轮换/吊销命令），请按凭证对待。`GET /api/config` **永远不回传 token**
-  （连"要不要带"的开关都不提供），**CLI `config list` 默认也不打印它**——凭证不该因为"顺手"
+- token **有时效**（`config set token_ttl 7d`，默认 7 天）：过期后 `/api/*` 一律 401 + `FMT-019`，
+  用 `fmt.exe user token renew`（要密码）换新的。`GET /api/config` **永远不回传 token**（连"要不要带"的开关都不提供），**CLI `config list` 默认也不打印它**——凭证不该因为"顺手"
   而多出现在日志、转发、工单和截图里；要 token 只有两条路：`fmt.exe config list --show-token`，
   或直接读数据根下的 `data/user.json`。
 - 分享默认 **20 次下载、7 天过期**，两者相互独立；文件进回收站后分享立即失效。

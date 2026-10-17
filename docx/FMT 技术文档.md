@@ -1286,7 +1286,7 @@ Bucket 级记录**不使用 `file_id`**，用 Bucket 名称标识。常量在
 { "version": 1,
   "user_id": "u-b1e7c28f", "username": "user",
   "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节十六进制盐>",
-  "token": "<32 位十六进制，永久有效>", "current_bucket": "lazy",
+  "token": "<32 位十六进制>", "token_issued_at": "…", "token_expires_at": "…", "current_bucket": "lazy",
   "created_at": "…", "updated_at": "…", "last_login_at": "" }
 ```
 
@@ -1300,7 +1300,7 @@ current_bucket 保留（用户说以后可能有用），但它只是**快照**�
 盐        **新账号**是 `directory_salt(username)`（确定性派生）；**v1.0 老账号**是
           16 字节**随机盐**，照读照用。`password_salt` 一律保留，并且**口令派生
           用的盐始终取自它**——这样老账号升级后口令不会被锁死。
-token     32 位十六进制、**永久有效**；HTTP 的 `/api/*` 就靠它认证。
+token     32 位十六进制、**有时效**（`config.token_ttl_seconds`，默认 7 天）；HTTP 的 `/api/*` 就靠它认证。过期回 FMT-019，用 `user token renew`（凭密码）换新。
           **CLI 日常走登录（`login` / `-u -p`），token 是「临时备用钥匙」**：
           Java/REST 直连仍然只用 token，服务端认证协议没有变。
 「还没账号」 文件里只有 {"version":1}；补建缺失文件时写的就是它。
@@ -4747,6 +4747,7 @@ V1 只实现图片，其他类型待后续扩展。
 |---|---|
 | 400 | `FMT-001` **`FMT-016`** `FMT-012` `FMT-014` `FMT-100` `FMT-101` `FMT-102` `FMT-103` `FMT-104` **`FMT-106`** `FMT-202` `FMT-300` `FMT-303` `FMT-700` `FMT-701` |
 | **401** | **`FMT-018 Unauthorized`**（提交 `4b812b5`）：缺 token / token 不对（`/api/ping` 与分享下载除外），由 **pre-routing 钩子**一处拒绝；退出码 5 |
+| **401** | **`FMT-019 TokenExpired`**（本次改动（未提交））：token 过期。**与 FMT-018 分开**——前者该去续期，后者是凭证抄错。续期用 `user token renew`（凭密码）；有效期 `config.token_ttl_seconds`（默认 7 天，拒绝 0）；没有有效期记录的老 token 也按过期处理 |
 | 403 | `FMT-004` `FMT-501` `FMT-502` `FMT-503` |
 | 404 | `FMT-002` `FMT-200` `FMT-400` `FMT-500` `FMT-305` `FMT-402` **`FMT-017`** |
 | 409 | `FMT-003` `FMT-105` `FMT-201` `FMT-203`(保留未用) `FMT-304` `FMT-401` **`FMT-403`** | 冲突（已存在、重名、仍被引用、**桶内已有相同内容**、**合并回退撞上同名文件**；**`FMT-203 BucketInUse` 保留、V1 未使用**——没有代码会产生它，见 12.5 下方的说明与 9.2） |
@@ -9149,7 +9150,7 @@ HTTP          **一个路由都没加**（用户决定）——等用户定开�
    **单用户文件**（一个数据根一个账号，字段平铺在根上）：
    { "version": 1, "user_id": "u-b1e7c28f", "username": "user",
      "password_hash": "<PBKDF2-SHA256，64 位十六进制>", "password_salt": "<16 字节十六进制盐>",
-     "token": "<32 位十六进制，永久有效>", "current_bucket": "lazy",
+     "token": "<32 位十六进制>", "token_issued_at": "…", "token_expires_at": "…", "current_bucket": "lazy",
      "created_at": "…", "updated_at": "…", "last_login_at": "" }
    **buckets 字段已删除**：桶以磁盘上的 repository/<user>/<bucket>/ 为准；
    读的时候忽略老字段，**下一次初始化会把老文件里的它清掉**（线上已验证清掉了）。

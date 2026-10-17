@@ -9,11 +9,13 @@
 //     （为什么不挑战-应答：服务只存单向摘要，PBKDF2 不可组合，服务方无法对随机
 //      nonce 算出同一个应答值；详见 user.hpp 里 `verify_password_digest` 的说明。）
 //   * **一个数据根一个账号**：账号就是 data/user.json 里那条记录（单用户文件）。
-//   * **密码只能改一次**：config.json 的 `uuid` 存着 data/user.json 的 MD5。
-//     一致 == 还是原始文件 → 允许改一次，改完把新 MD5 写回 uuid；
+//   * **密码只能改一次**：config.json 的 `uuid` 存着「账号内容」的指纹。
+//     一致 == 还没改过 → 允许改一次，改完把改之前的指纹写回 uuid；
 //     不一致 == 已经改过 → 拒绝，提示「删除用户重新创建」。
-//     判定用**规范化文档文本**（UserStore::record_json_text）而不是磁盘原文，
-//     这样与格式补字段之类的写盘细节无关。
+//     指纹用**规范化文档文本**（UserStore::record_json_text）而不是磁盘原文，
+//     并且**排除 token 相关字段**——token 会轮换，轮换不该改变"改没改过密码"。
+//   * **token 有时效**：`config.token_ttl_seconds` 决定有效期，过期后 HTTP 一律
+//     `FMT-019`；`user token renew`（凭密码）是唯一的续期路径。
 #pragma once
 
 #include <string>
@@ -58,6 +60,13 @@ public:
 
     // 口令校验（`user delete` 与改密共用）：把 CLI 算好的摘要与已存摘要做常量时间比对。
     Result<UserRecord> verify_digest(std::string_view presented_digest_hex) const;
+
+    // 换发 token：`user token renew`。**必须给密码摘要**——token 过期之后除了这条路
+    // 没有别的办法（否则只能 user delete 重建账号，代价是数据全没）。
+    //
+    // 与「密码只能改一次」互不影响：换 token 不消耗那一次机会（指纹排除了 token 字段，
+    // 并且老账号的旧口径指纹会在这里被迁移成新指纹）。
+    Result<nlohmann::json> renew_token(std::string_view current_digest_hex);
 
     // `user get` 的载荷：账号字段 + 「口令是否已经改过一次」。
     //

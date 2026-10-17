@@ -780,10 +780,19 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
                 return httplib::Server::HandlerResponse::Unhandled;
             }
             const std::string token = header_token(request);
-            const std::string username =
-                (verifier && !token.empty()) ? verifier(token) : std::string{};
-            if (!username.empty()) {
-                return httplib::Server::HandlerResponse::Unhandled;
+            if (verifier && !token.empty()) {
+                const Result<std::string> verified = verifier(token);
+                if (ok(verified) && !std::get<std::string>(verified).empty()) {
+                    return httplib::Server::HandlerResponse::Unhandled;
+                }
+                // 校验器说得出原因就用它的（token 过期是 FMT-019，抄错是 FMT-018）；
+                // 说不出原因（理论上不会有）就退回统一的「缺少或无效」。
+                if (!ok(verified)) {
+                    response.status = 401;
+                    response.set_content(dump(envelope_error(*error_of(verified))),
+                                         kJsonContentType);
+                    return httplib::Server::HandlerResponse::Handled;
+                }
             }
             response.status = 401;
             response.set_content(

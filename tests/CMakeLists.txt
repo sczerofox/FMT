@@ -15,6 +15,7 @@ add_executable(fmt_tests
     storage_test.cpp
     config_test.cpp
     app_test.cpp
+    user_test.cpp
     bucket_test.cpp
     file_test.cpp
     ipc_test.cpp

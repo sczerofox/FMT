@@ -898,6 +898,50 @@ FMT_TEST(Service, 列表排序配置与清空回收站) {
         }
     }
 
+    // config set token_ttl：访问 token 的有效期（用户要求 token 有时效）。
+    // 接受 `7d` / `12h` / 纯秒数；**拒绝 0**（允许 0 等于留了「永不过期」的后门）。
+    {
+        fmt::ipc::Request ttl;
+        ttl.id = 20;
+        ttl.op = "config.set";
+        ttl.args["argv"] = nlohmann::json::array({"token_ttl", "12h"});
+        const fmt::ipc::Response applied = runtime.handle(ttl);
+        FMT_CHECK(applied.ok);
+        FMT_CHECK_EQ(applied.data.value("token_ttl_seconds", 0ULL), 12ULL * 60 * 60);
+
+        fmt::ipc::Request days;
+        days.id = 21;
+        days.op = "config.set";
+        days.args["argv"] = nlohmann::json::array({"token_ttl", "3d"});
+        const fmt::ipc::Response applied_days = runtime.handle(days);
+        FMT_CHECK(applied_days.ok);
+        FMT_CHECK_EQ(applied_days.data.value("token_ttl_seconds", 0ULL), 3ULL * 24 * 60 * 60);
+
+        fmt::ipc::Request zero;
+        zero.id = 22;
+        zero.op = "config.set";
+        zero.args["argv"] = nlohmann::json::array({"token_ttl", "0"});
+        const fmt::ipc::Response rejected = runtime.handle(zero);
+        FMT_CHECK(!rejected.ok);
+        FMT_CHECK_EQ(rejected.error.code, fmt::ErrorCode::InvalidArgument);
+
+        fmt::ipc::Request garbage;
+        garbage.id = 23;
+        garbage.op = "config.set";
+        garbage.args["argv"] = nlohmann::json::array({"token_ttl", "soon"});
+        const fmt::ipc::Response garbage_rejected = runtime.handle(garbage);
+        FMT_CHECK(!garbage_rejected.ok);
+
+        // 落盘：重读配置拿到的是 3 天（最后一次成功的那次）。
+        const fmt::PathManager paths{root};
+        const auto reloaded = fmt::load_config(paths);
+        FMT_CHECK(fmt::ok(reloaded));
+        if (fmt::ok(reloaded)) {
+            FMT_CHECK_EQ(std::get<fmt::Config>(reloaded).token_ttl_seconds,
+                         3ULL * 24 * 60 * 60);
+        }
+    }
+
     // config set server_enabled：改 server.json（本次改动（未提交）），并回报要重启服务；
     // **服务侧不做 reinstall**（那由 CLI 做），所以这里只断言文件与响应字段
     {

@@ -29,6 +29,15 @@ struct Config {
     std::string size_unit = "MB";
     std::string language = "zh-CN";
 
+    // 访问 token 的有效期（秒）。用户要求「service 端实现 token 的时效性，过时不能用」。
+    //
+    //   * 每次 `user create` / `user token renew` 都按它算 `token_expires_at`；
+    //   * 默认 **7 天**：token 是给外部客户端（Java/HTTP）用的凭证，不该永久有效；
+    //   * 必须是正数（0 或负值一律拒绝）：允许 0 就等于留了「永不过期」的后门；
+    //   * 改它**不影响已经签发的 token**（有效期是签发时写死在 user.json 里的），
+    //     只影响下一次签发——这样行为可预测，也不会让正在用的客户端突然失效。
+    std::uint64_t token_ttl_seconds = 7ULL * 24 * 60 * 60;
+
     // data/user.json 的 MD5（32 位小写十六进制）。用途只有一个：
     // **判定「密码是否已经改过一次」**。
     //   * `user create` 写完账号后，把当时 user.json 的 MD5 记在这里；

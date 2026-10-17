@@ -22,11 +22,15 @@ namespace fmt::server {
 using BusinessHandler =
     std::function<Result<nlohmann::json>(const std::string& operation, const nlohmann::json& args)>;
 
-// token 校验器：传进来的 token 有效就返回**用户名**，无效返回空串。
+// token 校验器：有效返回**用户名**；无效返回错误（`Unauthorized` 或 `TokenExpired`）。
+//
+// 为什么返回 Result 而不是空串：token **有时效**，过期（FMT-019）与抄错/没有（FMT-018）
+// 对客户端是两件事——前者该去 renew，后者是凭证不对。只回一个"空"就把这个区别丢了。
+//
 // 由服务的运行体注入（它才拿得到 data/user.json 与 config）。
 // **默认拒绝**：没注入校验器时，管理接口一律 401——HTTP 层不认识账号，
 // 但它必须默认是关着的，免得哪天忘了注入就变成裸奔。
-using TokenVerifier = std::function<std::string(const std::string& token)>;
+using TokenVerifier = std::function<Result<std::string>(const std::string& token)>;
 
 // 上传上限的**取值器**：每次上传请求现取一次（不是启动时的快照）。
 // 为什么是取值器而不是一个数：上限住在 config.json 里，`config set max_upload_size`
