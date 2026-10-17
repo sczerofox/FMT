@@ -244,9 +244,10 @@ Result<nlohmann::json> UserService::describe() const {
     data["last_login_at"] = record.last_login_at;
     data["path"] = "data/user.json";
     // 「口令是否已经改过一次」如实报出来，省得用户改到一半才发现。
+    // **不给 message**：CLI 已经按 password_changed 打成「密码状态：…」，
+    // 再附一句"账号信息（密码还可以修改一次）"只是把同一件事说两遍
+    // （真机测出来的重复行）。
     data["password_changed"] = changed;
-    data["message"] = changed ? "账号信息（密码已经修改过一次，不能再改）"
-                              : "账号信息（密码还可以修改一次）";
     // 刻意**不含** password_hash / password_salt / token：读账号信息不该顺手吐凭证。
     return data;
 }

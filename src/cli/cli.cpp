@@ -855,9 +855,13 @@ bool is_data_root_problem(ErrorCode code) {
 }
 
 void print_failure(const Error& error) {
+    // 先把 stdout 刷掉再写 stderr：两条流被重定向到同一个管道时（脚本、e2e），
+    // stdout 是块缓冲而 stderr 无缓冲，不刷就会出现「错误信息跑到提示符前面」的错觉。
+    std::fflush(stdout);
     std::fprintf(stderr, "执行失败：%s %s\n", code_string(error.code).c_str(),
                  error.message.c_str());
     std::fprintf(stderr, "错误码：%d\n", exit_code(error.code));
+    std::fflush(stderr);
 }
 
 // 定义在下面（print_business_data 与 print_precheck 都要用它）
@@ -1485,6 +1489,18 @@ Result<std::string> verify_login(Session& session, const Options& options,
         return std::get<ipc::Response>(verified).error;
     }
     return std::get<ipc::Response>(verified).data.value("username", username);
+}
+
+// 门禁提示里要写的「命令标签」：`file list`、`user delete` 这样给到二级，
+// 而不是只说 `user` —— 否则用户知道被拦了、却不知道是哪条被拦。
+std::string command_label(const std::vector<std::string>& parts) {
+    if (parts.empty()) {
+        return {};
+    }
+    if (parts.size() >= 2) {
+        return parts[0] + " " + parts[1];
+    }
+    return parts[0];
 }
 
 // 门禁：没登录就不放行业务命令（用户要求）。
@@ -2216,7 +2232,7 @@ int run_interactive(const Options& options, service::State state, Session& sessi
                 "需要先登录才能执行 %s。\n"
                 "本窗口内登录：login <用户名>      （回车后隐藏输入密码）\n"
                 "不需要登录：service / log / help / version / user get / user create\n",
-                head.c_str());
+                command_label(parts).c_str());
             continue;
         }
 
@@ -2483,11 +2499,12 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
                 (rest[0] == "user" && rest.size() >= 2 &&
                  (rest[1] == "create" || rest[1] == "get"));
             if (!user_readonly_ok) {
+                const std::string label = command_label(rest);
                 std::fprintf(stderr,
                              "需要先登录才能执行 %s。\n"
                              "用法：fmt -u <用户名> -p %s\n"
                              "（口令在回车后隐藏输入；登录态只活在本次命令/窗口里）\n",
-                             rest[0].c_str(), rest[0].c_str());
+                             label.c_str(), label.c_str());
                 return exit_code(ErrorCode::Unauthorized);
             }
         }
