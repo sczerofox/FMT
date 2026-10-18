@@ -102,6 +102,31 @@ class FmtChannelTest {
     }
 
     @Test
+    void tokenWithBucketCanExecuteBusinessAndServerEnforcesIt() {
+        try (StubFmtServer stub = StubFmtServer.start(TOKEN)) {
+            stub.on("GET", "/api/file", request -> "work".equals(request.header("X-FMT-Bucket"))
+                    ? StubFmtServer.Reply.ok(
+                            "{\"files\":[],\"count\":0,\"total\":0,\"page\":1,\"page_size\":0,"
+                                    + "\"total_pages\":0,\"sort\":\"name\"}")
+                    : StubFmtServer.Reply.error(403, FmtErrorCodes.PERMISSION_DENIED,
+                            "这个 token 不能访问这个 Bucket"));
+
+            // 地址 + token + 桶名：业务调用成功，服务端看到 X-FMT-Bucket: work
+            try (FmtChannel fmt = Fmt.channel(stub.baseUrl(), TOKEN, "work")) {
+                assertTrue(fmt.listFiles(FileQuery.all()).isOk());
+                assertEquals("work", stub.lastRequest().header("X-FMT-Bucket"));
+            }
+
+            // 换一个桶名：服务端按 FMT-004 拒绝，SDK 原样保留错误码
+            try (FmtChannel wrong = Fmt.channel(stub.baseUrl(), TOKEN, "other")) {
+                FmtResult<FmtPage> result = wrong.listFiles(FileQuery.all());
+                assertFalse(result.isOk());
+                assertEquals(FmtErrorCodes.PERMISSION_DENIED, result.error().code());
+            }
+        }
+    }
+
+    @Test
     void bearerSchemePutsTokenInAuthorizationHeader() {
         try (StubFmtServer stub = StubFmtServer.start(TOKEN);
              FmtChannel fmt = Fmt.channel(Fmt.builder(stub.baseUrl(), TOKEN)

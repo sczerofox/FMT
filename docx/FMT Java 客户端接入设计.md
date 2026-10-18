@@ -127,7 +127,10 @@ POST /api/auth/logout                           （要 token）→ 会话立即�
 - **库名必须每请求带**: 业务请求头 `X-FMT-Bucket: <bucket>`；会话 token 只能访问
   登录时选的那个 Bucket，缺失 → 400 `FMT-001`，不匹配 → 403 `FMT-004`。
 - **旧账号 token**: 带 `X-FMT-Bucket` 就按它走；不带就沿用服务端 `current_bucket`
-  （保持旧 SDK 行为）。
+  （保持旧 SDK 行为）。显式带库名的连接写法：
+  ```java
+  FmtChannel fmt = Fmt.channel("http://localhost:4122", token, "work");
+  ```
 - **Java 侧**:
   ```java
   try (FmtChannel fmt = Fmt.login("http://localhost:4122", "user", "password", "work")) {

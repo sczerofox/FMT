@@ -1125,5 +1125,28 @@ FMT_TEST(Server, 登录会话与请求级Bucket) {
         FMT_CHECK(nlohmann::json::parse(logout_response->body)["ok"].get<bool>());
     }
 
+    // 旧账号 token + 显式库名：同样能把 X-FMT-Bucket 透到业务层（这是 SDK 的
+    // Fmt.channel(baseUrl, token, bucket) 走的路径）。
+    httplib::Client account_client("127.0.0.1", server.port());
+    account_client.set_default_headers(
+        {{"X-FMT-Token", kTestToken}, {"X-FMT-Bucket", "work"}});
+    const auto account_with_bucket = account_client.Get("/api/file");
+    FMT_CHECK(account_with_bucket != nullptr);
+    if (account_with_bucket != nullptr) {
+        FMT_CHECK_EQ(account_with_bucket->status, 200);
+        const auto body = nlohmann::json::parse(account_with_bucket->body);
+        FMT_CHECK_EQ(body["data"]["bucket"].get<std::string>(), std::string("work"));
+    }
+
+    // 旧账号 token 不带库名：保持旧行为，业务层看到空 _bucket（用 current_bucket）。
+    httplib::Client legacy_client("127.0.0.1", server.port());
+    legacy_client.set_default_headers({{"X-FMT-Token", kTestToken}});
+    const auto legacy = legacy_client.Get("/api/file");
+    FMT_CHECK(legacy != nullptr);
+    if (legacy != nullptr) {
+        FMT_CHECK_EQ(legacy->status, 200);
+        FMT_CHECK(nlohmann::json::parse(legacy->body)["data"]["bucket"].get<std::string>().empty());
+    }
+
     server.stop();
 }
