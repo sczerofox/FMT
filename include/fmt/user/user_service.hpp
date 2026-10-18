@@ -61,6 +61,10 @@ public:
     // 口令校验（`user delete` 与改密共用）：把 CLI 算好的摘要与已存摘要做常量时间比对。
     Result<UserRecord> verify_digest(std::string_view presented_digest_hex) const;
 
+    // 登录成功后刷新 `last_login_at`（`user verify` 调用）。
+    // 登录痕迹**不参与**「密码只能改一次」的指纹，所以这个写盘不会影响改密判定。
+    Status record_login() const;
+
     // 换发 token：`user token renew`。**必须给密码摘要**——token 过期之后除了这条路
     // 没有别的办法（否则只能 user delete 重建账号，代价是数据全没）。
     //

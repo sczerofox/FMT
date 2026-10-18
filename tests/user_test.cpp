@@ -193,3 +193,55 @@ FMT_TEST(User, 换发token后旧的立刻失效且密码仍只能改一次) {
     const auto twice = service.update_password(next, fmt::password_digest("again", salt));
     FMT_CHECK(!fmt::ok(twice));
 }
+
+FMT_TEST(User, 登录更新最后登录时间且不影响改密判定) {
+    fmt_test::TempDir temp("user-login-stamp");
+    const auto root = temp / "root";
+    const auto paths = fmt::initialize_root(root);
+    FMT_CHECK(fmt::ok(paths));
+    if (!fmt::ok(paths)) {
+        return;
+    }
+    const fmt::PathManager& manager = *std::get<std::unique_ptr<fmt::PathManager>>(paths);
+
+    fmt::Config config = std::get<fmt::Config>(fmt::load_config(manager));
+    fmt::user::UserService service(manager, config);
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("pw", salt);
+    const auto created = service.create("user", digest);
+    FMT_CHECK(fmt::ok(created));
+    if (!fmt::ok(created)) {
+        return;
+    }
+    FMT_CHECK(std::get<fmt::UserRecord>(created).last_login_at.empty());  // 刚建号还没登录过
+
+    // 登录（服务侧在 user.verify 成功后调 record_login）→ 时间戳写进去。
+    FMT_CHECK(fmt::ok(service.record_login()));
+    const auto after_login = service.current();
+    FMT_CHECK(fmt::ok(after_login));
+    if (fmt::ok(after_login)) {
+        FMT_CHECK(!std::get<fmt::UserRecord>(after_login).last_login_at.empty());
+    }
+
+    // **关键**：登录会写 user.json，但指纹只算 password_hash + salt + user_id + created_at，
+    // 所以「密码还能改一次」的状态必须原样保留——否则登录一次就把机主锁死了。
+    const auto described = service.describe();
+    FMT_CHECK(fmt::ok(described));
+    if (fmt::ok(described)) {
+        FMT_CHECK(!std::get<nlohmann::json>(described).value("password_changed", true));
+    }
+
+    // 多登录几次也不影响：还是能改一次密码。
+    FMT_CHECK(fmt::ok(service.record_login()));
+    FMT_CHECK(fmt::ok(service.record_login()));
+    const auto changed = service.update_password(digest, fmt::password_digest("next", salt));
+    FMT_CHECK(fmt::ok(changed));
+    // 用掉那一次之后，再改必须被拒（登录不会把它"洗回来"）。
+    FMT_CHECK(fmt::ok(service.record_login()));
+    const auto twice = service.update_password(fmt::password_digest("next", salt),
+                                              fmt::password_digest("again", salt));
+    FMT_CHECK(!fmt::ok(twice));
+    if (!fmt::ok(twice)) {
+        FMT_CHECK_EQ(fmt::error_of(twice)->code, fmt::ErrorCode::PermissionDenied);
+    }
+}

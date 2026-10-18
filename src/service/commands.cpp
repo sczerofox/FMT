@@ -1342,6 +1342,14 @@ Result<nlohmann::json> user_command(AppContext& context, const std::string& oper
         if (!ok(verified)) {
             return *error_of(verified);
         }
+        // 登录成功 → 刷新 last_login_at（用户要求「登录之后最后登录时间要变」）。
+        // 写失败**不阻断登录**：口令已经验过了，只是时间戳没写成；记进日志即可。
+        if (const Status touched = users.record_login(); !ok(touched)) {
+            if (context.logger != nullptr) {
+                context.logger->warn("User", "登录成功但没能更新 last_login_at：" +
+                                                 error_of(touched)->message);
+            }
+        }
         nlohmann::json data = nlohmann::json::object();
         data["username"] = std::get<UserRecord>(verified).username;
         data["user_id"] = std::get<UserRecord>(verified).user_id;

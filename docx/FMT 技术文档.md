@@ -1303,6 +1303,11 @@ current_bucket 保留（用户说以后可能有用），但它只是**快照**�
 token     32 位十六进制、**有时效**（`config.token_ttl_seconds`，默认 7 天）；HTTP 的 `/api/*` 就靠它认证。过期回 FMT-019，用 `user token renew`（凭密码）换新。
           **CLI 日常走登录（`login` / `-u -p`），token 是「临时备用钥匙」**：
           Java/REST 直连仍然只用 token，服务端认证协议没有变。
+          `user get`（**要登录**）会把它与有效期一起打出来。
+last_login_at  **登录成功时**由 `UserService::record_login()` 写入（`user.verify` 之后）。
+          它和 token 三件套都**不参与**「密码只能改一次」的指纹——指纹只算
+          `user_id` + `password_hash` + `password_salt` + `created_at`，
+          所以登录一次或换一次 token 都不会把改密判定弄歪。
 「还没账号」 文件里只有 {"version":1}；补建缺失文件时写的就是它。
           **账号不再自动创建**：必须由机主 `user create <用户名>`。
 默认账号  **已取消**：`initialize_root` 不再建账号，`UserStore::ensure_default()`

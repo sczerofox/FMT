@@ -1028,7 +1028,7 @@ user
 | 命令 | 服务端 op | 说明 |
 |---|---|---|
 | `user create <用户名>` | `user.create` | 建账号；提示两次口令（**回显 `*`**）、写 `data/user.json`、把该文件的 MD5 记进 `config.json` 的 `uuid` |
-| `user get` | `user.get` | 打印账号字段（用户名 / ID / 当前 Bucket / 创建时间 / 更新时间 / 最后登录 / 密码状态 / 文件路径）。**刻意不打印口令哈希、盐与 token** |
+| `user get` | `user.get` | 打印账号字段（用户名 / ID / 当前 Bucket / 创建时间 / 更新时间 / 最后登录 / 密码状态 / **当前 token 与有效期**）。**要登录才能用**；仍然不打印口令哈希与盐 |
 | `user update password` | `user.update` | 当前密码 → 新密码 ×2；**只能改一次**（第 18.6 节） |
 | `user delete` | `user.delete` | 先验密码，再**逐字输入 `delete`** 才动手；永久删除 `repository/ trash/ config/ data/ temp/`（只留 `fmt.exe` 与 `log/`），**不进回收站、不可撤销** |
 | （内部）取口令盐 | `user.salt` | 供登录/改密/删除前算摘要用（第 18.4 节） |
@@ -1082,11 +1082,16 @@ fmt> logout                   # 退出登录
 | 需要登录 | 不需要登录 |
 |---|---|
 | `file *`、`bucket *`、`trash *`、`share *`、`config *` | `service *`（装/卸/启/停/重装/状态） |
-| `user update password`、`user delete` | `log clean`、`help`、`version`、`exit` |
-| | `user get`、`user create`（还没有账号时得先能建） |
+| `user get`、`user update password`、`user delete` | `log clean`、`help`、`version`、`exit` |
+| | `user create`（还没有账号时得先能建）、`user token renew`（自带密码校验） |
 
 不受限的那几类是有意为之：服务坏了、账号进不去的时候，得靠它们把机器救回来。
 拦下时的提示必须**能照着做**：`本窗口内登录：login <用户名>`。
+`user get` 之所以也要登录：它会打印**当前 token**（用户要求），token 是凭证，不该不登录就给。
+
+**登录会更新时间戳**：`user.verify` 验过口令之后写 `last_login_at` / `updated_at`
+（用户要求「登录之后最后登录时间要变」）。登录痕迹**不在**改密指纹里（第 18.5 节），
+所以怎么写都不会影响「密码只能改一次」。
 
 **门禁只做在 CLI 层（方案 A）**：服务端认证协议**一个字没改** —— 管道与 HTTP 仍然
 每请求认 `data/user.json` 里的 token。所以 Java/REST 直连照旧可用，
@@ -1108,31 +1113,48 @@ fmt> logout                   # 退出登录
 
 ## 18.5 `config.json` 的 `uuid` 与「密码只能改一次」
 
-`config.json` 新增字段 `uuid`，语义是「**`user.json` 的指纹**」：
+`config.json` 的 `uuid` 存的是「**口令状态的指纹**」。口径按用户原话定：
+
+> 创建用户时：将已经存入的**密码、盐和用户 id、创建时间**的内容进行哈希运算，
+> 将计算值存入 `config.json` 的 `uuid`
 
 ```text
-建号 / 初始化    uuid := md5(user.json 的规范化文本)
-user update     ① 先验旧口令；② uuid 必须与**当前记录的 MD5**一致（= 还没改过）；
-                ③ 改完之后，uuid := **改动之前**那份记录的 MD5
-下一次再来       uuid 与当前记录的 MD5 不再一致 → 拒绝，提示「先 user delete 再 user create」
+指纹 = md5( { user_id, password_hash, password_salt, created_at } 的规范化 JSON )
+
+建号 / 初始化    uuid := 指纹
+user update     ① 先验旧口令；② uuid 必须等于**当前记录**的指纹（= 还没改过）；
+                ③ 改完之后，uuid := **改动之前**那份记录的指纹
+下一次再来       uuid 与当前记录的指纹不再一致 → 拒绝，提示「先 user delete 再 user create」
 ```
 
-**③ 的时点极关键**（真踩过）：曾经写成"保存之后再取指纹"，那等于把 uuid 设成
-**改完之后**那份文件的 MD5，而下一次进来加载到的正是它，于是「改前指纹 == uuid」
-永远成立 —— **可以无限次改密**。被 `App.初始化数据根不再自动建账号` 这条用例钉住。
+**只算这四项的理由**：其余字段都会自己动 —— `token` / `token_issued_at` /
+`token_expires_at`（`user token renew` 会重写）、`last_login_at` / `updated_at`
+（每次登录都会写）。把它们算进来，一次登录或一次换 token 就会被判成"密码已经改过"，
+机主被永久锁死；而如果为了绕开去重写 uuid，又会把"已改过"的状态抹掉、重新放开一次改密。
 
-**`record_md5()` 不是裸文件字节的 MD5**，而是 `UserStore::record_json_text()` 的
-规范化文本（与 `save()` 完全同一套序列化）的 MD5：这样"同一个账号重建"能得到同一个
-指纹，不受磁盘格式/换行影响。
+**兼容**：升级前两代的口径（整条记录只排 token 字段、以及更早的整份文件 MD5）**都认**
+（`never_changed_password()`），否则一个明明没改过密码的老账号会被判成"已经改过"。
+任一次成功的改密 / 换 token 会把 uuid 迁移成新口径。
+
+**③ 的时点极关键**（真踩过）：曾经写成"保存之后再取指纹"，那等于把 uuid 设成
+**改完之后**那份记录的指纹，而下一次进来加载到的正是它，于是「改前指纹 == uuid」
+永远成立 —— **可以无限次改密**。被 `App.初始化数据根不再自动建账号` 这条用例钉住。
 
 ## 18.6 `data/user.json` 不会被日常操作改写
 
-`uuid` 规则成立的前提是：**正常使用期间 `user.json` 一个字节都不变**。
+`uuid` 规则成立的前提是：**指纹里的那四个字段在正常使用期间不变**。
 
-`record_login` / `refresh_current_bucket` 这两个会写 `user.json` 的函数
-**都不在请求路径上**（HTTP 认证是每请求现读，不写回），所以指纹稳定。
-这条约束改动前要先想清楚：任何"每次请求顺手更新一下 last_login_at"的改动都会
-让「密码只能改一次」立刻失效。
+`user.json` 本身**会**被改写（两处，都是有意的）：
+
+| 时机 | 写什么 | 影响指纹吗 |
+|---|---|---|
+| 登录成功（`user.verify` 之后） | `last_login_at`、`updated_at` | **不**（不在四项里） |
+| `user token renew` | `token` / `token_issued_at` / `token_expires_at` | **不**（不在四项里） |
+
+**这条约束不能松**：如果哪天有人把 `last_login_at` 或 token 加进指纹，
+登录一次或换一次 token 就会让「密码只能改一次」误判——要么把机主锁死
+（判成已改过），要么把状态洗回"没改过"（重新放开一次）。
+对应地，HTTP 认证仍然是**每请求现读、不写回**，所以登录时间只在真正登录时更新。
 
 ---
 
@@ -10341,6 +10363,7 @@ blocked 的情况     歧义（file.delete）、同名冲突 / 随桶删除 / �
 | 46 | **口令明文不出 CLI 进程 + 登录门禁（本次改动，未提交）**：用户要求「使用 `fmt -u <username> -p` 回车输入密码登录（密码显示 `*`），本次 CLI 关闭后又要重新登录」「`service` 命令不被限制使用，但其他业务类型的数据就会被禁用，除非登录」，并指定「后续我要通过像 mysql 一样使用 jar 包登录和使用，token 做为临时备用钥匙」，门禁范围选**方案 A（只做在 CLI）**。做法：CLI 先向服务要 `user.salt` → 本地 `password_digest(口令, 盐)`（PBKDF2-SHA256 10 万轮）→ 只把摘要发给 `user.verify` 常量时间比对；登录态只存 `Session::logged_in`（**内存，不落盘**——落盘就不叫"关掉重开要重新登录"）；门禁在 `run_interactive()` 与 `dispatch_command()` 两处，`service` / `log` / `help` / `version` / `exit` / `user get` / `user create` 放行；窗口内也能 `login` / `logout`。**服务端认证协议一个字没改**（管道与 HTTP 仍每请求认 token）。**测试 179 → 180 项全绿**（含 `-u/-p` 进窗口、窗口内 login、logout 后又被拦、未登录被拒）。见第 18.3、18.4 节 | ① **挑战-应答在密码学上走不通**：服务只存单向摘要，而 PBKDF2 不可组合（`PBKDF2(P) ≠ PBKDF2(PBKDF2(P))`），服务端无法对随机 nonce 算出同一应答值——除非存明文或"口令等价值"，那更糟。所以是"CLI 用服务给的盐算摘要、只发摘要"。② **盐必须由服务给**：老账号是**随机盐**，若一律按用户名派生，老账号口令会当场验不过、等于把机主锁在门外（真踩过，已加 `App.老账号的随机盐依然能验密与改密` 钉住）。③ 门禁选方案 A：服务端协议不动，Java/token 直连不受影响，token 就是那颗"临时备用钥匙"；要做 jar 登录接口时只加接口、不改现有认证。④ `-u/-p` 不带命令必须**进窗口**（真踩过：登录完直接 `return 0`，表现为"登录成功但窗口里什么都没发生"）。⑤ 单实例互斥体加 `FMT_MUTEX` 覆盖：否则用户开着 FMT 窗口时，e2e 的无参数交互式子进程会撞上互斥体**静默退出**（表现为"输出里只有登录成功"） |
 | 47 | **`config.json` 的 `uuid` + 「密码只能改一次」（本次改动，未提交）**：用户要求「user update password 回车输入新密码确认密码，只能修改一次」，并指定判定办法「将已经创建的 `user.json` 生成一个 MD5，保存在 `config.json` 里字段 `uuid`，第一次改密码将 `user.json` 的 MD5 与 `config.json` 比对，一致说明是第一次修改允许改，改完的 MD5 肯定与之前的 `uuid` 不一致，下一次就提示不能修改、提示用户删除用户重新创建」。做法：`Config::uuid` 序列化为 `uuid`；`record_md5(record)` = `UserStore::record_json_text()`（与 `save()` 同一套序列化）的 MD5；建号/初始化写入；改密时"uuid 必须等于当前记录的 MD5"才放行，成功后把 uuid 置为**改动之前**那份记录的 MD5。**测试 178 → 179 项**（`App.初始化数据根不再自动建账号` 与新增的老账号用例）。见第 18.5、18.6 节 | 用户给的方案就是对的，直接照做。**踩过的坑必须记住**：uuid 只能取"**改之前**"的指纹——写成"保存之后再取"，等于把 uuid 设成"改完之后那份文件"的 MD5，而下一次进来加载到的正是它，于是"改前指纹 == uuid"永远成立，**可以无限次改密**（被用例钉住）。另一条隐含约束：`user.json` 在日常使用中**不能被改写**，否则指纹漂移、规则失效——`record_login` / `refresh_current_bucket` 因此都不能上请求路径 |
 | 48 | **访问 token 加时效：过期一律拒绝（本次改动，未提交）**：用户要求「service 端实现 token 的时效性，过时不能用」。落地：① `data/user.json` 新增 `token_issued_at` / `token_expires_at`（本地时间 `YYYY-MM-DDTHH:MM:SS`）；② `config.json` 新增 `token_ttl_seconds`（默认 **7 天**），`config set token_ttl 7d|12h|3600`（**拒绝 0**——允许 0 就等于留了「永不过期」的后门），改它只影响**下一次签发**；③ `UserStore::find_by_token()` 先比 token 再判时效，过期回**独立错误码 `FMT-019 TokenExpired`**（与 `FMT-018` 区分：前者该去续期，后者是凭证抄错），HTTP 401 信封里带着原因与补救命令；④ 新增 `user token renew`（**凭密码摘要**，`user.token.renew` 服务 op）换发 token，旧 token 立即失效；⑤ **没有 `token_expires_at` 的老 token 按已过期处理**（升级后必须换一次——「说不清有效期的凭证不放行」）；⑥ 指纹口径调整：`config.uuid` 的指纹**排除 token 三个字段**，否则换 token 会被判成「已经改过密码」（或反过来把「已改过」抹掉）；`update_password` 同时认老口径（整份文件 MD5）以保证老账号不被锁死。**测试 180 → 185 项全绿**（`User.新建账号的token带有效期且默认七天` / `User.token过期后服务拒绝` / `User.没有有效期记录的旧token按过期处理` / `User.换发token后旧的立刻失效且密码仍只能改一次` / `Server.token过期返回FMT019而不是FMT018`，以及 `config set token_ttl` 的解析与拒绝 0）。见第 18.7 节、`FMT 技术文档.md` 第 12.3.2 节 | 用户的原话是「过时不能用」，那就不能有「永久有效」这条后门：`token_ttl_seconds = 0` 被明确拒绝。**续期必须凭密码而不是凭旧 token**——否则 token 一过期就只剩 `user delete`（数据全没）这一条路；而凭旧 token 续期又等于没有时效。**指纹必须排除 token**：`uuid` 的语义是「密码改没改过」，轮换凭证与改密码是两件事，混在一起会互相踩（真踩过的坑：uuid 取错时点导致改密可以无限次）。老 token 按过期处理是刻意的：v1.0/v2.0 的 token 是永久凭证，继续放行等于这次改动白做；代价是升级后要跑一次 `user token renew`，错误消息里直接给了这条命令 |
+| 49 | **账号口径三处修正（本次改动，未提交）**：用户真机提的三条——「登录之后最后登录时间没变」「改成登录之后才能用 `user get`」「希望能输出当前 token」，并明确了改密指纹的口径：「将已经存入的**密码、盐和用户 id、创建时间**的内容进行哈希运算，存入 `config.json` 的 `uuid`」。落地：① `user.verify` 验过口令后调 `UserService::record_login()` 写 `last_login_at` / `updated_at`（写失败只记日志、不阻断登录）；② 指纹改成**只算这四项**（`user_id` / `password_hash` / `password_salt` / `created_at`），token 三件套与登录痕迹全部排除——这样「登录一次」或「换一次 token」都不会把「密码只能改一次」判歪；旧两代口径继续认（`never_changed_password()`），老账号不被锁死；③ `user get` 移进登录门禁（它现在要打 token），未登录拒之；④ `describe()` 增加 `token`，CLI 打成「访问 token：…」+「请求头：X-FMT-Token: …」。**测试 185 → 186 项全绿**（新增 `User.登录更新最后登录时间且不影响改密判定`；e2e 断言窗口内登录后 `最后登录` 有值、`user get` 给 token、未登录被拒） | 三条都是用户实测出来的，口径没有争议。**指纹必须排除"会自己动"的字段**是关键：登录写 `last_login_at`、换 token 写 token 字段，这些若进指纹，要么把机主锁死（误判已改过），要么把状态洗回去（重新放开一次改密）。用户给的四项口径正好是"账号身份 + 口令状态"，比"整份文件"稳得多。`user get` 要登录是因为它开始输出 token——凭证不该在未认证状态下给 |
 
 
 以下决策在第二阶段编码前确定，**不再扩展基础架构**，各模块按此实现。

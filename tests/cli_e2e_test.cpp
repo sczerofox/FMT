@@ -105,7 +105,14 @@ CliRun run_cli(const std::filesystem::path& exe, const std::vector<std::string>&
     // 「明明该打印却什么都没打印」。把事实测出来，别去猜。
     {
         SetLastError(ERROR_SUCCESS);  // 不平：CreateMutexW 只在新建时报 ERROR_ALREADY_EXISTS
-        HANDLE probe = CreateMutexW(nullptr, FALSE, L"Local\\FMT.CLI.v1");
+        // 子进程用的是 FMT_MUTEX 指定的名字（fixture 每实例唯一）；探针必须查**同一个**，
+        // 否则会去查 Local\FMT.CLI.v1 然后因为用户开着窗口而误报。
+        wchar_t override_name[256] = {};
+        const DWORD override_len =
+            GetEnvironmentVariableW(L"FMT_MUTEX", override_name, 256);
+        std::wstring probe_name =
+            override_len > 0 ? std::wstring(L"Local\\") + override_name : std::wstring(L"Local\\FMT.CLI.v1");
+        HANDLE probe = CreateMutexW(nullptr, FALSE, probe_name.c_str());
         const bool busy = (probe != nullptr && GetLastError() == ERROR_ALREADY_EXISTS);
         if (probe != nullptr) {
             CloseHandle(probe);
@@ -397,10 +404,16 @@ FMT_TEST(CliE2e, user命令打出账号字段而不是只剩一句提示) {
     // 窗口内登录（真机反馈的用法）：进了提示符再敲 login，登录后同一次会话里业务命令可用。
     // 曾经 `-u/-p` 只在启动参数里有效，窗口里敲 `fmt -u lazy -p` 会被门禁当成未知命令组。
     const CliRun in_prompt = run_interactive_via_login_command(
-        fixture, "login\n" + std::string(E2eFixture::kTestPassword) + "\nfile list\nexit\n");
+        fixture, "login\n" + std::string(E2eFixture::kTestPassword) +
+                      "\nfile list\nuser get\nexit\n");
     FMT_CHECK(has(in_prompt, "登录成功"));
     FMT_CHECK(has(in_prompt, "密码"));            // 问了密码
     FMT_CHECK(!has(in_prompt, "需要先登录"));     // 登录之后没再拦
+    // 登录要**更新时间戳**（用户要求）：窗口内 user get 不该再说「还没登录过」。
+    FMT_CHECK(has(in_prompt, "最后登录："));
+    FMT_CHECK(!has(in_prompt, "最后登录：（还没登录过）"));
+    // 而且登录之后 `user get` 要能给出 token。
+    FMT_CHECK(has(in_prompt, "访问 token："));
 
     // 窗口内 logout：登出之后业务命令又要登录
     const CliRun after_logout = run_interactive_via_login_command(
@@ -409,9 +422,13 @@ FMT_TEST(CliE2e, user命令打出账号字段而不是只剩一句提示) {
     FMT_CHECK(has(after_logout, "已退出登录"));
     FMT_CHECK(has(after_logout, "需要先登录"));   // 门禁回来了
 
-    // 关键回归：`user get` 必须把字段列出来，不能只剩一句提示。
-    // 它**不需要登录**（看账号状态是允许的）——所以这里走不带 -p 的调用。
-    const CliRun got = fixture.cli({"user", "get"});
+    // `user get` **要登录**（用户要求）：未登录必须被拒。
+    const CliRun denied_get = fixture.cli({"user", "get"});
+    FMT_CHECK(denied_get.exit_code != 0);
+    FMT_CHECK(has(denied_get, "需要先登录"));
+
+    // 关键回归：登录之后 `user get` 必须把字段与 token 都列出来，不能只剩一句提示。
+    const CliRun got = fixture.business({"user", "get"});
     if (got.exit_code != 0) {
         std::fprintf(stderr, "[e2e] user get 输出：\n%s\n", got.output.c_str());
     }
@@ -422,9 +439,10 @@ FMT_TEST(CliE2e, user命令打出账号字段而不是只剩一句提示) {
     FMT_CHECK(has(got, "创建时间："));
     FMT_CHECK(has(got, "密码状态："));
     FMT_CHECK(has(got, "还可以修改一次"));
-    FMT_CHECK(!has(got, "password_hash"));   // 凭证一个都不打
+    FMT_CHECK(has(got, "访问 token："));      // 用户要求：user get 要能看当前 token
+    FMT_CHECK(has(got, "X-FMT-Token:"));
+    FMT_CHECK(!has(got, "password_hash"));   // 口令哈希/盐仍然一个都不打
     FMT_CHECK(!has(got, "password_salt"));
-    FMT_CHECK(!has(got, "访问 token"));
 
     // 口令错：`user delete` 不该放行（真删目录之前的最后一道闸）
     const CliRun wrong = fixture.business({"user", "delete"}, "definitely-wrong\ndelete\n");
@@ -462,8 +480,8 @@ FMT_TEST(CliE2e, user命令打出账号字段而不是只剩一句提示) {
     FMT_CHECK(second.exit_code != 0);
     FMT_CHECK(has(second, "只能修改一次") || has(second, "不能再改"));
 
-    // 改完之后 `user get` 如实报告「不能再改」，旧口令也不再有效。
-    const CliRun after = fixture.cli({"user", "get"});  // 只读，不需要登录
+    // 改完之后 `user get`（**要登录**，用新口令）如实报告「不能再改」。
+    const CliRun after = fixture.business_with_password("new-pw", {"user", "get"});
     FMT_CHECK_EQ(after.exit_code, 0);
     FMT_CHECK(has(after, "已经修改过一次"));
 

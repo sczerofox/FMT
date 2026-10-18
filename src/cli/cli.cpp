@@ -976,7 +976,7 @@ void print_business_data(const nlohmann::json& data, bool show_token = false) {
             expiry != data.end() && expiry->is_string()) {
             std::printf("token 有效期：%s\n", expiry->get<std::string>().c_str());
         }
-        // `user token renew` 的响应会带新 token：换发之后不把新值打出来就等于白换。
+        // token 值：`user get` 与 `user token renew` 都会带。
         if (const auto token = data.find("token"); token != data.end() && token->is_string()) {
             std::printf("访问 token：%s\n", token->get<std::string>().c_str());
             if (const auto issued = data.find("token_issued_at");
@@ -2325,11 +2325,13 @@ int run_interactive(const Options& options, service::State state, Session& sessi
         // **service / log / help / version / exit 不受限**——服务坏了、账号进不去的时候，
         // 还得靠它们把机器救回来。
         //
-        // 例外：`user create`（还没有账号时得先能建）与 `user get`（看账号状态）。
-        // `token renew` 自带密码校验（服务端凭摘要签发），所以不需要先登录。
+        // 例外只剩两条：
+        //   * `user create`：还没有账号时得先能建出来；
+        //   * `user token renew`：自带密码校验（服务端凭摘要签发）。
+        // `user get` **不在例外里**（用户要求：登录之后才能看账号信息，因为要打 token）。
         const bool user_readonly_ok =
             (head == "user" && parts.size() >= 2 &&
-             (parts[1] == "create" || parts[1] == "get" || parts[1] == "token"));
+             (parts[1] == "create" || parts[1] == "token"));
         if (!session.logged_in && !user_readonly_ok && !business_allowed(head, !need_account)) {
             // 提示要**能照着做**：窗口里直接 `login` 就行。
             // 曾经写的是「请重新打开窗口并登录：fmt -u <用户名> -p」——那时候窗口内
@@ -2337,7 +2339,7 @@ int run_interactive(const Options& options, service::State state, Session& sessi
             std::printf(
                 "需要先登录才能执行 %s。\n"
                 "本窗口内登录：login <用户名>      （回车后隐藏输入密码）\n"
-                "不需要登录：service / log / help / version / user get / user create / user token renew\n",
+                "不需要登录：service / log / help / version / user create / user token renew\n",
                 command_label(parts).c_str());
             continue;
         }
@@ -2604,7 +2606,7 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
             // `user get`（看账号状态）不需要登录。
             const bool user_readonly_ok =
                 (rest[0] == "user" && rest.size() >= 2 &&
-                 (rest[1] == "create" || rest[1] == "get" || rest[1] == "token"));
+                 (rest[1] == "create" || rest[1] == "token"));
             if (!user_readonly_ok) {
                 const std::string label = command_label(rest);
                 std::fprintf(stderr,
