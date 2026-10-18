@@ -444,17 +444,16 @@ FMT_TEST(CliE2e, user命令打出账号字段而不是只剩一句提示) {
     FMT_CHECK(!has(got, "password_hash"));   // 口令哈希/盐仍然一个都不打
     FMT_CHECK(!has(got, "password_salt"));
 
-    // 口令错：`user delete` 不该放行（真删目录之前的最后一道闸）
-    const CliRun wrong = fixture.business({"user", "delete"}, "definitely-wrong\ndelete\n");
-    FMT_CHECK(wrong.exit_code != 0);
-    FMT_CHECK(has(wrong, "口令不正确") || has(wrong, "Unauthorized"));
-    FMT_CHECK(fmt::file_exists(fixture.root() / "data" / "user.json"));  // 数据还在
-
-    // 口令对 + 没敲 delete：什么都不删
-    const CliRun refused = fixture.business({"user", "delete"}, "e2e-secret\nno\n");
+    // `user delete` **既不需要登录、也不需要密码**（用户要求：忘记密码时这是唯一出路）。
+    // 防误触靠的是「逐字输入 delete」。
+    const CliRun refused = fixture.cli({"user", "delete"}, "no\n");
     FMT_CHECK_EQ(refused.exit_code, 0);
     FMT_CHECK(has(refused, "已取消"));
-    FMT_CHECK(fmt::file_exists(fixture.root() / "data" / "user.json"));
+    FMT_CHECK(fmt::file_exists(fixture.root() / "data" / "user.json"));  // 数据还在
+
+    // 登录也不该是前置条件：这一条不带 -u/-p 也必须能走到确认提示。
+    FMT_CHECK(!has(refused, "需要先登录"));
+    FMT_CHECK(has(refused, "逐字输入 delete"));
 
     // token 换发：**要登录**（用户要求：改密码、换 token 都得先登录）。
     const CliRun renew_denied = fixture.cli({"user", "token", "renew"});
@@ -488,10 +487,20 @@ FMT_TEST(CliE2e, user命令打出账号字段而不是只剩一句提示) {
     FMT_CHECK_EQ(after.exit_code, 0);
     FMT_CHECK(has(after, "已经修改过一次"));
 
-    const CliRun old_password = fixture.business_with_password("new-pw", {"user", "delete"}, "e2e-secret\ndelete\n");
-    FMT_CHECK(old_password.exit_code != 0);
-    FMT_CHECK(has(old_password, "口令不正确"));
-    FMT_CHECK(fmt::file_exists(fixture.root() / "data" / "user.json"));
+    // 真删：逐字 delete 才动手，删完立刻重建目录骨架（同一进程里能接着 user create）。
+    const CliRun deleted = fixture.cli({"user", "delete"}, "delete\n");
+    FMT_CHECK_EQ(deleted.exit_code, 0);
+    FMT_CHECK(has(deleted, "已永久删除"));
+    FMT_CHECK(has(deleted, "目录结构已重建"));
+    FMT_CHECK(has(deleted, "user create"));
+    // 账号没了：user.json 只剩版本号；桶目录也清空了。
+    const auto remaining = fmt::read_json_file(fixture.root() / "data" / "user.json");
+    FMT_CHECK(fmt::ok(remaining));
+    if (fmt::ok(remaining)) {
+        FMT_CHECK(!std::get<nlohmann::json>(remaining).contains("username"));
+    }
+    FMT_CHECK(fmt::file_exists(fixture.root() / "data" / "file.json"));   // 骨架重建了
+    FMT_CHECK(!fmt::file_exists(fixture.root() / "repository" / "user"));  // 业务数据没了
 }
 
 FMT_TEST(CliE2e, 核心链路走真实exe与真实管道) {

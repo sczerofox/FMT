@@ -1030,7 +1030,7 @@ user
 | `user create <用户名>` | `user.create` | 建账号；提示两次口令（**回显 `*`**）、写 `data/user.json`、把该文件的 MD5 记进 `config.json` 的 `uuid` |
 | `user get` | `user.get` | 打印账号字段（用户名 / ID / 当前 Bucket / 创建时间 / 更新时间 / 最后登录 / 密码状态 / **当前 token 与有效期**）。**要登录才能用**；仍然不打印口令哈希与盐 |
 | `user update password` | `user.update` | 当前密码 → 新密码 ×2；**只能改一次**（第 18.6 节） |
-| `user delete` | `user.delete` | 先验密码，再**逐字输入 `delete`** 才动手；永久删除 `repository/ trash/ config/ data/ temp/`（只留 `fmt.exe` 与 `log/`），**不进回收站、不可撤销** |
+| `user delete` | 不再走服务 | **不需要登录、不需要密码**（忘记密码时唯一的逃生门），只要**逐字输入 `delete`**；永久删除 `repository/ trash/ config/ data/ temp/`（只留 `fmt.exe` 与 `log/`），删完**立刻重建目录骨架**，同一窗口可直接 `user create`。**不进回收站、不可撤销** |
 | （内部）取口令盐 | `user.salt` | 供登录/改密/删除前算摘要用（第 18.4 节） |
 | （内部）验口令 | `user.verify` | 登录用：常量时间比对摘要 |
 
@@ -1082,8 +1082,8 @@ fmt> logout                   # 退出登录
 | 需要登录 | 不需要登录 |
 |---|---|
 | `file *`、`bucket *`、`trash *`、`share *`、`config *` | `service *`（装/卸/启/停/重装/状态） |
-| `user get`、`user token renew`、`user delete` | `log clean`、`help`、`version`、`exit` |
-| | `user create`（还没有账号时得先能建）、`user update password`（自己会问当前密码） |
+| `user get`、`user token renew` | `log clean`、`help`、`version`、`exit` |
+| | `user create`（还没有账号时得先能建）、`user update password`（自己会问当前密码）、`user delete`（忘记密码时的唯一出路） |
 
 不受限的那几类是有意为之：服务坏了、账号进不去的时候，得靠它们把机器救回来。
 拦下时的提示必须**能照着做**：`本窗口内登录：login <用户名>`。

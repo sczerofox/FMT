@@ -311,8 +311,8 @@ bool print_command_help(const std::string& topic) {
             "\n"
             "为什么需要登录：业务数据（文件/桶/回收站/分享/配置与改密删号）都要先证明你是机主。\n"
             "不需要登录的：service（装/卸/启/停/重装/状态）、log clean、help、version、\n"
-            "user create（还没有账号时得先能建）、user update password（自己会问当前密码）。\n"
-            "其余 user 子命令（get / token renew / delete）都要先登录。\n"
+            "user create（还没有账号时得先能建）、user update password（自己会问当前密码）、\n"
+            "user delete（忘记密码时的唯一出路）。其余 user 子命令（get / token renew）要登录。\n"
             "\n"
             "登录态**只在本次窗口的内存里**：窗口一关就要重新登录。\n"
             "口令明文不出本进程：CLI 先取口令盐、本地算摘要，只把摘要交给服务比对。\n");
@@ -1411,6 +1411,7 @@ int delete_data_root(const Options& options) {
                 fmt::path_to_utf8(paths.file_data()).c_str());
     std::printf("只保留 fmt.exe 与 log/。\n");
     std::printf("**不进回收站、无法撤销**：账号、令牌、桶里的文件、回收站里的历史都会消失。\n");
+    std::printf("删完之后目录结构会自动重建，可以立刻 `user create <用户名>` 建新账号。\n");
     std::printf("确认请逐字输入 delete（其它任何输入都会取消）：");
     std::fflush(stdout);
 
@@ -1447,8 +1448,21 @@ int delete_data_root(const Options& options) {
                      failures);
         return exit_code(ErrorCode::StorageError);
     }
-    std::printf(
-        "\n数据已永久删除。下次启动会重建目录结构，并用 `user create <用户名>` 建新账号。\n");
+
+    // 删完立刻把目录骨架建回来（目录 + 四个默认 JSON，**不建账号**）。
+    //
+    // 为什么必须重建：`user create` 有「关键数据文件缺失就拒绝」的保护，
+    // 而刚删掉 data/ 之后四个文件都不在——不重建的话用户还得关掉窗口重开一次
+    // 才能建账号（真机流程里那一步很突兀）。
+    const Result<RootRepair> rebuilt = ensure_root(paths);
+    if (!ok(rebuilt)) {
+        std::fprintf(stderr, "数据已删除，但目录结构重建失败：%s\n",
+                     error_of(rebuilt)->message.c_str());
+        return exit_code(ErrorCode::StorageError);
+    }
+
+    std::printf("\n数据已永久删除，目录结构已重建。\n");
+    std::printf("现在可以直接建新账号：user create <用户名>\n");
     return 0;
 }
 
@@ -1571,6 +1585,19 @@ int run_user_command(const std::vector<std::string>& parts, Session& session,
         return exit_code(ErrorCode::InvalidArgument);
     }
     const std::string& verb = parts[1];
+
+    // **`user delete` 在连接服务之前处理**：它不需要登录、也不需要密码。
+    //
+    // 用户的原话：「用户不记得密码 还不能重新创建用户吗？user delete 为什么要登录？」
+    // 判断成立——删号是「忘记密码」时唯一的逃生门。若这里还要密码，门就锁死了
+    // （密码记不住，还得用它来删号，等于永远进不去）。
+    //
+    // 安全口径：这个数据根的所有者是本机这个 Windows 用户，他本来就能用资源管理器
+    // 直接删 data/；密码校验在这里只是仪式，不是边界。真正的防误触是「逐字输入 delete」。
+    // 也正因为不碰服务，服务没装/没跑的时候照样能删。
+    if (verb == "delete") {
+        return delete_data_root(options);
+    }
 
     if (const Status status = ensure_connected(session, options); !ok(status)) {
         log_error("Cli", "user 命令无法连接服务：" + error_of(status)->message);
@@ -1774,77 +1801,6 @@ int run_user_command(const std::vector<std::string>& parts, Session& session,
         request.op = "user.update";
         request.args["current_digest"] = current_digest;  // 旧口令的摘要：服务只做比对
         request.args["password_digest"] = digest;         // 新口令的摘要
-    } else if (verb == "delete") {
-        // 口令校验：CLI 本地把口令派生成摘要发给服务比对（明文不出本进程）。
-        // 通过之后，真正删目录由本进程做——服务持有 log/ 句柄，让它删自己的数据根
-        // 是在踩自己的脚。
-        std::string username;
-        std::string salt;
-        {
-            ipc::Request who = request;
-            who.op = "user.get";
-            who.id = session.next_id++;
-            Result<ipc::Response> named = session.client.call(who, ipc::kCommandTimeoutMs);
-            if (!ok(named)) {
-                session.connected = false;
-                print_failure(*error_of(named));
-                return exit_code(error_of(named)->code);
-            }
-            if (!std::get<ipc::Response>(named).ok) {
-                print_failure(std::get<ipc::Response>(named).error);
-                return exit_code(std::get<ipc::Response>(named).error.code);
-            }
-            username = std::get<ipc::Response>(named).data.value("username", std::string{});
-        }
-        {
-            ipc::Request want = request;
-            want.op = "user.salt";
-            want.id = session.next_id++;
-            Result<ipc::Response> got = session.client.call(want, ipc::kCommandTimeoutMs);
-            if (!ok(got)) {
-                session.connected = false;
-                print_failure(*error_of(got));
-                return exit_code(error_of(got)->code);
-            }
-            if (!std::get<ipc::Response>(got).ok) {
-                print_failure(std::get<ipc::Response>(got).error);
-                return exit_code(std::get<ipc::Response>(got).error.code);
-            }
-            salt = std::get<ipc::Response>(got).data.value("salt", std::string{});
-        }
-        if (salt.empty()) {
-            std::fprintf(stderr, "服务没有给出账号口令盐，无法校验\n");
-            return exit_code(ErrorCode::StorageError);
-        }
-
-        std::string current;
-        if (!read_password_masked("请输入密码：", &current)) {
-            return exit_code(ErrorCode::InvalidArgument);
-        }
-        const std::string current_digest = fmt::password_digest(current, salt);
-        current.assign(current.size(), '\0');
-        if (current_digest.empty()) {
-            std::fprintf(stderr, "无法计算口令摘要（CSPRNG/PBKDF2 失败）\n");
-            return exit_code(ErrorCode::StorageError);
-        }
-
-        ipc::Request verify = request;
-        verify.op = "user.delete";  // 服务在这里只做「口令对不对」，不删任何东西
-        verify.id = session.next_id++;
-        verify.args["current_digest"] = current_digest;
-        Result<ipc::Response> checked = session.client.call(verify, ipc::kCommandTimeoutMs);
-        if (!ok(checked)) {
-            session.connected = false;
-            print_failure(*error_of(checked));
-            return exit_code(error_of(checked)->code);
-        }
-        const ipc::Response& checked_value = std::get<ipc::Response>(checked);
-        if (!checked_value.ok) {
-            print_failure(checked_value.error);
-            return exit_code(checked_value.error.code);
-        }
-        std::printf("口令正确。\n");
-        return delete_data_root(options);
     } else {
         std::fprintf(stderr, "未知的 user 子命令：%s\n\n", verb.c_str());
         return exit_code(ErrorCode::InvalidArgument);
@@ -2330,14 +2286,15 @@ int run_interactive(const Options& options, service::State state, Session& sessi
         // **service / log / help / version / exit 不受限**——服务坏了、账号进不去的时候，
         // 还得靠它们把机器救回来。
         //
-        // 两条例外：
+        // 三条例外，都是「不能逼人先登录」的：
         //   * `user create`：还没有账号时得先能建出来；
-        //   * `user update password`：**本身就是凭密码自证的**（会问当前密码），
-        //     逼用户先 login 一次等于把同一个密码输入两遍（用户明确要求「可以不登录改一次密码」）。
-        // 其余 user 子命令（get / token renew / delete）都要登录。
+        //   * `user update password`：本身凭密码自证（会问当前密码），
+        //     逼用户先 login 等于把同一个密码输两遍；
+        //   * `user delete`：**忘记密码时唯一的逃生门**（用户明确要求）。
+        // 其余 user 子命令（get / token renew）都要登录。
         const bool user_readonly_ok =
             (head == "user" && parts.size() >= 2 &&
-             (parts[1] == "create" || parts[1] == "update"));
+             (parts[1] == "create" || parts[1] == "update" || parts[1] == "delete"));
         if (!session.logged_in && !user_readonly_ok && !business_allowed(head, !need_account)) {
             // 提示要**能照着做**：窗口里直接 `login` 就行。
             // 曾经写的是「请重新打开窗口并登录：fmt -u <用户名> -p」——那时候窗口内
@@ -2345,7 +2302,7 @@ int run_interactive(const Options& options, service::State state, Session& sessi
             std::printf(
                 "需要先登录才能执行 %s。\n"
                 "本窗口内登录：login <用户名>      （回车后隐藏输入密码）\n"
-                "不需要登录：service / log / help / version / user create / user update password\n",
+                "不需要登录：service / log / help / version / user create / user update password / user delete\n",
                 command_label(parts).c_str());
             continue;
         }
@@ -2612,7 +2569,7 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
             // `user get`（看账号状态）不需要登录。
             const bool user_readonly_ok =
                 (rest[0] == "user" && rest.size() >= 2 &&
-                 (rest[1] == "create" || rest[1] == "update"));
+                 (rest[1] == "create" || rest[1] == "update" || rest[1] == "delete"));
             if (!user_readonly_ok) {
                 const std::string label = command_label(rest);
                 std::fprintf(stderr,
