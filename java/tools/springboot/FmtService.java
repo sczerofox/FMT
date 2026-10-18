@@ -99,8 +99,13 @@ public class FmtService {
             name = "upload.bin";
         }
         try (InputStream in = file.getInputStream()) {
-            return fmt.upload(in, name).orThrow();
+            return upload(in, name);
         }
+    }
+
+    /** 给非 Web 调用方（例如 UserService）复用：直接传流和文件名。 */
+    public FmtUpload upload(InputStream in, String fileName) {
+        return fmt.upload(in, fileName).orThrow();
     }
 
     /** 下载/预览落盘；{@code target} 由调用方决定，SDK 不接受服务端路径。 */
