@@ -245,3 +245,10 @@ FMT_TEST(User, 登录更新最后登录时间且不影响改密判定) {
         FMT_CHECK_EQ(fmt::error_of(twice)->code, fmt::ErrorCode::PermissionDenied);
     }
 }
+
+FMT_TEST(User, PBKDF2与Java和标准向量一致) {
+    // 与 Java PasswordDigestTest 用同一个向量：PBKDF2-HMAC-SHA256、100000 轮、32 字节，
+    // 口令含中文（UTF-8 原始字节）。它同时钉住 C++ 与 Java 两个 jar 的摘要算法一致。
+    FMT_CHECK_EQ(fmt::password_digest("密码", "00112233445566778899aabbccddeeff"),
+                 std::string("8311414396192b4a109f0f247c08680e8e06f7d0c8871ff7c0faa3582d7a18a0"));
+}
