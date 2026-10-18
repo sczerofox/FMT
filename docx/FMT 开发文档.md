@@ -1082,8 +1082,8 @@ fmt> logout                   # 退出登录
 | 需要登录 | 不需要登录 |
 |---|---|
 | `file *`、`bucket *`、`trash *`、`share *`、`config *` | `service *`（装/卸/启/停/重装/状态） |
-| `user get`、`user update password`、`user token renew`、`user delete` | `log clean`、`help`、`version`、`exit` |
-| | `user create`（还没有账号时得先能建） |
+| `user get`、`user token renew`、`user delete` | `log clean`、`help`、`version`、`exit` |
+| | `user create`（还没有账号时得先能建）、`user update password`（自己会问当前密码） |
 
 不受限的那几类是有意为之：服务坏了、账号进不去的时候，得靠它们把机器救回来。
 拦下时的提示必须**能照着做**：`本窗口内登录：login <用户名>`。

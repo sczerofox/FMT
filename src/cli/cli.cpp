@@ -311,8 +311,8 @@ bool print_command_help(const std::string& topic) {
             "\n"
             "为什么需要登录：业务数据（文件/桶/回收站/分享/配置与改密删号）都要先证明你是机主。\n"
             "不需要登录的：service（装/卸/启/停/重装/状态）、log clean、help、version、\n"
-            "user create（还没有账号时得先能建）。其余 user 子命令（get / update password /\n"
-            "token renew / delete）都要先登录。\n"
+            "user create（还没有账号时得先能建）、user update password（自己会问当前密码）。\n"
+            "其余 user 子命令（get / token renew / delete）都要先登录。\n"
             "\n"
             "登录态**只在本次窗口的内存里**：窗口一关就要重新登录。\n"
             "口令明文不出本进程：CLI 先取口令盐、本地算摘要，只把摘要交给服务比对。\n");
@@ -2330,11 +2330,14 @@ int run_interactive(const Options& options, service::State state, Session& sessi
         // **service / log / help / version / exit 不受限**——服务坏了、账号进不去的时候，
         // 还得靠它们把机器救回来。
         //
-        // 例外只剩一条：`user create`（还没有账号时得先能建出来）。
-        // `user get` / `user update password` / `user token renew` / `user delete`
-        // **全部要登录**（用户明确要求：改密码、换 token 都得先登录）。
+        // 两条例外：
+        //   * `user create`：还没有账号时得先能建出来；
+        //   * `user update password`：**本身就是凭密码自证的**（会问当前密码），
+        //     逼用户先 login 一次等于把同一个密码输入两遍（用户明确要求「可以不登录改一次密码」）。
+        // 其余 user 子命令（get / token renew / delete）都要登录。
         const bool user_readonly_ok =
-            (head == "user" && parts.size() >= 2 && parts[1] == "create");
+            (head == "user" && parts.size() >= 2 &&
+             (parts[1] == "create" || parts[1] == "update"));
         if (!session.logged_in && !user_readonly_ok && !business_allowed(head, !need_account)) {
             // 提示要**能照着做**：窗口里直接 `login` 就行。
             // 曾经写的是「请重新打开窗口并登录：fmt -u <用户名> -p」——那时候窗口内
@@ -2342,7 +2345,7 @@ int run_interactive(const Options& options, service::State state, Session& sessi
             std::printf(
                 "需要先登录才能执行 %s。\n"
                 "本窗口内登录：login <用户名>      （回车后隐藏输入密码）\n"
-                "不需要登录：service / log / help / version / user create\n",
+                "不需要登录：service / log / help / version / user create / user update password\n",
                 command_label(parts).c_str());
             continue;
         }
@@ -2608,7 +2611,8 @@ int dispatch_command(const std::vector<std::string>& args, const Options& option
             // 例外与交互模式一致：`user create`（还没有账号时得先能建）与
             // `user get`（看账号状态）不需要登录。
             const bool user_readonly_ok =
-                (rest[0] == "user" && rest.size() >= 2 && rest[1] == "create");
+                (rest[0] == "user" && rest.size() >= 2 &&
+                 (rest[1] == "create" || rest[1] == "update"));
             if (!user_readonly_ok) {
                 const std::string label = command_label(rest);
                 std::fprintf(stderr,

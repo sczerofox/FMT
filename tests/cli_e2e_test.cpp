@@ -471,9 +471,10 @@ FMT_TEST(CliE2e, user命令打出账号字段而不是只剩一句提示) {
     // 登录时已经算过摘要，换 token **不该再问第二遍密码**。
     FMT_CHECK_EQ(count_of(renewed, "请输入密码"), std::size_t{1});
 
-    // 改密：只能改一次。第一次成功，第二次被拒并提示删除用户重建。
+    // 改密：**不需要先登录**（自己会问当前密码），用户明确要求这条不能逼人登录。
+    // 只能改一次：第一次成功，第二次被拒并提示删除用户重建。
     const CliRun changed =
-        fixture.business({"user", "update", "password"}, "e2e-secret\nnew-pw\nnew-pw\n");
+        fixture.cli({"user", "update", "password"}, "e2e-secret\nnew-pw\nnew-pw\n");
     FMT_CHECK_EQ(changed.exit_code, 0);
     FMT_CHECK(has(changed, "密码已更新"));
 
