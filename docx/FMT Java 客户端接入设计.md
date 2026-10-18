@@ -720,7 +720,7 @@ user.json」）。所以对着**旧 exe** 跑，桥接侧看到的是（都是**
 
 | 场景 | 做法 |
 |---|---|
-| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.0.0` |
+| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.0.1` |
 | 不想动私服 | `mvn install:install-file` 把两个 jar 装进本地仓库，或直接 `<scope>system</scope>`（不推荐） |
 | 只在非 Spring 项目用 | 只依赖 `fmt-client-core`（零依赖，Java 17+） |
 | 当独立桥接服务跑 | `java -jar fmt-bridge.jar`（demo 模块打成可执行 jar），别的系统调它的 REST |
