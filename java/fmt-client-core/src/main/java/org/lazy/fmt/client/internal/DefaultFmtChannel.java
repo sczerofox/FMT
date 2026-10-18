@@ -178,6 +178,11 @@ public final class DefaultFmtChannel implements FmtChannel {
     }
 
     @Override
+    public String bucket() {
+        return config.bucket();
+    }
+
+    @Override
     public String describe() {
         String token;
         try {
@@ -185,7 +190,9 @@ public final class DefaultFmtChannel implements FmtChannel {
         } catch (RuntimeException unavailable) {
             token = "(不可用：" + unavailable.getMessage() + ")";
         }
-        return config.baseUri() + " [auth=" + config.authScheme().description() + ", token=" + token + "]";
+        return config.baseUri() + " [auth=" + config.authScheme().description()
+                + ", bucket=" + (config.bucket() == null ? "(current)" : config.bucket())
+                + ", token=" + token + "]";
     }
 
     @Override
@@ -405,6 +412,12 @@ public final class DefaultFmtChannel implements FmtChannel {
                 builder.setHeader("X-FMT-Token", token);
                 builder.setHeader("Authorization", "Bearer " + token);
             }
+        }
+        // 库名（Bucket）必须**每个请求都明显带上**：服务端会话 token 会校验它，
+        // 旧账号 token 有它就按它走、没有就沿用服务端 current_bucket。
+        String bucket = config.bucket();
+        if (bucket != null && !bucket.isBlank()) {
+            builder.setHeader("X-FMT-Bucket", bucket);
         }
     }
 

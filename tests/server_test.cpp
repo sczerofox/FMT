@@ -1006,3 +1006,124 @@ FMT_TEST(Server, 信封与管道共用同一份实现) {
     FMT_CHECK_EQ(bad["error"]["code"].get<std::string>(), std::string("FMT-200"));
     FMT_CHECK_EQ(bad["error"]["message"].get<std::string>(), std::string("Bucket 不存在"));
 }
+
+FMT_TEST(Server, 登录会话与请求级Bucket) {
+    fmt::server::HttpServer server;
+    const auto handler = [](const std::string& operation, const nlohmann::json& args)
+        -> fmt::Result<nlohmann::json> {
+        nlohmann::json data = nlohmann::json::object();
+        data["operation"] = operation;
+        data["bucket"] = args.value("_bucket", std::string{});
+        return data;
+    };
+    const fmt::server::SessionVerifier session =
+        [](const std::string& token) -> fmt::Result<fmt::server::AuthIdentity> {
+        if (token == "session-token-abc") {
+            return fmt::server::AuthIdentity{"user", "work", true};
+        }
+        if (token == "expired-session") {
+            return fmt::make_error(fmt::ErrorCode::TokenExpired, "会话已过期");
+        }
+        return fmt::make_error(fmt::ErrorCode::Unauthorized, "不是会话 token");
+    };
+    const fmt::server::LoginHandler login =
+        [](const std::string& username, const std::string& digest, const std::string& bucket)
+        -> fmt::Result<fmt::server::LoginResult> {
+        if (username == "user" && digest == "digest" && bucket == "work") {
+            fmt::server::LoginResult result;
+            result.token = "session-token-abc";
+            result.username = "user";
+            result.bucket = "work";
+            result.expires_at = "2026-10-19T02:00:00";
+            return result;
+        }
+        return fmt::make_error(fmt::ErrorCode::Unauthorized, "用户名或密码不正确");
+    };
+    const fmt::server::SaltHandler salt = [](const std::string& username) -> fmt::Result<std::string> {
+        if (username == "user") {
+            return std::string("00112233445566778899aabbccddeeff");
+        }
+        return fmt::make_error(fmt::ErrorCode::Unauthorized, "用户名或密码不正确");
+    };
+    const fmt::server::LogoutHandler logout =
+        [](const std::string&) -> fmt::Status { return std::monostate{}; };
+
+    FMT_CHECK(fmt::ok(server.start("127.0.0.1", 0, R"(D:\FMT)", nullptr, handler, test_verifier(),
+                                   fixed_upload_limit(0), session, login, salt, logout)));
+
+    httplib::Client anonymous("127.0.0.1", server.port());
+    const auto salt_response = anonymous.Get("/api/auth/salt?username=user");
+    FMT_CHECK(salt_response != nullptr);
+    if (salt_response != nullptr) {
+        FMT_CHECK_EQ(salt_response->status, 200);
+        const auto body = nlohmann::json::parse(salt_response->body);
+        FMT_CHECK(body["ok"].get<bool>());
+        FMT_CHECK_EQ(body["data"]["salt"].get<std::string>(),
+                     std::string("00112233445566778899aabbccddeeff"));
+    }
+
+    const auto login_response = anonymous.Post(
+        "/api/auth/login",
+        R"({"username":"user","password_digest":"digest","bucket":"work"})",
+        "application/json");
+    FMT_CHECK(login_response != nullptr);
+    if (login_response != nullptr) {
+        FMT_CHECK_EQ(login_response->status, 200);
+        const auto body = nlohmann::json::parse(login_response->body);
+        FMT_CHECK(body["ok"].get<bool>());
+        FMT_CHECK_EQ(body["data"]["token"].get<std::string>(), std::string("session-token-abc"));
+        FMT_CHECK_EQ(body["data"]["bucket"].get<std::string>(), std::string("work"));
+    }
+
+    httplib::Client session_client("127.0.0.1", server.port());
+    session_client.set_default_headers(
+        {{"X-FMT-Token", "session-token-abc"}, {"X-FMT-Bucket", "work"}});
+    const auto with_bucket = session_client.Get("/api/file");
+    FMT_CHECK(with_bucket != nullptr);
+    if (with_bucket != nullptr) {
+        FMT_CHECK_EQ(with_bucket->status, 200);
+        const auto body = nlohmann::json::parse(with_bucket->body);
+        FMT_CHECK_EQ(body["data"]["bucket"].get<std::string>(), std::string("work"));
+    }
+
+    httplib::Client missing_bucket("127.0.0.1", server.port());
+    missing_bucket.set_default_headers({{"X-FMT-Token", "session-token-abc"}});
+    const auto missing = missing_bucket.Get("/api/file");
+    FMT_CHECK(missing != nullptr);
+    if (missing != nullptr) {
+        FMT_CHECK_EQ(missing->status, 400);
+        FMT_CHECK_EQ(nlohmann::json::parse(missing->body)["error"]["code"].get<std::string>(),
+                     std::string("FMT-001"));
+    }
+
+    httplib::Client wrong_bucket("127.0.0.1", server.port());
+    wrong_bucket.set_default_headers(
+        {{"X-FMT-Token", "session-token-abc"}, {"X-FMT-Bucket", "other"}});
+    const auto wrong = wrong_bucket.Get("/api/file");
+    FMT_CHECK(wrong != nullptr);
+    if (wrong != nullptr) {
+        FMT_CHECK_EQ(wrong->status, 403);
+        FMT_CHECK_EQ(nlohmann::json::parse(wrong->body)["error"]["code"].get<std::string>(),
+                     std::string("FMT-004"));
+    }
+
+    httplib::Client expired("127.0.0.1", server.port());
+    expired.set_default_headers(
+        {{"X-FMT-Token", "expired-session"}, {"X-FMT-Bucket", "work"}});
+    const auto expired_response = expired.Get("/api/file");
+    FMT_CHECK(expired_response != nullptr);
+    if (expired_response != nullptr) {
+        FMT_CHECK_EQ(expired_response->status, 401);
+        FMT_CHECK_EQ(nlohmann::json::parse(expired_response->body)["error"]["code"].get<std::string>(),
+                     std::string("FMT-019"));
+    }
+
+    const auto logout_response = session_client.Post("/api/auth/logout", "", "application/json");
+    FMT_CHECK(logout_response != nullptr);
+    if (logout_response != nullptr) {
+        FMT_CHECK_EQ(logout_response->status, 200);
+        FMT_CHECK(nlohmann::json::parse(logout_response->body)["ok"].get<bool>());
+    }
+
+    server.stop();
+}

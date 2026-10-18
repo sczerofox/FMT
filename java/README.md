@@ -56,7 +56,7 @@ java/
 <dependency>
   <groupId>org.lazy</groupId>
   <artifactId>fmt-spring-boot-starter</artifactId>
-  <version>2.0.2</version>
+  <version>2.1.0</version>
 </dependency>
 ```
 
@@ -108,6 +108,47 @@ public class ReportService {
 
 ---
 
+## 2.1 像 MySQL 一样：账号 + 密码 + 库名
+
+2.1.0 起，starter 可以直接用 **账号、密码、库名（Bucket）** 登录，不需要再配 token：
+
+```yaml
+fmt:
+  base-url: http://localhost:4122
+  username: user
+  password: your-password
+  bucket: work          # 库名 = FMT 的 Bucket；登录模式必填
+```
+
+`fmt.username` + `fmt.password` 与 `fmt.token` / `fmt.data-root` **二选一**：
+
+- 登录模式：第一次业务调用时自动 `GET /api/auth/salt` → 本地 PBKDF2 摘要 →
+  `POST /api/auth/login`；拿到的是 **2 小时有效的内存会话 token**，不是 `data/user.json`
+  里那个 7 天账号 token。
+- 会话过期（401 + `FMT-019`）时通道会用保存的账号密码**自动重登一次**；账号密码被改过
+  则如实报 `FMT-020`，不会无限重试。
+- 每个业务请求都带 `X-FMT-Bucket: <bucket>`；服务端会校验会话只能访问登录时选的那个库。
+- 明文密码只在 Java 进程里，网络上只有 PBKDF2 摘要。
+
+普通 Java 项目：
+
+```java
+try (FmtChannel fmt = Fmt.login("http://localhost:4122", "user", "password", "work")) {
+    fmt.listFiles(FileQuery.all());   // 请求自动带 X-FMT-Token + X-FMT-Bucket
+}
+```
+
+如果继续用旧 token，也可以显式绑定库名：
+
+```java
+FmtChannel fmt = Fmt.channel("http://localhost:4122", token, "work");
+```
+
+> 登录失败是 `FMT-020`；库不存在是 `FMT-200`；会话过期是 `FMT-019`（登录模式会自动重登）。
+> 旧 token 通路保持可用：不带 `X-FMT-Bucket` 时仍用服务端 `current_bucket`。
+
+---
+
 ## 3. 快速开始：普通 Java 项目（不带 Spring）
 
 调用流程只有三步：**调参数（`FmtClientCore`）→ 建通道（`Fmt.channel`）→ 调方法**。
@@ -146,11 +187,11 @@ try (FmtChannel fmt = Fmt.channel(core)) {
 ```powershell
 # 对着假 FMT 联调（不碰真服务）
 java java\tools\fake-fmt\FakeFmt.java 14122
-java -cp java\fmt-client-core\target\fmt-client-core-2.0.2.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-2.1.0.jar java\tools\FmtDemo.java `
      --base-url=http://127.0.0.1:14122 --token=test-token-1234567890abcdef --keep
 
 # 对着真服务：地址 + 数据根（token 从 <数据根>/data/user.json 读）
-java -cp java\fmt-client-core\target\fmt-client-core-2.0.2.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-2.1.0.jar java\tools\FmtDemo.java `
      --data-root=D:\Data\Temp\JMT\fmt --out-dir=D:\tmp\fmt-demo
 ```
 

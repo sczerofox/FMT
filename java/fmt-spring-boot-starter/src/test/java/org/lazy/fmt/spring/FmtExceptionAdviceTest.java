@@ -61,6 +61,14 @@ class FmtExceptionAdviceTest {
     }
 
     @Test
+    void loginFailureIsUnauthorized() {
+        ResponseEntity<Map<String, Object>> response = advice.onFmtError(
+                new FmtApiException(new FmtError(FmtErrorCodes.LOGIN_FAILED, "用户名或密码不正确", 401)));
+        assertEquals(HttpStatus.UNAUTHORIZED, response.getStatusCode());
+        assertEquals(FmtErrorCodes.LOGIN_FAILED, errorOf(response).get("code"));
+    }
+
+    @Test
     void transportFailureIsBadGateway() {
         ResponseEntity<Map<String, Object>> response =
                 advice.onTransport(new FmtTransportException("连不上 FMT"));

@@ -8,10 +8,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 
 #include "fmt/common/error.hpp"
 #include "fmt/core/app.hpp"
@@ -59,6 +61,17 @@ public:
 
     std::filesystem::path current_root() const;
 
+    // HTTP 登录：账号 + PBKDF2 摘要 + Bucket → 内存会话 token（短 TTL）。
+    // 公开给测试直接验证真实账号/Bucket；HTTP 层通过回调使用同一实现。
+    Result<server::LoginResult> login_http(const std::string& username,
+                                           const std::string& password_digest,
+                                           const std::string& bucket);
+    // 会话 token 校验；未命中返回 Unauthorized（让 HTTP 层继续试账号 token），
+    // 过期返回 TokenExpired。
+    Result<server::AuthIdentity> verify_session_http(const std::string& token);
+    Status logout_http(const std::string& token);
+    Result<std::string> salt_http(const std::string& username);
+
 private:
     static std::filesystem::path state_directory_default();
 
@@ -67,6 +80,14 @@ private:
     void serve(ipc::PipeConnection connection);
     // 上传是两段式：下载/复制在锁外，登记在锁内（见 file.hpp 的注释）。
     Result<nlohmann::json> run_upload(const nlohmann::json& args);
+    void clear_sessions();
+
+    struct HttpSession {
+        std::string username;
+        std::string bucket;
+        std::chrono::system_clock::time_point expires;
+    };
+
     // current_bucket 失效（目录不存在）时置空并落盘（开发文档第 61 节）。
     // 调用时必须持有 mutex_。
     void refresh_current_bucket_locked();
@@ -76,6 +97,10 @@ private:
     void restart_http();
 
     mutable std::mutex mutex_;
+    // 会话 token → 账号 + Bucket + 过期时间。**只在内存里**：服务重启即失效，
+    // 与 data/user.json 的账号 token 完全独立。
+    mutable std::mutex session_mutex_;
+    std::unordered_map<std::string, HttpSession> sessions_;
     std::unique_ptr<AppContext> context_;
     std::unique_ptr<server::HttpServer> http_;
     std::filesystem::path fallback_root_;

@@ -83,6 +83,25 @@ class FmtChannelTest {
     }
 
     @Test
+    void bucketHeaderIsSentOnEveryAuthenticatedCall() {
+        try (StubFmtServer stub = StubFmtServer.start(TOKEN);
+             FmtChannel fmt = Fmt.channel(stub.baseUrl(), TOKEN, "work")) {
+            stub.on("GET", "/api/status", request -> StubFmtServer.Reply.ok(STATUS_OK));
+            stub.on("GET", "/api/file", request -> StubFmtServer.Reply.ok(
+                    "{\"files\":[],\"count\":0,\"total\":0,\"page\":1,\"page_size\":0,"
+                            + "\"total_pages\":0,\"sort\":\"name\"}"));
+
+            assertTrue(fmt.status().isOk());
+            assertTrue(fmt.listFiles(FileQuery.all()).isOk());
+
+            for (StubFmtServer.Recorded request : stub.requests()) {
+                assertEquals("work", request.header("X-FMT-Bucket"),
+                        "带库名的 token 模式每个请求都要有 X-FMT-Bucket：" + request.path());
+            }
+        }
+    }
+
+    @Test
     void bearerSchemePutsTokenInAuthorizationHeader() {
         try (StubFmtServer stub = StubFmtServer.start(TOKEN);
              FmtChannel fmt = Fmt.channel(Fmt.builder(stub.baseUrl(), TOKEN)

@@ -1,5 +1,6 @@
 package org.lazy.fmt.client;
 
+import org.lazy.fmt.client.internal.SessionTokenProvider;
 import org.lazy.fmt.client.json.SimpleJson;
 
 import java.net.URI;
@@ -52,6 +53,7 @@ public final class FmtChannelConfig {
     private final FmtLogger logger;
     private final Map<String, String> extraHeaders;
     private final String userAgent;
+    private final String bucket;
 
     private FmtChannelConfig(Builder builder) {
         this.baseUri = builder.baseUri;
@@ -67,6 +69,7 @@ public final class FmtChannelConfig {
         this.logger = builder.logger;
         this.extraHeaders = Map.copyOf(builder.extraHeaders);
         this.userAgent = builder.userAgent;
+        this.bucket = builder.bucket;
     }
 
     public static Builder builder() {
@@ -132,6 +135,15 @@ public final class FmtChannelConfig {
         return userAgent;
     }
 
+    /**
+     * 业务请求要访问的 Bucket（库名）；空表示沿用服务端 {@code current_bucket}（旧行为）。
+     *
+     * <p>登录模式下它同时是登录时选的库，且每个请求都会带 {@code X-FMT-Bucket}。
+     */
+    public String bucket() {
+        return bucket;
+    }
+
     public static final class Builder {
 
         private URI baseUri = URI.create(DEFAULT_BASE_URL);
@@ -147,6 +159,9 @@ public final class FmtChannelConfig {
         private FmtLogger logger = FmtLoggers.NOOP;
         private final Map<String, String> extraHeaders = new LinkedHashMap<>();
         private String userAgent = "fmt-client-java/1.0";
+        private String bucket;
+        private String username;
+        private String password;
 
         private Builder() {
         }
@@ -258,10 +273,53 @@ public final class FmtChannelConfig {
             return this;
         }
 
+        /**
+         * 业务请求要访问的 Bucket（库名）。旧 token 模式下可不给（沿用服务端 current_bucket）；
+         * 登录模式下必须给，并且每个请求都会带 {@code X-FMT-Bucket}。
+         */
+        public Builder bucket(String bucket) {
+            this.bucket = bucket == null || bucket.isBlank() ? null : bucket.trim();
+            return this;
+        }
+
+        /**
+         * 账号密码登录（像 MySQL 一样给账号、密码、库名）。
+         *
+         * <p>通道会在第一次需要认证的调用时：
+         * 取 salt → 本地 PBKDF2 摘要 → {@code POST /api/auth/login} → 拿临时会话 token。
+         * 会话过期时通道会自动用同一份账号密码重登；明文密码不会出现在网络上。
+         */
+        public Builder login(String username, String password, String bucket) {
+            if (username == null || username.isBlank()) {
+                throw new FmtConfigurationException("登录用户名不能为空");
+            }
+            if (password == null) {
+                throw new FmtConfigurationException("登录密码不能为空");
+            }
+            if (bucket == null || bucket.isBlank()) {
+                throw new FmtConfigurationException("登录必须给库名（Bucket）");
+            }
+            this.username = username.trim();
+            this.password = password;
+            this.bucket = bucket.trim();
+            return this;
+        }
+
         public FmtChannelConfig build() {
+            if (username != null || password != null) {
+                if (tokenProvider != null) {
+                    throw new FmtConfigurationException(
+                            "不能同时配置 token 与账号密码：二选一（登录模式用 login(...)）");
+                }
+                tokenProvider = new SessionTokenProvider(
+                        baseUri, username, password, bucket, codec,
+                        logger == null ? FmtLoggers.NOOP : logger,
+                        connectTimeout, requestTimeout);
+            }
             if (tokenProvider == null) {
                 throw new FmtConfigurationException(
-                        "没有配置 token 来源：用 .token(...) 或 .tokenProvider(...) 给通道一个凭证");
+                        "没有配置凭证：用 .login(user, password, bucket)、.token(...) 或 "
+                                + ".tokenProvider(...) 给通道一个凭证");
             }
             if (maxConnections <= 0) {
                 throw new FmtConfigurationException("maxConnections 必须大于 0");

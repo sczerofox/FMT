@@ -79,7 +79,9 @@ int http_status_for(ErrorCode code) {
         case ErrorCode::RouteNotFound:
             return 404;
         case ErrorCode::Unauthorized:
-            return 401;  // 缺 token / token 不对
+        case ErrorCode::TokenExpired:
+        case ErrorCode::LoginFailed:
+            return 401;  // 缺 token / token 不对 / token 过期 / 账号密码不对
         case ErrorCode::ServiceOperationFailed:
             // 「服务端还没实现这个接口」是 501，不是 500：500 等于说服务器坏了，
             // 而真相是这个功能还没做（现在只剩 /api/server/*、/api/preview/* 这类
@@ -104,13 +106,30 @@ nlohmann::json args_with_encoded_name(const std::string& encoded) {
 
 // ---- 访问凭证（token）----
 
-// 不需要 token 的路径：只有健康检查与「别人拿分享链接下载」。
-// 分享链接本身就是凭证（share_id 是随机 12 位十六进制），那一步不该再要 token。
+// 当前 HTTP 请求的 Bucket（请求级；由 pre-routing 解析）。
+//
+// cpp-httplib 的 pre-routing 与路由处理在同一个工作线程上顺序执行，所以用
+// thread_local 传递即可；post-routing 与下一次 pre-routing 都会清空它，避免串请求。
+thread_local std::string g_request_bucket;
+
+// 不需要 token 的路径：健康检查、分享下载、登录/取盐。
+// 分享链接本身就是凭证（share_id 是随机 12 位十六进制）；登录/取盐必须在
+// 拿到 token 之前调用，所以也不能要 token。
 bool is_public_path(const std::string& path) {
-    if (path == "/api/ping") {
+    if (path == "/api/ping" || path == "/api/auth/salt" || path == "/api/auth/login") {
         return true;
     }
     return starts_with(path, "/api/share/") && ends_with(path, "/download");
+}
+
+// 把解析出来的 Bucket 放进业务参数（`_bucket` 是 HTTP 层内部字段，不回声给调用方）。
+nlohmann::json with_request_bucket(const nlohmann::json& args) {
+    if (g_request_bucket.empty() || !args.is_object()) {
+        return args;
+    }
+    nlohmann::json copy = args;
+    copy["_bucket"] = g_request_bucket;
+    return copy;
 }
 
 // 接受两种写法：`X-FMT-Token: <token>` 与 `Authorization: Bearer <token>`。
@@ -242,6 +261,41 @@ void respond(httplib::Response& response, const Result<nlohmann::json>& result) 
     response.set_content(dump(envelope_error(error)), kJsonContentType);
 }
 
+// 登录/取盐/注销的返回体：都包成与业务接口相同的信封。
+Result<nlohmann::json> salt_payload(const std::string& username,
+                                    const Result<std::string>& salt) {
+    if (!ok(salt)) {
+        return *error_of(salt);
+    }
+    nlohmann::json data = nlohmann::json::object();
+    data["username"] = username;
+    data["salt"] = std::get<std::string>(salt);
+    return data;
+}
+
+Result<nlohmann::json> login_payload(const Result<LoginResult>& result) {
+    if (!ok(result)) {
+        return *error_of(result);
+    }
+    const LoginResult& login = std::get<LoginResult>(result);
+    nlohmann::json data = nlohmann::json::object();
+    data["token"] = login.token;
+    data["token_type"] = login.token_type;
+    data["expires_at"] = login.expires_at;
+    data["username"] = login.username;
+    data["bucket"] = login.bucket;
+    return data;
+}
+
+Result<nlohmann::json> logout_payload(const Status& status) {
+    if (!ok(status)) {
+        return *error_of(status);
+    }
+    nlohmann::json data = nlohmann::json::object();
+    data["message"] = "已退出登录，会话 token 立即失效";
+    return data;
+}
+
 // ---- 流式上下行（第 3 步）----
 
 // **早退回调必须先把请求体读干净**：ContentReader 型的处理器不读完，
@@ -362,7 +416,8 @@ void register_content_route(httplib::Server* server, const BusinessHandler& hand
                         return;
                     }
                     const Result<nlohmann::json> got =
-                        handler("file.get", args_with_encoded_name(request.matches[1]));
+                        handler("file.get", with_request_bucket(
+                                                args_with_encoded_name(request.matches[1])));
                     if (!ok(got)) {
                         respond(response, got);
                         return;
@@ -409,7 +464,7 @@ void register_business_routes(httplib::Server* server, BusinessHandler handler,
                                          "HTTP 未接入业务处理"));
             return;
         }
-        Result<nlohmann::json> result = handler(operation, args);
+        Result<nlohmann::json> result = handler(operation, with_request_bucket(args));
         if (ok(result) && transform) {
             transform(std::get<nlohmann::json>(result));
         }
@@ -759,7 +814,8 @@ HttpServer::~HttpServer() { stop(); }
 
 Status HttpServer::start(const std::string& host, int port, std::string data_root, Logger* logger,
                          BusinessHandler handler, TokenVerifier verifier,
-                         UploadLimitProvider upload_limit) {
+                         UploadLimitProvider upload_limit, SessionVerifier session_verifier,
+                         LoginHandler login, SaltHandler salt, LogoutHandler logout) {
     if (impl_->running.load()) {
         return make_error(ErrorCode::InvalidArgument, "HTTP 服务已经在运行");
     }
@@ -774,39 +830,164 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
     // 是因为「漏给某条路由加认证」正是这类代码最容易出的事故。
     // 没有注入校验器时**一律拒绝**（默认关着），免得哪天忘了注入就裸奔。
     impl_->server->set_pre_routing_handler(
-        [verifier](const httplib::Request& request,
-                   httplib::Response& response) -> httplib::Server::HandlerResponse {
+        [verifier, session_verifier](const httplib::Request& request,
+                                     httplib::Response& response)
+            -> httplib::Server::HandlerResponse {
+            // 请求级 Bucket 不能串到下一个请求；公开路径与认证失败都要清掉。
+            g_request_bucket.clear();
             if (!starts_with(request.path, "/api/") || is_public_path(request.path)) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
             const std::string token = header_token(request);
-            if (verifier && !token.empty()) {
-                const Result<std::string> verified = verifier(token);
-                if (ok(verified) && !std::get<std::string>(verified).empty()) {
-                    return httplib::Server::HandlerResponse::Unhandled;
-                }
-                // 校验器说得出原因就用它的（token 过期是 FMT-019，抄错是 FMT-018）；
-                // 说不出原因（理论上不会有）就退回统一的「缺少或无效」。
-                if (!ok(verified)) {
-                    response.status = 401;
-                    response.set_content(dump(envelope_error(*error_of(verified))),
-                                         kJsonContentType);
+            if (token.empty()) {
+                respond(response, make_error(
+                                        ErrorCode::Unauthorized,
+                                        "缺少或无效的访问 token：请求头用 X-FMT-Token: <token>，"
+                                        "或 Authorization: Bearer <token>；也可以先用账号密码登录"));
+                return httplib::Server::HandlerResponse::Handled;
+            }
+
+            AuthIdentity identity;
+            bool authenticated = false;
+
+            // 先查会话表：会话 token 是登录签发的临时密钥。未命中（Unauthorized）
+            // 继续按旧账号 token 校验；过期（TokenExpired）直接 401，不能降级成账号 token。
+            if (session_verifier) {
+                const Result<AuthIdentity> session = session_verifier(token);
+                if (ok(session)) {
+                    identity = std::get<AuthIdentity>(session);
+                    authenticated = true;
+                } else if (error_of(session)->code == ErrorCode::TokenExpired) {
+                    respond(response, *error_of(session));
                     return httplib::Server::HandlerResponse::Handled;
                 }
             }
-            response.status = 401;
-            response.set_content(
-                dump(envelope_error(make_error(
-                    ErrorCode::Unauthorized,
-                    "缺少或无效的访问 token：请求头用 X-FMT-Token: <token>，"
-                    "或 Authorization: Bearer <token>（token 在 data/user.json 里）"))),
-                kJsonContentType);
-            return httplib::Server::HandlerResponse::Handled;
+
+            if (!authenticated && verifier) {
+                const Result<std::string> account = verifier(token);
+                if (ok(account) && !std::get<std::string>(account).empty()) {
+                    identity.username = std::get<std::string>(account);
+                    identity.session = false;
+                    authenticated = true;
+                } else if (!ok(account)) {
+                    // 校验器说得出原因就用它的（过期是 FMT-019，抄错是 FMT-018）。
+                    respond(response, *error_of(account));
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+            }
+
+            if (!authenticated) {
+                respond(response, make_error(
+                                        ErrorCode::Unauthorized,
+                                        "缺少或无效的访问 token（账号 token 与会话 token 都不匹配）"));
+                return httplib::Server::HandlerResponse::Handled;
+            }
+
+            const std::string requested_bucket = trim(request.get_header_value("X-FMT-Bucket"));
+            if (identity.session) {
+                // 会话 token 绑定登录时选的 Bucket：每个业务请求都必须明确带它，
+                // 而且不能拿一个会话去访问另一个库。
+                if (requested_bucket.empty()) {
+                    respond(response, make_error(
+                                            ErrorCode::InvalidArgument,
+                                            "会话 token 必须带 X-FMT-Bucket（登录时选的 Bucket）："
+                                            "这个 token 只能访问「" + identity.bucket + "」"));
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                if (!iequals(requested_bucket, identity.bucket)) {
+                    respond(response, make_error(
+                                            ErrorCode::PermissionDenied,
+                                            "这个会话 token 只能访问 Bucket「" + identity.bucket +
+                                                "」，不能访问「" + requested_bucket + "」"));
+                    return httplib::Server::HandlerResponse::Handled;
+                }
+                g_request_bucket = identity.bucket;
+            } else {
+                // 旧账号 token：带 X-FMT-Bucket 就按它走（业务层会校验并规范化），
+                // 不带就沿用服务端 current_bucket，保持旧 SDK 的行为。
+                g_request_bucket = requested_bucket;
+            }
+            return httplib::Server::HandlerResponse::Unhandled;
         });
+
+    // 每个请求结束都清掉请求级 Bucket，避免工作线程复用导致串请求。
+    impl_->server->set_post_routing_handler(
+        [](const httplib::Request&, httplib::Response&) { g_request_bucket.clear(); });
 
     impl_->server->Get("/api/ping", [](const httplib::Request&, httplib::Response& response) {
         response.set_content(dump(envelope_ok(nlohmann::json::object())), kJsonContentType);
     });
+
+    // 登录/取盐：公开接口。客户端先取盐、本地算 PBKDF2 摘要，再把摘要发来，
+    // 明文密码一个字节都不进 HTTP。登录成功后签发**内存会话 token**（短 TTL）。
+    impl_->server->Get("/api/auth/salt",
+                       [salt](const httplib::Request& request, httplib::Response& response) {
+                           if (!salt) {
+                               respond(response, make_error(ErrorCode::ServiceOperationFailed,
+                                                            "HTTP 未接入登录"));
+                               return;
+                           }
+                           const std::string username =
+                               request.has_param("username")
+                                   ? trim(request.get_param_value("username"))
+                                   : std::string{};
+                           if (username.empty()) {
+                               respond(response, make_error(ErrorCode::InvalidArgument,
+                                                            "缺少 username 查询参数"));
+                               return;
+                           }
+                           respond(response, salt_payload(username, salt(username)));
+                       });
+    impl_->server->Post("/api/auth/login",
+                        [login](const httplib::Request& request, httplib::Response& response) {
+                            if (!login) {
+                                respond(response, make_error(ErrorCode::ServiceOperationFailed,
+                                                             "HTTP 未接入登录"));
+                                return;
+                            }
+                            nlohmann::json body;
+                            try {
+                                body = nlohmann::json::parse(request.body);
+                            } catch (const nlohmann::json::exception&) {
+                                respond(response, make_error(ErrorCode::JsonParseError,
+                                                             "登录请求体不是合法 JSON"));
+                                return;
+                            }
+                            const auto text = [&body](const char* key) -> std::string {
+                                if (body.is_object() && body.contains(key) &&
+                                    body[key].is_string()) {
+                                    return body[key].get<std::string>();
+                                }
+                                return {};
+                            };
+                            const std::string username = text("username");
+                            const std::string digest = text("password_digest");
+                            const std::string bucket = text("bucket");
+                            if (username.empty() || digest.empty() || bucket.empty()) {
+                                respond(response, make_error(
+                                                        ErrorCode::InvalidArgument,
+                                                        "登录必须给 username、password_digest 与 "
+                                                        "bucket（库名）"));
+                                return;
+                            }
+                            respond(response, login_payload(login(username, digest, bucket)));
+                        });
+    impl_->server->Post("/api/auth/logout",
+                        [logout](const httplib::Request& request,
+                                 httplib::Response& response) {
+                            if (!logout) {
+                                respond(response, make_error(ErrorCode::ServiceOperationFailed,
+                                                             "HTTP 未接入登录"));
+                                return;
+                            }
+                            const std::string token = header_token(request);
+                            if (token.empty()) {
+                                respond(response, make_error(ErrorCode::Unauthorized,
+                                                             "缺少要注销的会话 token"));
+                                return;
+                            }
+                            respond(response, logout_payload(logout(token)));
+                        });
 
     const std::shared_ptr<SharedState> state = impl_->state;
     impl_->server->Get("/api/status",

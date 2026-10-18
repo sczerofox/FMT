@@ -13,6 +13,7 @@
 #include "fmt/ipc/protocol.hpp"
 #include "fmt/share/share.hpp"
 #include "fmt/storage/storage.hpp"
+#include "fmt/user/user.hpp"
 #include "fmt_test.hpp"
 #include "temp_dir.hpp"
 
@@ -1616,4 +1617,152 @@ FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {
     FMT_CHECK(!rejected.ok);
     FMT_CHECK(rejected.error.code == fmt::ErrorCode::InvalidArgument);
     FMT_CHECK_EQ(fmt::exit_code(rejected.error.code), 2);
+}
+
+FMT_TEST(Service, 账号密码登录签发临时会话) {
+    fmt_test::TempDir temp("service-login");
+    const auto root = temp / "root";
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("password", salt);
+    FMT_CHECK(!digest.empty());
+
+    fmt::ipc::Request create_user;
+    create_user.id = 1;
+    create_user.op = "user.create";
+    create_user.args["username"] = "user";
+    create_user.args["password_digest"] = digest;
+    const fmt::ipc::Response created = runtime.handle(create_user);
+    FMT_CHECK(created.ok);
+    if (!created.ok) {
+        return;
+    }
+
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 2;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+
+    // 盐接口：客户端拿它算摘要
+    const auto salt_result = runtime.salt_http("user");
+    FMT_CHECK(fmt::ok(salt_result));
+    if (fmt::ok(salt_result)) {
+        FMT_CHECK_EQ(std::get<std::string>(salt_result), salt);
+    }
+
+    // 登录：摘要 + 明确的 Bucket
+    const auto login = runtime.login_http("user", digest, "work");
+    FMT_CHECK(fmt::ok(login));
+    if (!fmt::ok(login)) {
+        return;
+    }
+    const fmt::server::LoginResult& session = std::get<fmt::server::LoginResult>(login);
+    FMT_CHECK(!session.token.empty());
+    FMT_CHECK_EQ(session.username, std::string("user"));
+    FMT_CHECK_EQ(session.bucket, std::string("work"));
+    FMT_CHECK_EQ(session.token_type, std::string("session"));
+
+    // 会话 token 能验出来，并且绑定 work
+    const auto identity = runtime.verify_session_http(session.token);
+    FMT_CHECK(fmt::ok(identity));
+    if (fmt::ok(identity)) {
+        const fmt::server::AuthIdentity& who = std::get<fmt::server::AuthIdentity>(identity);
+        FMT_CHECK(who.session);
+        FMT_CHECK_EQ(who.username, std::string("user"));
+        FMT_CHECK_EQ(who.bucket, std::string("work"));
+    }
+
+    // 错误密码 / 不存在的 Bucket 都不能登录
+    FMT_CHECK(!fmt::ok(runtime.login_http("user", std::string(64, '0'), "work")));
+    FMT_CHECK(!fmt::ok(runtime.login_http("user", digest, "missing")));
+
+    // 注销后会话立刻失效
+    FMT_CHECK(fmt::ok(runtime.logout_http(session.token)));
+    const auto after = runtime.verify_session_http(session.token);
+    FMT_CHECK(!fmt::ok(after));
+    if (!fmt::ok(after)) {
+        FMT_CHECK(fmt::error_of(after)->code == fmt::ErrorCode::Unauthorized);
+    }
+}
+
+FMT_TEST(Service, 请求级Bucket隔离) {
+    fmt_test::TempDir temp("service-bucket-scope");
+    const auto root = temp / "root";
+    const auto source = temp / "payload.txt";
+    FMT_CHECK(fmt::ok(fmt::write_text_file_atomic(source, "scoped")));
+
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    fmt::ipc::Request create;
+    create.id = 1;
+    create.op = "bucket.create";
+    create.args["argv"] = nlohmann::json::array({"工作"});
+    FMT_CHECK(runtime.handle(create).ok);
+
+    fmt::ipc::Request upload;
+    upload.id = 2;
+    upload.op = "file.upload";
+    upload.args["argv"] = nlohmann::json::array({fmt::path_to_utf8(source)});
+    const fmt::ipc::Response uploaded = runtime.handle(upload);
+    FMT_CHECK(uploaded.ok);
+    if (!uploaded.ok) {
+        return;
+    }
+    const std::string file_id = uploaded.data.value("file_id", std::string{});
+
+    fmt::ipc::Request other;
+    other.id = 3;
+    other.op = "bucket.create";
+    other.args["argv"] = nlohmann::json::array({"other"});
+    FMT_CHECK(runtime.handle(other).ok);
+
+    // 不带 _bucket：仍用 current_bucket（工作），旧行为不变
+    fmt::ipc::Request plain;
+    plain.id = 4;
+    plain.op = "file.list";
+    const fmt::ipc::Response plain_list = runtime.handle(plain);
+    FMT_CHECK(plain_list.ok);
+    if (plain_list.ok) {
+        FMT_CHECK_EQ(plain_list.data["files"].size(), std::size_t{1});
+    }
+
+    // 带 _bucket=other：同一个数据根里看不到「工作」的文件
+    fmt::ipc::Request scoped;
+    scoped.id = 5;
+    scoped.op = "file.list";
+    scoped.args["_bucket"] = "other";
+    const fmt::ipc::Response scoped_list = runtime.handle(scoped);
+    FMT_CHECK(scoped_list.ok);
+    if (scoped_list.ok) {
+        FMT_CHECK_EQ(scoped_list.data["files"].size(), std::size_t{0});
+    }
+
+    // 按 file_id 查也一样：other 里没有这个文件
+    fmt::ipc::Request wrong_get;
+    wrong_get.id = 6;
+    wrong_get.op = "file.get";
+    wrong_get.args["argv"] = nlohmann::json::array({file_id});
+    wrong_get.args["_bucket"] = "other";
+    const fmt::ipc::Response missing = runtime.handle(wrong_get);
+    FMT_CHECK(!missing.ok);
+    if (!missing.ok) {
+        FMT_CHECK(missing.error.code == fmt::ErrorCode::FileNotFound);
+    }
+
+    // 显式指定「工作」则能查到
+    fmt::ipc::Request right_get;
+    right_get.id = 7;
+    right_get.op = "file.get";
+    right_get.args["argv"] = nlohmann::json::array({file_id});
+    right_get.args["_bucket"] = "工作";
+    const fmt::ipc::Response found = runtime.handle(right_get);
+    FMT_CHECK(found.ok);
+    if (found.ok) {
+        FMT_CHECK_EQ(found.data.value("file_id", std::string{}), file_id);
+    }
 }

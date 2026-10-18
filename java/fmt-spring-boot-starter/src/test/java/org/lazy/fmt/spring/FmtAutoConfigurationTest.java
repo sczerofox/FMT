@@ -48,6 +48,33 @@ class FmtAutoConfigurationTest {
     }
 
     @Test
+    void loginModeBuildsAChannelWithoutToken() {
+        runner.withPropertyValues(
+                        "fmt.username=user",
+                        "fmt.password=password",
+                        "fmt.bucket=work")
+                .run(context -> {
+                    assertThat(context).hasSingleBean(FmtChannel.class);
+                    assertEquals("work", context.getBean(FmtChannel.class).bucket());
+                });
+    }
+
+    @Test
+    void loginModeRequiresBucket() {
+        runner.withPropertyValues("fmt.username=user", "fmt.password=password")
+                .run(context -> assertThat(context).hasFailed());
+    }
+
+    @Test
+    void tokenModeCanAlsoBindABucket() {
+        runner.withPropertyValues("fmt.token=" + TOKEN, "fmt.bucket=work")
+                .run(context -> {
+                    assertThat(context).hasSingleBean(FmtChannel.class);
+                    assertEquals("work", context.getBean(FmtChannel.class).bucket());
+                });
+    }
+
+    @Test
     void fmtEnabledFalseRegistersNothing() {
         runner.withPropertyValues("fmt.enabled=false", "fmt.token=" + TOKEN)
                 .run(context -> {

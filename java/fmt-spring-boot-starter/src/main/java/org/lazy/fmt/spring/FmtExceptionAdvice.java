@@ -92,6 +92,7 @@ public class FmtExceptionAdvice {
             case 3, 16, 105, 201, 203, 304, 401, 403 -> HttpStatus.CONFLICT;
             case 4, 501, 502, 503, 603 -> HttpStatus.FORBIDDEN;
             case 8, 604 -> HttpStatus.INTERNAL_SERVER_ERROR;
+            case 19, 20 -> HttpStatus.UNAUTHORIZED;
             default -> HttpStatus.BAD_GATEWAY;
         };
     }

@@ -38,6 +38,7 @@ enum class ErrorCode : int {
     RouteNotFound = 17,            // 没有这个接口（HTTP 404）退出码 3
     Unauthorized = 18,             // 缺少或无效的访问 token（HTTP 401）退出码 5
     TokenExpired = 19,             // 访问 token 已过期（HTTP 401）  退出码 5
+    LoginFailed = 20,              // 账号/密码/Bucket 登录失败（HTTP 401）退出码 5
 
     // ---- FMT-1xx 文件名校验 ----
     FileNameEmpty = 100,           // 文件名为空             退出码 2

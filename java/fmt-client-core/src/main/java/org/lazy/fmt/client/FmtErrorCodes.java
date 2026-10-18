@@ -35,6 +35,10 @@ public final class FmtErrorCodes {
     public static final String ROUTE_NOT_FOUND = "FMT-017";
     /** 缺少或无效的访问 token（HTTP 401）——通道自愈就靠这个码。 */
     public static final String UNAUTHORIZED = "FMT-018";
+    /** 访问 token 已过期（HTTP 401）；登录模式下通道会用账号密码自动重登。 */
+    public static final String TOKEN_EXPIRED = "FMT-019";
+    /** 账号/密码/库名登录失败（HTTP 401）。 */
+    public static final String LOGIN_FAILED = "FMT-020";
 
     // ---- FMT-1xx 文件名校验 ----
     public static final String FILE_NAME_EMPTY = "FMT-100";
@@ -100,6 +104,7 @@ public final class FmtErrorCodes {
             Map.entry(13, "DirectoryCreateFailed"), Map.entry(14, "PathEscape"),
             Map.entry(15, "ConsistencyError"), Map.entry(16, "ConfirmRequired"),
             Map.entry(17, "RouteNotFound"), Map.entry(18, "Unauthorized"),
+            Map.entry(19, "TokenExpired"), Map.entry(20, "LoginFailed"),
             Map.entry(100, "FileNameEmpty"), Map.entry(101, "FileNameInvalidChar"),
             Map.entry(102, "FileNameSeparator"), Map.entry(103, "FileNameReserved"),
             Map.entry(104, "FileNameTooLong"), Map.entry(105, "FileNameConflict"),

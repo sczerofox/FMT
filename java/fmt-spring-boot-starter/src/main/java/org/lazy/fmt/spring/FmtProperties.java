@@ -42,6 +42,19 @@ public class FmtProperties {
     /** 直接给 token（32 位十六进制）。优先级最高。 */
     private String token;
 
+    /**
+     * 账号密码登录（像 MySQL 一样）。配了 username + password 就**不再走 token/data-root**，
+     * 第一次业务调用时自动换临时会话 token；会话过期自动重登。
+     *
+     * <p>明文密码只在本进程内存里，网络上只有 PBKDF2 摘要。
+     */
+    private String username;
+
+    private String password;
+
+    /** 库名（Bucket）。登录模式必填；token 模式可选（不填沿用服务端 current_bucket）。 */
+    private String bucket;
+
     /** 指定 {@code data/user.json} 文件。 */
     private Path tokenFile;
 
@@ -146,6 +159,35 @@ public class FmtProperties {
 
     public void setToken(String token) {
         this.token = token;
+    }
+
+    /** 是否配置了账号密码登录。 */
+    public boolean hasLogin() {
+        return username != null && !username.isBlank() && password != null;
+    }
+
+    public String getUsername() {
+        return username;
+    }
+
+    public void setUsername(String username) {
+        this.username = username;
+    }
+
+    public String getPassword() {
+        return password;
+    }
+
+    public void setPassword(String password) {
+        this.password = password;
+    }
+
+    public String getBucket() {
+        return bucket;
+    }
+
+    public void setBucket(String bucket) {
+        this.bucket = bucket;
     }
 
     public Path getTokenFile() {

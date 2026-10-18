@@ -71,6 +71,34 @@ public final class Fmt {
         return channel(FmtChannelConfig.builder(baseUrl, token).build());
     }
 
+    /**
+     * 像 MySQL 一样用「账号 + 密码 + 库名」建通道（默认地址 {@code http://localhost:4122}）。
+     *
+     * <pre>{@code
+     * try (FmtChannel fmt = Fmt.login("user", "password", "work")) {
+     *     fmt.listFiles(FileQuery.all());   // 每个请求都自动带 X-FMT-Bucket: work
+     * }
+     * }</pre>
+     */
+    public static FmtChannel login(String username, String password, String bucket) {
+        return channel(FmtChannelConfig.builder()
+                .login(username, password, bucket)
+                .build());
+    }
+
+    /** 像 MySQL 一样用「地址 + 账号 + 密码 + 库名」建通道。 */
+    public static FmtChannel login(String baseUrl, String username, String password, String bucket) {
+        return channel(FmtChannelConfig.builder()
+                .baseUrl(baseUrl)
+                .login(username, password, bucket)
+                .build());
+    }
+
+    /** 旧 token 模式 + 显式库名：每个请求带 {@code X-FMT-Bucket}。 */
+    public static FmtChannel channel(String baseUrl, String token, String bucket) {
+        return channel(FmtChannelConfig.builder(baseUrl, token).bucket(bucket).build());
+    }
+
     public static FmtChannel channel(String baseUrl, TokenProvider tokenProvider) {
         return channel(FmtChannelConfig.builder().baseUrl(baseUrl).tokenProvider(tokenProvider).build());
     }

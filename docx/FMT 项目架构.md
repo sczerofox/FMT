@@ -2097,6 +2097,7 @@ Service）→ **提前**到新阶段 3；原阶段 10（HTTP Server）、11（Pr
 | FMT-016 | `ConfirmRequired` | 该操作需要显式确认（`force`）——**提交 `711da4c` 追加**：永久删除（两级 `trash delete`）、跨 Bucket 的 `file delete`、非空桶的 `bucket delete` 缺 `force` 时返回它；HTTP 400；**不再复用 `FMT-001`**。**提交 `674d0b0` 追加**：`trash empty`（清空整站）也返回它，**回收站本来就空时不要确认、直接成功**；**本次改动（未提交）起 HTTP 的 `DELETE /api/trash/empty` 走同一份实现**（第 44 项决策） | 2 |
 | FMT-017 | `RouteNotFound` | **没有这个接口**——**提交 `4ddb515` 追加**：HTTP 兜底路由遇到完全打错的 `/api/...` 路径时返回它（HTTP 404），默认消息「没有这个接口」。**只由 HTTP 兜底路由产生**——管道入口没有「路由」概念（op 名写错走业务层错误）。**已知模块下没有这个接口是另一回事**：`501 + FMT-602`（见下表 FMT-602 行）。**提交 `4b812b5` 追加一种用法**：`/api/bucket*` 也返回它——那是**故意不要**（用户明确「桶不要」），不是「还没做」。**本次改动（未提交）起要分两种情形读**：① 真·打错的路径（`/api/nosuch`）＝没有这个接口；② **桶的写接口**（`/api/bucket/<其它路径>`）＝**故意不要**。**`GET /api/bucket`（只读列表）本次已登记为路由，不再返回它**；`POST /api/bucket` 因为没有 `/api/.*` 兜底而落通用错误处理器 → **404 + `FMT-002`**（第 44 项决策与 `FMT 技术文档.md` 第 12.3.2、12.7、18.43 节） | 3 |
 | FMT-018 | `Unauthorized` | **缺少 / 无效的访问 token**——**提交 `4b812b5` 追加**：HTTP 401、退出码 5。`/api/*` 都要 token，唯一例外是 `/api/ping`（健康检查）与 `/api/share/<id>/download`（分享链接本身就是凭证）；由 httplib 的 **pre-routing 钩子一处拒绝**（不逐个路由判断），且**没有注入校验器时一律 401**（fail-closed）。请求头收 `X-FMT-Token: <token>` 与 `Authorization: Bearer <token>`，比较是**常量时间**；token 从 `config list` 拿 | 5 |
+| FMT-020 | `LoginFailed` | **账号/密码/Bucket 登录失败**（2.1.0）：HTTP 401、退出码 5。由 `/api/auth/login` 与 `/api/auth/salt` 在用户名不存在或摘要不对时返回；与 FMT-018「token 不对」分开，客户端可提示「检查账号密码」而不是「重配 token」 | 5 |
 
 **文件名校验（阶段 5 前，`common/validation`）**
 

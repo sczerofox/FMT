@@ -268,9 +268,14 @@ Result<nlohmann::json> bucket_command(AppContext& context, const std::string& op
 }
 
 // 回收站：桶级条目。文件级条目随阶段 5/7 一起进来。
-Result<nlohmann::json> trash_command(AppContext& context, const std::string& operation,
+Result<nlohmann::json> trash_command(AppContext& context, Config& config, bool bucket_scoped,
+                                     const std::string& operation,
                                      const nlohmann::json& args) {
-    TrashService trash(*context.paths, context.config, context.logger.get());
+    TrashService trash(*context.paths, config, context.logger.get());
+
+    const auto in_scope = [bucket_scoped, &config](const std::string& bucket) {
+        return !bucket_scoped || iequals(bucket, config.current_bucket);
+    };
 
     const auto entry_json = [](const TrashEntry& entry) {
         nlohmann::json item = nlohmann::json::object();
@@ -323,6 +328,10 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
         std::size_t files = 0;
         std::size_t buckets = 0;
         for (const TrashEntry& entry : std::get<std::vector<TrashEntry>>(items)) {
+            // 请求级 Bucket：只列当前库的条目（桶级条目的 bucket 是原桶名）。
+            if (!in_scope(entry.bucket)) {
+                continue;
+            }
             if (entry.type == "file") {
                 ++files;
             } else {
@@ -348,6 +357,10 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
         if (!ok(entry)) {
             return *error_of(entry);
         }
+        if (!in_scope(std::get<TrashEntry>(entry).bucket)) {
+            return make_error(ErrorCode::TrashEntryNotFound,
+                              "当前 Bucket「" + config.current_bucket + "」里没有这个回收站条目");
+        }
 
         nlohmann::json data = nlohmann::json::object();
         data["entry"] = entry_json(std::get<TrashEntry>(entry));
@@ -367,7 +380,13 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
             if (!ok(checked)) {
                 return *error_of(checked);
             }
-            return check_json(std::get<TrashCheck>(checked));
+            const TrashCheck& check = std::get<TrashCheck>(checked);
+            if (!in_scope(check.entry.bucket)) {
+                return make_error(ErrorCode::TrashEntryNotFound,
+                                  "当前 Bucket「" + config.current_bucket +
+                                      "」里没有这个回收站条目");
+            }
+            return check_json(check);
         }
 
         // 目标桶已存在时回退是**合并**：这是「拿回收站的数据往现有桶里加东西」，
@@ -380,6 +399,11 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
                 return *error_of(checked);
             }
             const TrashCheck& check = std::get<TrashCheck>(checked);
+            if (!in_scope(check.entry.bucket)) {
+                return make_error(ErrorCode::TrashEntryNotFound,
+                                  "当前 Bucket「" + config.current_bucket +
+                                      "」里没有这个回收站条目");
+            }
             if (!check.conflicts.empty()) {
                 return make_error(ErrorCode::RestoreMergeConflict, check.message);
             }
@@ -425,7 +449,26 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
             if (!ok(checked)) {
                 return *error_of(checked);
             }
-            return check_json(std::get<TrashCheck>(checked));
+            const TrashCheck& check = std::get<TrashCheck>(checked);
+            if (!in_scope(check.entry.bucket)) {
+                return make_error(ErrorCode::TrashEntryNotFound,
+                                  "当前 Bucket「" + config.current_bucket +
+                                      "」里没有这个回收站条目");
+            }
+            return check_json(check);
+        }
+
+        // 请求级 Bucket：永久删除也只能删当前库的条目。
+        if (bucket_scoped) {
+            const Result<TrashCheck> checked = trash.check_purge(value);
+            if (!ok(checked)) {
+                return *error_of(checked);
+            }
+            if (!in_scope(std::get<TrashCheck>(checked).entry.bucket)) {
+                return make_error(ErrorCode::TrashEntryNotFound,
+                                  "当前 Bucket「" + config.current_bucket +
+                                      "」里没有这个回收站条目");
+            }
         }
 
         // 永久删除不可恢复：调用方必须显式确认（CLI 在用户回答 y 之后才置 force）
@@ -448,6 +491,12 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
     }
 
     if (operation == "trash.empty") {
+        // 清空回收站是**整站**操作：请求级 Bucket 下不允许（会把别的库也删掉）。
+        if (bucket_scoped) {
+            return make_error(ErrorCode::PermissionDenied,
+                              "清空回收站是整站操作，不能通过单个 Bucket 的会话执行；"
+                              "请在 CLI 里操作或去掉 X-FMT-Bucket");
+        }
         // 永久删除整站：先把「几项、多少」说清楚，再要一次确认（缺 force → FMT-016）。
         const auto force = args.find("force");
         const bool forced = force != args.end() && force->is_boolean() && force->get<bool>();
@@ -502,9 +551,10 @@ Result<nlohmann::json> trash_command(AppContext& context, const std::string& ope
 
 // 文件：list / get / delete。**upload 不在这里**——它要边下载边写盘，属长任务，
 // 由运行体的两段式路径处理（下载在锁外、登记在锁内，见 file.hpp）。
-Result<nlohmann::json> file_command(AppContext& context, const std::string& operation,
+Result<nlohmann::json> file_command(AppContext& context, Config& config, bool bucket_scoped,
+                                    const std::string& operation,
                                     const nlohmann::json& args) {
-    FileService files(*context.paths, context.config, context.logger.get());
+    FileService files(*context.paths, config, context.logger.get());
 
     if (operation == "file.upload_stream") {
         // **流式上传的第二段**：数据已经由 HTTP 层边收边写落在 temp/ 里，
@@ -521,7 +571,7 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
 
         Result<PreparedUpload> prepared =
             prepare_staged_upload(*context.paths, path_from_utf8(std::get<std::string>(staged)), name,
-                                  context.config.max_upload_size, context.logger.get());
+                                  config.max_upload_size, context.logger.get());
         if (!ok(prepared)) {
             // 暂存文件的生命周期到这里为止：失败就地清掉，别留在 temp/ 里。
             std::error_code ignored;
@@ -681,6 +731,12 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
         }
 
         const FileRecord& found = std::get<FileRecord>(record);
+        // 请求级 Bucket（登录会话 / X-FMT-Bucket）下，file_id 也只能在当前库内命中：
+        // 否则拿一个 token 就能按全局 file_id 读到别的库的文件。
+        if (bucket_scoped && !iequals(found.bucket, config.current_bucket)) {
+            return make_error(ErrorCode::FileNotFound,
+                              "当前 Bucket「" + config.current_bucket + "」里没有这个文件：" + value);
+        }
         nlohmann::json data = nlohmann::json::object();
         data["file_id"] = found.file_id;
         data["file_name"] = found.file_name;
@@ -735,6 +791,11 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
                 return *error_of(checked);
             }
             const FileDeleteCheck& check = std::get<FileDeleteCheck>(checked);
+            if (bucket_scoped && check.other_bucket) {
+                return make_error(ErrorCode::FileNotFound,
+                                  "当前 Bucket「" + config.current_bucket +
+                                      "」里没有这个文件：" + value);
+            }
 
             nlohmann::json data = nlohmann::json::object();
             data["ambiguous"] = check.ambiguous;
@@ -777,6 +838,11 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
                 return *error_of(checked);
             }
             const FileDeleteCheck& check = std::get<FileDeleteCheck>(checked);
+            if (bucket_scoped && check.other_bucket) {
+                return make_error(ErrorCode::FileNotFound,
+                                  "当前 Bucket「" + config.current_bucket +
+                                      "」里没有这个文件：" + value);
+            }
             if (check.other_bucket) {
                 return make_error(ErrorCode::ConfirmRequired,
                                   check.message + "；确认删除请加 force（CLI：--yes）");
@@ -800,7 +866,7 @@ Result<nlohmann::json> file_command(AppContext& context, const std::string& oper
                 relative_path_text(context.paths->root(), std::get<std::filesystem::path>(target));
         }
         data["message"] = "文件已移入回收站：" + record.file_name +
-                          (iequals(record.bucket, context.config.current_bucket)
+                          (iequals(record.bucket, config.current_bucket)
                                ? std::string{}
                                : "（Bucket：" + record.bucket + "）");
         return data;
@@ -1116,9 +1182,14 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
 // 下载也走这条：HTTP 的 GET /api/share/<share_id>/download（**公开、不要 token**）
 // 先调 share.download 记账，全部检查通过才把字节流出去——§50/§51 的「先记账再放行」
 // 就落在 register_download 里（端点只负责记账完之后去读文件、回内容）。
-Result<nlohmann::json> share_command(AppContext& context, const std::string& operation,
+Result<nlohmann::json> share_command(AppContext& context, Config& config, bool bucket_scoped,
+                                     const std::string& operation,
                                      const nlohmann::json& args) {
-    ShareService shares(*context.paths, context.config, context.logger.get());
+    ShareService shares(*context.paths, config, context.logger.get());
+
+    const auto in_scope = [bucket_scoped, &config](const std::string& bucket) {
+        return !bucket_scoped || iequals(bucket, config.current_bucket);
+    };
 
     const auto share_json = [](const ShareRecord& record) {
         nlohmann::json item = nlohmann::json::object();
@@ -1157,6 +1228,17 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
         if (!ok(key)) {
             return *error_of(key);
         }
+        if (bucket_scoped) {
+            const Result<FileRecord> file = shares.resolve(std::get<std::string>(key));
+            if (!ok(file)) {
+                return *error_of(file);
+            }
+            if (!in_scope(std::get<FileRecord>(file).bucket)) {
+                return make_error(ErrorCode::FileNotFound,
+                                  "当前 Bucket「" + config.current_bucket +
+                                      "」里没有这个文件：" + std::get<std::string>(key));
+            }
+        }
         const Result<ShareRecord> created = shares.create(std::get<std::string>(key));
         if (!ok(created)) {
             return *error_of(created);
@@ -1183,8 +1265,13 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
         if (!ok(view)) {
             return *error_of(view);
         }
-        nlohmann::json data = view_json(std::get<ShareView>(view));
-        data["url"] = share_url_of(context, std::get<ShareView>(view).share.share_id);
+        const ShareView& found = std::get<ShareView>(view);
+        if (bucket_scoped && (found.file.bucket.empty() || !in_scope(found.file.bucket))) {
+            return make_error(ErrorCode::ShareNotFound,
+                              "当前 Bucket「" + config.current_bucket + "」里没有这个分享");
+        }
+        nlohmann::json data = view_json(found);
+        data["url"] = share_url_of(context, found.share.share_id);
         data["share_url"] = data["url"];
         return data;
     }
@@ -1208,6 +1295,11 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
             if (!ok(resolved)) {
                 return *error_of(resolved);
             }
+            if (bucket_scoped && !in_scope(std::get<FileRecord>(resolved).bucket)) {
+                return make_error(ErrorCode::FileNotFound,
+                                  "当前 Bucket「" + config.current_bucket +
+                                      "」里没有这个文件：" + key);
+            }
             file_id = std::get<FileRecord>(resolved).file_id;
         }
 
@@ -1218,6 +1310,10 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
 
         nlohmann::json array = nlohmann::json::array();
         for (const ShareView& view : std::get<std::vector<ShareView>>(views)) {
+            // 请求级 Bucket：只列当前库的分享（文件已缺失的条目也不该跨库暴露）。
+            if (bucket_scoped && (view.file.bucket.empty() || !in_scope(view.file.bucket))) {
+                continue;
+            }
             nlohmann::json item = view_json(view);
             item["url"] = share_url_of(context, view.share.share_id);
             item["share_url"] = item["url"];
@@ -1231,7 +1327,7 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
         data["scope"] = key.empty() ? "all" : "file";
         // 当前 Bucket 两种模式都给：列全部时用户靠它分辨「这条是不是当前桶的文件」，
         // 过滤单个文件时也能顺手看出它属于哪个桶。
-        data["current_bucket"] = context.config.current_bucket;
+        data["current_bucket"] = config.current_bucket;
         if (!key.empty()) {
             data["file_id"] = file_id;
         }
@@ -1242,6 +1338,17 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
         const Result<std::string> share_id = argument(args, 0, "share_id");
         if (!ok(share_id)) {
             return *error_of(share_id);
+        }
+        if (bucket_scoped) {
+            const Result<ShareView> view = shares.get(std::get<std::string>(share_id));
+            if (!ok(view)) {
+                return *error_of(view);
+            }
+            const ShareView& found = std::get<ShareView>(view);
+            if (found.file.bucket.empty() || !in_scope(found.file.bucket)) {
+                return make_error(ErrorCode::ShareNotFound,
+                                  "当前 Bucket「" + config.current_bucket + "」里没有这个分享");
+            }
         }
         const Result<ShareRecord> removed = shares.remove(std::get<std::string>(share_id));
         if (!ok(removed)) {
@@ -1271,7 +1378,7 @@ Result<nlohmann::json> share_command(AppContext& context, const std::string& ope
         data["size"] = record.size;
         data["md5"] = record.md5;
         // 相对路径：公开的分享下载端点要按它去读文件（计数已经在上一步记好）
-        FileService files(*context.paths, context.config, context.logger.get());
+        FileService files(*context.paths, config, context.logger.get());
         if (const Result<std::filesystem::path> absolute = files.resolve_path(record);
             ok(absolute)) {
             data["path"] = relative_path_text(context.paths->root(),
@@ -1423,16 +1530,36 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
         return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
     }
 
+    // HTTP 层把请求级 Bucket 放在 `_bucket` 里（CLI 没有这个字段）。
+    // 先校验它存在并取磁盘上的规范名，再复制一份 Config 给文件/回收站/分享用；
+    // **不修改 context.config**，否则并发客户端会互相踩。
+    std::string requested_bucket;
+    if (args.is_object()) {
+        const auto found = args.find("_bucket");
+        if (found != args.end() && found->is_string()) {
+            requested_bucket = found->get<std::string>();
+        }
+    }
+    Config effective = context.config;
+    if (!requested_bucket.empty()) {
+        BucketService buckets(*context.paths, context.config, context.logger.get());
+        const Result<BucketInfo> info = buckets.get(requested_bucket);
+        if (!ok(info)) {
+            return *error_of(info);
+        }
+        effective.current_bucket = std::get<BucketInfo>(info).name;
+    }
+
     if (starts_with(operation, "bucket.")) {
         return bucket_command(context, operation, args);
     }
 
     if (starts_with(operation, "trash.")) {
-        return trash_command(context, operation, args);
+        return trash_command(context, effective, !requested_bucket.empty(), operation, args);
     }
 
     if (starts_with(operation, "file.")) {
-        return file_command(context, operation, args);
+        return file_command(context, effective, !requested_bucket.empty(), operation, args);
     }
 
     if (starts_with(operation, "config.")) {
@@ -1440,7 +1567,7 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
     }
 
     if (starts_with(operation, "share.")) {
-        return share_command(context, operation, args);
+        return share_command(context, effective, !requested_bucket.empty(), operation, args);
     }
 
     if (starts_with(operation, "user.")) {

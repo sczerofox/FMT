@@ -98,17 +98,44 @@ impl_->server->set_pre_routing_handler([verifier](const Request& request, Respon
   `fmt.exe config list --show-token`（默认隐藏，要显式加开关；会打印用户 ID / 访问 token /
   建议的请求头）。
   **HTTP 侧拿不到 token**：`GET /api/config` 的响应里永远没有它（见 §2.4 第 2 条）。
-- **CLI 侧已经加了登录，但 HTTP 认证一个字没改**（2026-10-17）：
-  - CLI 现在支持 `fmt.exe -u <用户名> -p`（回车后隐藏输入口令、回显 `*`）与窗口内
+- **CLI 与 HTTP 都支持账号密码登录**（HTTP 侧见 §2.2.1，2.1.0 起）：
+  - CLI 支持 `fmt.exe -u <用户名> -p`（回车后隐藏输入口令、回显 `*`）与窗口内
     `login` / `logout`，**业务命令要求先登录**（`service` / `log` / `help` / `version`
     与 `user get` / `user create` 除外）；登录态**只在 CLI 内存里**，窗口一关就要重新登录。
-  - 那条链路用的是 `user.salt` + 本地 `password_digest()` + `user.verify`：**口令明文不出
-    CLI 进程**，过管道的只有 PBKDF2 摘要。
-  - **对 Java 侧的意义：token 是「临时备用钥匙」**。服务端依然每请求只认 token，本 SDK
-    的 `TokenProvider` / `applyToken()` 流程**完全不受影响**，不需要跟着登录走。
-  - 将来要做「像 MySQL 那样用 jar 登录」时，那是一次**新增接口**（例如
-    `POST /api/auth/login` 收用户名+口令、返回会话或 token），**不是**改用现有认证——
-    现有 token 通路必须保持可用，否则已发布的 SDK 会被一次性打翻。
+  - 两条链路用的是同一套 `salt + 本地 password_digest() + 摘要比对`：**口令明文不出
+    客户端进程**，过管道/HTTP 的只有 PBKDF2 摘要。
+  - **旧 token 通路必须保持可用**：已发布的 SDK 不会被一次性打翻。登录是新增能力，
+    不是替换现有 token 认证。
+
+### 2.2.1 账号密码登录（2.1.0 起）
+
+像 MySQL 一样用「账号 + 密码 + 库名（Bucket）」执行业务，不用先手工拿 token：
+
+```text
+GET  /api/auth/salt?username=<用户名>          （公开）→ {username, salt}
+POST /api/auth/login                            （公开）
+     {"username":"…","password_digest":"<64 hex>","bucket":"work"}
+  → 200 {"ok":true,"data":{"token":"<会话 token>","token_type":"session",
+                           "expires_at":"…","username":"…","bucket":"work"}}
+POST /api/auth/logout                           （要 token）→ 会话立即失效
+```
+
+- **口令**: 客户端先取 salt，本地 PBKDF2-SHA256（100000 轮、32 字节）算摘要，
+  只发摘要；服务端用 `data/user.json` 里存的摘要做常量时间比对。
+- **会话 token**: 服务端内存表里的临时密钥，**2 小时**有效；服务重启即失效。
+  它与 `data/user.json` 的账号 token **完全独立**（后者仍是 7 天，给旧客户端/CLI 续期用）。
+- **库名必须每请求带**: 业务请求头 `X-FMT-Bucket: <bucket>`；会话 token 只能访问
+  登录时选的那个 Bucket，缺失 → 400 `FMT-001`，不匹配 → 403 `FMT-004`。
+- **旧账号 token**: 带 `X-FMT-Bucket` 就按它走；不带就沿用服务端 `current_bucket`
+  （保持旧 SDK 行为）。
+- **Java 侧**:
+  ```java
+  try (FmtChannel fmt = Fmt.login("http://localhost:4122", "user", "password", "work")) {
+      fmt.listFiles(FileQuery.all());   // 自动登录 + 每个请求带 X-FMT-Bucket
+  }
+  ```
+  Spring Boot 配 `fmt.username` / `fmt.password` / `fmt.bucket`。会话过期（`FMT-019`）
+  时 SDK 用保存的账号密码自动重登一次；账号密码错误则报 `FMT-020`。
 
 ### 2.3 信封与状态码
 
@@ -120,7 +147,7 @@ impl_->server->set_pre_routing_handler([verifier](const Request& request, Respon
 | HTTP | 含义 | 典型错误码 |
 |---|---|---|
 | 400 | 参数/校验 | FMT-001、FMT-303、FMT-701 |
-| 401 | 认证 | FMT-018（缺/错 token）、**FMT-019（token 过期，不可自愈）** |
+| 401 | 认证 | FMT-018（缺/错 token）、**FMT-019（token 过期）**、**FMT-020（账号/密码/库名登录失败）**；旧账号 token 过期不可自愈，登录模式的会话 token 会自动重登 |
 | 403 | 权限与不可用 | FMT-004、FMT-501/502/503 |
 | 404 | 不存在（含"故意不提供"） | FMT-002、FMT-017、FMT-200 |
 | 409 | 冲突 | FMT-003、FMT-105（同桶同名但内容不同）、FMT-304（同桶同名且内容相同）、FMT-401、FMT-403（回退桶时的合并撞名，见 `FMT 技术文档.md` 18.44） |
@@ -142,6 +169,9 @@ impl_->server->set_pre_routing_handler([verifier](const Request& request, Respon
 | GET | `/api/status` | `status()` |
 | GET | `/api/config` | `getConfig(...)`（**只读**，默认不回 token） |
 | GET | `/api/bucket` | `listBuckets()`（**只读**） |
+| GET | `/api/auth/salt` | `Fmt.login(...)` 内部：取口令盐（**公开**） |
+| POST | `/api/auth/login` | `Fmt.login(...)` 内部：摘要 + Bucket → 会话 token（**公开**） |
+| POST | `/api/auth/logout` | 注销当前会话（要 token；2.1.0） |
 | GET | `/api/file` | `listFiles(query)` |
 | POST | `/api/file/upload` | `upload(...)` |
 | GET | `/api/file/<id或名>` | `getFile(...)` |
@@ -417,7 +447,14 @@ if (got.isFailure()) {
 fmt:
   enabled: true
   base-url: http://localhost:4122   # 别写 127.0.0.1（见 §2.1 地址族那条）
-  data-root: D:/Tools/fmt        # 推荐：token 从 <data-root>/data/user.json 读
+  # ---- 方式 A：账号 + 密码 + 库名（2.1.0 起，推荐；与 token/data-root 二选一）----
+  username: user
+  password: your-password
+  bucket: work                    # 库名 = Bucket；登录模式必填
+  # ---- 方式 B：旧 token ----
+  # data-root: D:/Tools/fmt      # token 从 <data-root>/data/user.json 读
+  # token: <32 位十六进制>
+  # bucket: work                  # 可选：token 模式也显式带库名
   auth-scheme: X_FMT_TOKEN       # X_FMT_TOKEN | BEARER | BOTH
   connect-timeout: 3s
   request-timeout: 30s
@@ -453,32 +490,33 @@ fmt:
 
 ## 8. 演进：什么时候该改 fmt.exe
 
-### 8.1 会话模式（真·「token 只在建链时发一次」）
+### 8.1 会话模式（2.1.0 已落地）
 
-如果将来要把 FMT 暴露给**非本机**的客户端，可以加一套握手：
+2.1.0 起实现了「账号密码换临时会话 token」，但**没有**另造 `X-FMT-Session` 头：
+会话 token 与账号 token 共用 `X-FMT-Token` / `Authorization: Bearer`，服务端先查内存
+会话表，未命中再按旧账号 token 校验。
 
 ```text
-POST /api/auth/handshake
-  Header: X-FMT-Token: <token>
-  → 200 {"ok":true,"data":{"session_id":"…","expires_at":"2026-10-09 12:00:00"}}
-
-后续请求: X-FMT-Session: <session_id>      （服务端 pre-routing 先验 session，再验 token）
-DELETE /api/auth/session                    （主动注销）
+GET  /api/auth/salt?username=<用户名>     （公开）
+POST /api/auth/login                      （公开）
+     {"username":"…","password_digest":"<64 hex>","bucket":"work"}
+  → {"token":"<会话 token>","token_type":"session","expires_at":"…","bucket":"work"}
+POST /api/auth/logout                      （要 token）→ 会话立即失效
 ```
 
-服务端要动的地方（都不难，但都要认真做）：
+落地细节：
 
-| # | 改动 | 备注 |
-|---|---|---|
-| 1 | `server.cpp` 的 `set_pre_routing_handler`：先查 session 表，命中就放行 | 保持"认证只在一处"的结构 |
-| 2 | 新增会话表：`session_id → {user, 过期时间, 最后活跃}` | 内存 + 定期清理，别落盘 |
-| 3 | 会话过期/服务重启后的语义 | 建议 `401 + FMT-018`，客户端退回 token 重新握手 |
-| 4 | 并发：httplib 是多线程的，会话表要加锁 | 与现有业务锁分开，别混着用 |
-| 5 | 文档与测试：新增错误码（如 `FMT-019 会话过期`），补现有 162 个用例之外的新用例 | 项目对测试很较真，别省 |
+| 项 | 实现 |
+|---|---|
+| 会话表 | `ServerRuntime` 内存 `token → {username, bucket, expires}`，`session_mutex_` 保护 |
+| TTL | **2 小时**；过期返回 `401 + FMT-019`；登录/校验时顺手清过期项 |
+| 服务重启 | 会话全丢（内存），客户端用保存的账号密码自动重登 |
+| 旧 token | 完整保留；不带 `X-FMT-Bucket` 仍用 `current_bucket` |
+| 库名 | 会话 token 必须每请求带 `X-FMT-Bucket`，且只能访问登录时选的那个 Bucket |
+| 并发 | 会话锁与业务锁分开；登录/校验不长时间持业务锁 |
 
-**收益/成本判断**：在「只监听 localhost + 单用户」的现状下，会话模式**不增加实质安全性**
-（token 一样要在客户端内存/配置文件里躺着），却引入状态、过期、清理、并发四类新问题。
-**建议：现在不做**；真的跨机部署时再做，并且优先考虑 VPN/SSH 隧道 + 反向代理限流。
+在「只监听 localhost」的现状下，它不增加传输层安全性，但把「账号密码 → 临时钥匙」的
+使用方式做成了与 MySQL 类似的体验，且与 7 天账号 token 解耦。
 
 ### 8.2 FMT → Java 的真推送（webhook）
 
@@ -723,7 +761,7 @@ user.json」）。所以对着**旧 exe** 跑，桥接侧看到的是（都是**
 
 | 场景 | 做法 |
 |---|---|
-| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.0.2` |
+| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.1.0` |
 | 不想动私服 | `mvn install:install-file` 把两个 jar 装进本地仓库，或直接 `<scope>system</scope>`（不推荐） |
 | 只在非 Spring 项目用 | 只依赖 `fmt-client-core`（零依赖，Java 17+） |
 | 当独立桥接服务跑 | `java -jar fmt-bridge.jar`（demo 模块打成可执行 jar），别的系统调它的 REST |

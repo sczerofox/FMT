@@ -4,6 +4,7 @@ import org.lazy.fmt.client.Fmt;
 import org.lazy.fmt.client.FmtChannel;
 import org.lazy.fmt.client.FmtChannelConfig;
 import org.lazy.fmt.client.FmtCodec;
+import org.lazy.fmt.client.FmtConfigurationException;
 import org.lazy.fmt.client.FmtLogger;
 import org.lazy.fmt.client.json.SimpleJson;
 
@@ -63,7 +64,6 @@ public class FmtAutoConfiguration {
                                  ObjectProvider<FmtLogger> logger) {
         FmtChannelConfig.Builder builder = FmtChannelConfig.builder()
                 .baseUrl(properties.getBaseUrl())
-                .tokenProvider(properties.resolveTokenProvider())
                 .authScheme(properties.getAuthScheme())
                 .connectTimeout(properties.getConnectTimeout())
                 .requestTimeout(properties.getRequestTimeout())
@@ -72,6 +72,22 @@ public class FmtAutoConfiguration {
                 .retryOnUnauthorized(properties.isRetryOnUnauthorized())
                 .idempotentRetries(properties.getIdempotentRetries())
                 .headers(properties.getHeaders());
+        final String username = properties.getUsername();
+        final boolean hasUsername = username != null && !username.isBlank();
+        final boolean hasPassword = properties.getPassword() != null;
+        if (hasUsername != hasPassword) {
+            throw new FmtConfigurationException(
+                    "fmt.username 与 fmt.password 必须一起配置（像 MySQL 一样登录）");
+        }
+        if (properties.hasLogin()) {
+            // 像 MySQL 一样：账号 + 密码 + 库名。建 bean 时不发请求，第一次业务调用才登录。
+            builder.login(properties.getUsername(), properties.getPassword(), properties.getBucket());
+        } else {
+            builder.tokenProvider(properties.resolveTokenProvider());
+            if (properties.getBucket() != null && !properties.getBucket().isBlank()) {
+                builder.bucket(properties.getBucket());
+            }
+        }
         codec.ifAvailable(builder::codec);
         logger.ifAvailable(builder::logger);
         return Fmt.channel(builder.build());

@@ -5,14 +5,20 @@
 
 #include "fmt/bucket/bucket.hpp"
 #include "fmt/common/string.hpp"
+#include "fmt/common/time.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/file/file.hpp"
 #include "fmt/ipc/protocol.hpp"
 #include "fmt/service/commands.hpp"
 #include "fmt/user/user.hpp"
+#include "fmt/user/user_service.hpp"
 
 namespace fmt::service {
 namespace {
+
+// 会话 token 的 TTL：2 小时。它是「临时钥匙」，不是账号 token 的 7 天；
+// 过期后客户端用保存的账号密码自动重登（两个 jar 都会做）。
+constexpr std::int64_t kSessionTtlSeconds = 2 * 60 * 60;
 
 // 规范化数据根：绝对路径 + 词法归一（去尾部分隔符、折叠 . 与 ..）。
 std::string normalize_root(const std::string& root) {
@@ -260,6 +266,126 @@ Result<nlohmann::json> ServerRuntime::run_upload(const nlohmann::json& args) {
     return data;
 }
 
+Result<server::LoginResult> ServerRuntime::login_http(const std::string& username,
+                                                       const std::string& password_digest,
+                                                       const std::string& bucket) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (context_ == nullptr) {
+        return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+    }
+    if (bucket.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "登录必须指定 Bucket（库名）");
+    }
+
+    user::UserService users(*context_->paths, context_->config);
+    const Result<UserRecord> current = users.current();
+    if (!ok(current)) {
+        return make_error(ErrorCode::LoginFailed, "用户名或密码不正确");
+    }
+    const UserRecord& record = std::get<UserRecord>(current);
+    if (record.username.empty() || record.username != username) {
+        return make_error(ErrorCode::LoginFailed, "用户名或密码不正确");
+    }
+
+    // 摘要比对在服务端完成；明文口令从未离开客户端进程。
+    const Result<UserRecord> verified = users.verify_digest(password_digest);
+    if (!ok(verified)) {
+        return make_error(ErrorCode::LoginFailed, "用户名或密码不正确");
+    }
+
+    // 登录时就把「库」钉住：不存在的 Bucket 不能登录，避免之后每个请求才报错。
+    BucketService buckets(*context_->paths, context_->config, context_->logger.get());
+    const Result<BucketInfo> info = buckets.get(bucket);
+    if (!ok(info)) {
+        return *error_of(info);
+    }
+    const std::string canonical_bucket = std::get<BucketInfo>(info).name;
+
+    if (const Status touched = users.record_login(); !ok(touched) &&
+                                                     context_->logger != nullptr) {
+        context_->logger->warn("User", "登录成功但没能更新 last_login_at：" +
+                                           error_of(touched)->message);
+    }
+
+    const std::string token = [&]() {
+        std::lock_guard<std::mutex> sessions_guard(session_mutex_);
+        const auto now = std::chrono::system_clock::now();
+        // 顺手清掉过期会话（登录频率低，扫一遍很便宜）。
+        for (auto it = sessions_.begin(); it != sessions_.end();) {
+            if (now >= it->second.expires) {
+                it = sessions_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        std::string fresh = random_hex(16);
+        while (!fresh.empty() && sessions_.find(fresh) != sessions_.end()) {
+            fresh = random_hex(16);
+        }
+        if (fresh.empty()) {
+            return fresh;
+        }
+        sessions_[fresh] = HttpSession{username, canonical_bucket,
+                                       now + std::chrono::seconds(kSessionTtlSeconds)};
+        return fresh;
+    }();
+    if (token.empty()) {
+        return make_error(ErrorCode::StorageError, "无法生成会话 token（CSPRNG 失败）");
+    }
+
+    server::LoginResult result;
+    result.token = token;
+    result.username = username;
+    result.bucket = canonical_bucket;
+    result.expires_at = local_datetime_iso_after_seconds(kSessionTtlSeconds);
+    return result;
+}
+
+Result<server::AuthIdentity> ServerRuntime::verify_session_http(const std::string& token) {
+    std::lock_guard<std::mutex> guard(session_mutex_);
+    const auto found = sessions_.find(token);
+    if (found == sessions_.end()) {
+        return make_error(ErrorCode::Unauthorized, "不是会话 token");
+    }
+    if (std::chrono::system_clock::now() >= found->second.expires) {
+        sessions_.erase(found);
+        return make_error(ErrorCode::TokenExpired, "会话 token 已过期，请重新登录");
+    }
+    server::AuthIdentity identity;
+    identity.username = found->second.username;
+    identity.bucket = found->second.bucket;
+    identity.session = true;
+    return identity;
+}
+
+Status ServerRuntime::logout_http(const std::string& token) {
+    std::lock_guard<std::mutex> guard(session_mutex_);
+    sessions_.erase(token);  // 注销是幂等的：不存在也算成功
+    return std::monostate{};
+}
+
+Result<std::string> ServerRuntime::salt_http(const std::string& username) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    if (context_ == nullptr) {
+        return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+    }
+    user::UserService users(*context_->paths, context_->config);
+    const Result<UserRecord> current = users.current();
+    if (!ok(current)) {
+        return make_error(ErrorCode::LoginFailed, "用户名或密码不正确");
+    }
+    const UserRecord& record = std::get<UserRecord>(current);
+    if (record.username.empty() || record.username != username) {
+        return make_error(ErrorCode::LoginFailed, "用户名或密码不正确");
+    }
+    return users.password_salt();
+}
+
+void ServerRuntime::clear_sessions() {
+    std::lock_guard<std::mutex> guard(session_mutex_);
+    sessions_.clear();
+}
+
 void ServerRuntime::refresh_current_bucket_locked() {
     if (context_ == nullptr || context_->paths == nullptr) {
         return;
@@ -340,8 +466,27 @@ void ServerRuntime::restart_http() {
         return context_ == nullptr ? 0 : context_->config.max_upload_size;
     };
 
+    // 会话校验/登录：账号 + Bucket 绑定的临时 token，只在内存里。
+    server::SessionVerifier session_verifier =
+        [this](const std::string& token) -> Result<server::AuthIdentity> {
+        return verify_session_http(token);
+    };
+    server::LoginHandler login =
+        [this](const std::string& username, const std::string& password_digest,
+               const std::string& bucket) -> Result<server::LoginResult> {
+        return login_http(username, password_digest, bucket);
+    };
+    server::SaltHandler salt = [this](const std::string& username) -> Result<std::string> {
+        return salt_http(username);
+    };
+    server::LogoutHandler logout = [this](const std::string& token) -> Status {
+        return logout_http(token);
+    };
+
     const Status started = created->start(host, port, root, logger, std::move(handler),
-                                          std::move(verifier), std::move(upload_limit));
+                                          std::move(verifier), std::move(upload_limit),
+                                          std::move(session_verifier), std::move(login),
+                                          std::move(salt), std::move(logout));
     if (!ok(started)) {
         // 端口被占用等：记 ERROR 日志，但**不中断**服务的其他功能。
         if (logger != nullptr) {
@@ -411,6 +556,8 @@ Status ServerRuntime::apply_root(const std::string& requested_root, std::string*
 
         // 换根后同样校一次：新根里的 current_bucket 可能指向不存在的 Bucket。
         refresh_current_bucket_locked();
+        // 旧根的会话 token 不能带到新根：账号与 Bucket 都可能不同。
+        clear_sessions();
     }
 
     // 换根后重新评估 server.json；必须在锁外（见 restart_http 注释）。

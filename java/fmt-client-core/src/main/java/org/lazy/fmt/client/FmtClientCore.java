@@ -75,6 +75,9 @@ public final class FmtClientCore {
     private String token;
     private Path dataRoot;
     private TokenProvider tokenProvider;
+    private String username;
+    private String password;
+    private String bucket;
     private FmtAuthScheme authScheme = FmtAuthScheme.X_FMT_TOKEN;
     private Duration connectTimeout = Duration.ofSeconds(3);
     private Duration requestTimeout = Duration.ofSeconds(30);
@@ -110,6 +113,36 @@ public final class FmtClientCore {
     /** 固定 token（明文）。改一次要新建通道才生效。 */
     public FmtClientCore setToken(String token) {
         this.token = token == null ? null : token.trim();
+        return this;
+    }
+
+    /**
+     * 账号密码登录模式（像 MySQL 一样给账号、密码、库名）。
+     *
+     * <p>与 {@link #setToken(String)} 二选一；通道第一次需要认证时会自动
+     * 取 salt → 算摘要 → 换临时会话 token，过期后自动重登。
+     */
+    public FmtClientCore setLogin(String username, String password, String bucket) {
+        this.username = username == null || username.isBlank() ? null : username.trim();
+        this.password = password;
+        this.bucket = bucket == null || bucket.isBlank() ? null : bucket.trim();
+        return this;
+    }
+
+    /** 账号（配合 {@link #setPassword} / {@link #setBucket}）。 */
+    public FmtClientCore setUsername(String username) {
+        this.username = username == null || username.isBlank() ? null : username.trim();
+        return this;
+    }
+
+    public FmtClientCore setPassword(String password) {
+        this.password = password;
+        return this;
+    }
+
+    /** 库名（Bucket）；登录模式必填，token 模式可选（不填沿用服务端 current_bucket）。 */
+    public FmtClientCore setBucket(String bucket) {
+        this.bucket = bucket == null || bucket.isBlank() ? null : bucket.trim();
         return this;
     }
 
@@ -238,7 +271,6 @@ public final class FmtClientCore {
     public FmtChannelConfig toConfig() {
         FmtChannelConfig.Builder builder = FmtChannelConfig.builder()
                 .baseUrl(baseUrl)
-                .tokenProvider(resolveTokenProvider())
                 .authScheme(authScheme)
                 .connectTimeout(connectTimeout)
                 .requestTimeout(requestTimeout)
@@ -247,6 +279,14 @@ public final class FmtClientCore {
                 .retryOnUnauthorized(retryOnUnauthorized)
                 .idempotentRetries(idempotentRetries)
                 .logger(logger == null ? FmtLoggers.NOOP : logger);
+        if (username != null || password != null) {
+            builder.login(username, password, bucket);
+        } else {
+            builder.tokenProvider(resolveTokenProvider());
+            if (bucket != null) {
+                builder.bucket(bucket);
+            }
+        }
         if (codec != null) {
             builder.codec(codec);
         }
@@ -293,7 +333,8 @@ public final class FmtClientCore {
     @Override
     public String toString() {
         return "FmtClientCore[baseUrl=" + baseUrl + ", auth=" + authScheme.description()
-                + ", token来源=" + (tokenProvider != null ? "自定义 TokenProvider"
+                + ", 凭证=" + (username != null ? "账号密码登录（user=" + username + ", bucket=" + bucket + "）"
+                        : tokenProvider != null ? "自定义 TokenProvider"
                         : token != null && !token.isEmpty() ? "setToken(…)"
                         : dataRoot != null ? "data/user.json @ " + dataRoot
                         : "环境变量 " + DEFAULT_TOKEN_VARIABLE + " / " + DEFAULT_ROOT_VARIABLE)

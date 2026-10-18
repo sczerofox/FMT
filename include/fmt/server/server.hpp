@@ -32,6 +32,44 @@ using BusinessHandler =
 // 但它必须默认是关着的，免得哪天忘了注入就变成裸奔。
 using TokenVerifier = std::function<Result<std::string>(const std::string& token)>;
 
+// 会话身份：登录接口签发的是**临时会话 token**，它绑定「账号 + Bucket」。
+//
+// 与账号 token 的区别：
+//   * 账号 token 在 data/user.json 里，7 天有效，整个数据根共用；
+//   * 会话 token 只在内存里，短 TTL，服务重启即失效，可按客户端区分。
+//
+// `session == false` 表示这是旧的账号 token：`bucket` 为空，业务层用
+// 请求头 X-FMT-Bucket（有就覆盖）或服务端 current_bucket（没有就沿用）。
+struct AuthIdentity {
+    std::string username;
+    std::string bucket;
+    bool session = false;
+};
+
+// 登录结果：客户端拿 token + 明确的 Bucket。
+struct LoginResult {
+    std::string token;
+    std::string username;
+    std::string bucket;
+    std::string expires_at;
+    std::string token_type = "session";
+};
+
+// 会话校验器：有效返回身份；token 不是会话（未命中）返回 Unauthorized，
+// 让上层继续按账号 token 校验；会话过期返回 TokenExpired。
+using SessionVerifier = std::function<Result<AuthIdentity>(const std::string& token)>;
+
+// 登录：用户名 + PBKDF2 摘要（明文密码不进 HTTP）+ Bucket。
+using LoginHandler = std::function<Result<LoginResult>(const std::string& username,
+                                                       const std::string& password_digest,
+                                                       const std::string& bucket)>;
+
+// 取口令盐（公开接口）：客户端拿它算摘要，明文密码不出客户端进程。
+using SaltHandler = std::function<Result<std::string>(const std::string& username)>;
+
+// 注销会话；返回 Status 即可（成功/失败都只是一个信封）。
+using LogoutHandler = std::function<Status(const std::string& token)>;
+
 // 上传上限的**取值器**：每次上传请求现取一次（不是启动时的快照）。
 // 为什么是取值器而不是一个数：上限住在 config.json 里，`config set max_upload_size`
 // 只改服务进程里的值、不重启 HTTP 监听；拿快照会让「调大上限」当场失效
@@ -52,7 +90,11 @@ public:
     // 绑定失败（端口被占用等）返回错误：调用方记 ERROR 日志，但**不中断**其他功能。
     Status start(const std::string& host, int port, std::string data_root, Logger* logger,
                  BusinessHandler handler, TokenVerifier verifier,
-                 UploadLimitProvider upload_limit = nullptr);
+                 UploadLimitProvider upload_limit = nullptr,
+                 SessionVerifier session_verifier = nullptr,
+                 LoginHandler login = nullptr,
+                 SaltHandler salt = nullptr,
+                 LogoutHandler logout = nullptr);
 
     // 停止监听并等线程结束；可重复调用。
     void stop();

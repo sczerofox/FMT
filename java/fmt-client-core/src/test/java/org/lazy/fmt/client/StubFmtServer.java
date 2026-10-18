@@ -259,6 +259,8 @@ final class StubFmtServer implements AutoCloseable {
 
     private static boolean isPublicPath(String path) {
         return "/api/ping".equals(path)
+                || "/api/auth/salt".equals(path)
+                || "/api/auth/login".equals(path)
                 || (path.startsWith("/api/share/") && path.endsWith("/download"));
     }
 

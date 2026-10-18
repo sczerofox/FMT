@@ -78,6 +78,13 @@ public interface FmtChannel extends AutoCloseable {
     /** 通道的连接地址，例如 {@code http://127.0.0.1:4122}。 */
     URI baseUri();
 
+    /**
+     * 通道绑定的库名（Bucket）；{@code null} 表示沿用服务端 {@code current_bucket}（旧行为）。
+     */
+    default String bucket() {
+        return null;
+    }
+
     /** 便于日志的一行描述：地址 + 掩码后的凭证。**不含 token 明文。** */
     String describe();
 
