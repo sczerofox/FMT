@@ -11,6 +11,7 @@ import java.net.URI;
 import java.time.Duration;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -99,11 +100,25 @@ class SessionTokenProviderTest {
     }
 
     @Test
-    void loginModeRequiresBucket() {
-        assertThrows(FmtConfigurationException.class,
-                () -> Fmt.login("http://127.0.0.1:1", "user", "password", ""));
-        assertThrows(FmtConfigurationException.class,
-                () -> Fmt.channel(Fmt.builder().baseUrl("http://127.0.0.1:1")
-                        .login("user", "password", " ").build()));
+    void loginModeAllowsMissingBucketAndUsesCurrentBucket() {
+        try (StubFmtServer stub = StubFmtServer.start(SESSION)) {
+            stub.on("GET", "/api/auth/salt",
+                    request -> StubFmtServer.Reply.ok(
+                            "{\"username\":\"user\",\"salt\":\"" + SALT + "\"}"));
+            stub.on("POST", "/api/auth/login", request -> StubFmtServer.Reply.ok(LOGIN_OK));
+            stub.on("GET", "/api/file", request -> StubFmtServer.Reply.ok(
+                    "{\"files\":[],\"count\":0,\"total\":0,\"page\":1,\"page_size\":0,"
+                            + "\"total_pages\":0,\"sort\":\"name\"}"));
+
+            try (FmtChannel fmt = Fmt.login(stub.baseUrl(), "user", "password", null)) {
+                assertTrue(fmt.listFiles(FileQuery.all()).isOk());
+                // 登录请求里没有 bucket 字段；业务请求也没有 X-FMT-Bucket（服务端用会话桶）。
+                StubFmtServer.Recorded login = stub.requests().stream()
+                        .filter(r -> "/api/auth/login".equals(r.path()))
+                        .findFirst().orElseThrow();
+                assertTrue(!login.bodyText().contains("\"bucket\""), login.bodyText());
+                assertNull(stub.lastRequest().header("X-FMT-Bucket"));
+            }
+        }
     }
 }

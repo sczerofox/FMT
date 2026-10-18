@@ -9699,7 +9699,7 @@ Service Stopped...
 | 项 | 约定 |
 | --- | --- |
 | 程序名 | 固定 `File Manager Tool`（文档名/工程名仍叫 FMT，只有横幅用这个名字） |
-| 版本部分 | `v<MAJOR>.<MINOR>`，当前 `v2.0`；工程版本仍是 `2.1.0` |
+| 版本部分 | `v<MAJOR>.<MINOR>`，当前 `v2.0`；工程版本仍是 `2.2.0` |
 | 构建日期 | CMake 配置时生成（`FMT_BUILD_DATE`，`%Y.%m.%d` 本地时间），每次重新配置都会变 |
 | 单一来源 | 横幅、`--version` / `-v`、以及 `version` 命令（提交 `d108c80`）调同一个 `version_text()`（内部就是 `banner_text()`），不各写一份；源码里不得硬编码版本号或日期 |
 | 用法标题 | `--help` 里是 `用法：fmt.exe [命令]`，不再用 `FMT 2.0.0 - Windows 文件管理系统` 这类旧标题 |

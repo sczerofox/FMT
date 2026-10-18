@@ -74,19 +74,29 @@ public class FmtAutoConfiguration {
                 .headers(properties.getHeaders());
         final String username = properties.getUsername();
         final boolean hasUsername = username != null && !username.isBlank();
-        final boolean hasPassword = properties.getPassword() != null;
+        final boolean hasPassword = properties.getPassword() != null
+                && !properties.getPassword().isBlank();
         if (hasUsername != hasPassword) {
             throw new FmtConfigurationException(
                     "fmt.username 与 fmt.password 必须一起配置（像 MySQL 一样登录）");
         }
+        if (properties.hasLogin() && properties.hasToken()) {
+            throw new FmtConfigurationException(
+                    "fmt.token 与 fmt.username/fmt.password 只能二选一");
+        }
         if (properties.hasLogin()) {
-            // 像 MySQL 一样：账号 + 密码 + 库名。建 bean 时不发请求，第一次业务调用才登录。
+            // 像 MySQL 一样：账号 + 密码 + 可选库名。建 bean 时不发请求，第一次业务调用才登录。
             builder.login(properties.getUsername(), properties.getPassword(), properties.getBucket());
-        } else {
-            builder.tokenProvider(properties.resolveTokenProvider());
+        } else if (properties.hasToken()) {
+            builder.token(properties.getToken());
             if (properties.getBucket() != null && !properties.getBucket().isBlank()) {
                 builder.bucket(properties.getBucket());
             }
+        } else {
+            // 只支持 token 或账号密码；两者都没有就不允许“碰运气”连 fmt.exe。
+            throw new FmtConfigurationException(
+                    "没有配置 FMT 凭证：必须给 fmt.token，或 fmt.username + fmt.password"
+                            + "（fmt.bucket 可选，不填用服务端 current_bucket）");
         }
         codec.ifAvailable(builder::codec);
         logger.ifAvailable(builder::logger);

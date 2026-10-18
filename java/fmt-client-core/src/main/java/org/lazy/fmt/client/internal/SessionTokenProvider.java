@@ -77,12 +77,12 @@ public final class SessionTokenProvider implements TokenProvider {
             throw new FmtConfigurationException("没有配置 FMT 密码");
         }
         if (bucket == null || bucket.isBlank()) {
-            throw new FmtConfigurationException(
-                    "登录模式必须配置库名（Bucket）：fmt.bucket / FmtChannelConfig.bucket(...)");
+            this.bucket = null;  // 不填 = 用服务端 current_bucket
+        } else {
+            this.bucket = bucket.trim();
         }
         this.username = username;
         this.password = password;
-        this.bucket = bucket;
         this.codec = codec == null ? org.lazy.fmt.client.json.SimpleJson.INSTANCE : codec;
         this.logger = logger == null ? FmtLoggers.NOOP : logger;
         this.candidates = List.copyOf(DefaultFmtChannel.buildCandidates(baseUri));
@@ -123,7 +123,10 @@ public final class SessionTokenProvider implements TokenProvider {
         Map<String, String> body = new LinkedHashMap<>();
         body.put("username", username);
         body.put("password_digest", digest);
-        body.put("bucket", bucket);
+        if (bucket != null && !bucket.isBlank()) {
+            // 不填就不发这个字段：服务端用 current_bucket。
+            body.put("bucket", bucket);
+        }
 
         HttpResponse<String> response = send("POST", "/api/auth/login", codec.write(body));
         Map<String, Object> root = envelope(response);
@@ -133,8 +136,8 @@ public final class SessionTokenProvider implements TokenProvider {
         }
         Instant expires = parseInstant(Json.str(root, "data.expires_at", ""));
         if (logger != null) {
-            logger.info("FMT 登录成功：user=" + username + "，bucket=" + bucket + "，token="
-                    + mask(token));
+            logger.info("FMT 登录成功：user=" + username + "，bucket="
+                    + (bucket == null ? "(current)" : bucket) + "，token=" + mask(token));
         }
         return new Login(token, expires);
     }

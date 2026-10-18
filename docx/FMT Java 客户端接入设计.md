@@ -107,14 +107,14 @@ impl_->server->set_pre_routing_handler([verifier](const Request& request, Respon
   - **旧 token 通路必须保持可用**：已发布的 SDK 不会被一次性打翻。登录是新增能力，
     不是替换现有 token 认证。
 
-### 2.2.1 账号密码登录（2.1.0 起）
+### 2.2.1 账号密码登录（2.1.0 起；2.2.0 起桶名可选）
 
 像 MySQL 一样用「账号 + 密码 + 库名（Bucket）」执行业务，不用先手工拿 token：
 
 ```text
 GET  /api/auth/salt?username=<用户名>          （公开）→ {username, salt}
 POST /api/auth/login                            （公开）
-     {"username":"…","password_digest":"<64 hex>","bucket":"work"}
+     {"username":"…","password_digest":"<64 hex>","bucket":"work"}   // bucket 可省略
   → 200 {"ok":true,"data":{"token":"<会话 token>","token_type":"session",
                            "expires_at":"…","username":"…","bucket":"work"}}
 POST /api/auth/logout                           （要 token）→ 会话立即失效
@@ -124,21 +124,24 @@ POST /api/auth/logout                           （要 token）→ 会话立即�
   只发摘要；服务端用 `data/user.json` 里存的摘要做常量时间比对。
 - **会话 token**: 服务端内存表里的临时密钥，**2 小时**有效；服务重启即失效。
   它与 `data/user.json` 的账号 token **完全独立**（后者仍是 7 天，给旧客户端/CLI 续期用）。
-- **库名必须每请求带**: 业务请求头 `X-FMT-Bucket: <bucket>`；会话 token 只能访问
-  登录时选的那个 Bucket，缺失 → 400 `FMT-001`，不匹配 → 403 `FMT-004`。
-- **旧账号 token**: 带 `X-FMT-Bucket` 就按它走；不带就沿用服务端 `current_bucket`
-  （保持旧 SDK 行为）。显式带库名的连接写法：
+- **库名可选**: 登录时不填 `bucket` → 用服务端 `current_bucket`；业务请求头
+  `X-FMT-Bucket` 也可省略（默认会话桶）。带了就必须与会话桶一致，不匹配 → 403 `FMT-004`。
+- **旧账号 token**: 带 `X-FMT-Bucket` 就按它走；不带就沿用服务端 `current_bucket`。
+  显式带库名的连接写法：
   ```java
   FmtChannel fmt = Fmt.channel("http://localhost:4122", token, "work");
   ```
 - **Java 侧**:
   ```java
-  try (FmtChannel fmt = Fmt.login("http://localhost:4122", "user", "password", "work")) {
-      fmt.listFiles(FileQuery.all());   // 自动登录 + 每个请求带 X-FMT-Bucket
+  try (FmtChannel fmt = Fmt.login("http://localhost:4122", "user", "password", null)) {
+      fmt.listFiles(FileQuery.all());   // 不填桶 = 服务端当前桶
   }
   ```
-  Spring Boot 配 `fmt.username` / `fmt.password` / `fmt.bucket`。会话过期（`FMT-019`）
-  时 SDK 用保存的账号密码自动重登一次；账号密码错误则报 `FMT-020`。
+  Spring Boot 配 `fmt.username` / `fmt.password`（`fmt.bucket` 可选）。会话过期
+  （`FMT-019`）时 SDK 用保存的账号密码自动重登一次；账号密码错误则报 `FMT-020`。
+- **Spring Boot starter 只支持两种凭证**：`fmt.token`，或 `fmt.username + fmt.password`；
+  两者都没配会**启动失败**。`fmt.data-root` / `fmt.token-file` / `FMT_TOKEN` / `FMT_ROOT`
+  不再被 starter 读取（核心包 `FmtClientCore` 仍保留这些底层能力）。
 
 ### 2.3 信封与状态码
 
@@ -450,12 +453,11 @@ if (got.isFailure()) {
 fmt:
   enabled: true
   base-url: http://localhost:4122   # 别写 127.0.0.1（见 §2.1 地址族那条）
-  # ---- 方式 A：账号 + 密码 + 库名（2.1.0 起，推荐；与 token/data-root 二选一）----
+  # ---- 方式 A：账号 + 密码（2.1.0 起；与 token 二选一）----
   username: user
   password: your-password
-  bucket: work                    # 库名 = Bucket；登录模式必填
-  # ---- 方式 B：旧 token ----
-  # data-root: D:/Tools/fmt      # token 从 <data-root>/data/user.json 读
+  # bucket: work                  # 可选；不填用服务端 current_bucket
+  # ---- 方式 B：固定 token ----
   # token: <32 位十六进制>
   # bucket: work                  # 可选：token 模式也显式带库名
   auth-scheme: X_FMT_TOKEN       # X_FMT_TOKEN | BEARER | BOTH
@@ -464,11 +466,14 @@ fmt:
   stream-timeout: 30m            # 0s = 不限制
   max-connections: 16
   retry-on-unauthorized: true
-  token-cache-ttl: 30s
   exception-advice: true         # Servlet Web 应用里自动注册 FMT 异常 → JSON（默认开）
   headers:                       # 过网关时可能需要
     X-Request-From: billing
 ```
+
+> **2.2.0 起**：starter 只认 `fmt.token` 或 `fmt.username + fmt.password`；
+> 两者都没配会**启动失败**。`fmt.data-root` / `fmt.token-file` / `FMT_TOKEN` / `FMT_ROOT`
+> 不再由 starter 读取（核心包 `FmtClientCore` 仍保留）。
 
 | bean | 类型 | 覆盖方式 |
 |---|---|---|
@@ -515,7 +520,7 @@ POST /api/auth/logout                      （要 token）→ 会话立即失效
 | TTL | **2 小时**；过期返回 `401 + FMT-019`；登录/校验时顺手清过期项 |
 | 服务重启 | 会话全丢（内存），客户端用保存的账号密码自动重登 |
 | 旧 token | 完整保留；不带 `X-FMT-Bucket` 仍用 `current_bucket` |
-| 库名 | 会话 token 必须每请求带 `X-FMT-Bucket`，且只能访问登录时选的那个 Bucket |
+| 库名 | 登录时可选；业务请求 `X-FMT-Bucket` 也可省略（默认会话桶），带了就必须与会话桶一致 |
 | 并发 | 会话锁与业务锁分开；登录/校验不长时间持业务锁 |
 
 在「只监听 localhost」的现状下，它不增加传输层安全性，但把「账号密码 → 临时钥匙」的
@@ -764,7 +769,7 @@ user.json」）。所以对着**旧 exe** 跑，桥接侧看到的是（都是**
 
 | 场景 | 做法 |
 |---|---|
-| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.1.0` |
+| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.2.0` |
 | 不想动私服 | `mvn install:install-file` 把两个 jar 装进本地仓库，或直接 `<scope>system</scope>`（不推荐） |
 | 只在非 Spring 项目用 | 只依赖 `fmt-client-core`（零依赖，Java 17+） |
 | 当独立桥接服务跑 | `java -jar fmt-bridge.jar`（demo 模块打成可执行 jar），别的系统调它的 REST |

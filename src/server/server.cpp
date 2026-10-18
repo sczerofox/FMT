@@ -885,16 +885,9 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
 
             const std::string requested_bucket = trim(request.get_header_value("X-FMT-Bucket"));
             if (identity.session) {
-                // 会话 token 绑定登录时选的 Bucket：每个业务请求都必须明确带它，
-                // 而且不能拿一个会话去访问另一个库。
-                if (requested_bucket.empty()) {
-                    respond(response, make_error(
-                                            ErrorCode::InvalidArgument,
-                                            "会话 token 必须带 X-FMT-Bucket（登录时选的 Bucket）："
-                                            "这个 token 只能访问「" + identity.bucket + "」"));
-                    return httplib::Server::HandlerResponse::Handled;
-                }
-                if (!iequals(requested_bucket, identity.bucket)) {
+                // 会话 token 绑定登录时选的 Bucket；请求头可选：
+                // 带就必须一致（防止拿一个 token 访问另一个库），不带就默认用会话桶。
+                if (!requested_bucket.empty() && !iequals(requested_bucket, identity.bucket)) {
                     respond(response, make_error(
                                             ErrorCode::PermissionDenied,
                                             "这个会话 token 只能访问 Bucket「" + identity.bucket +
@@ -963,11 +956,11 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
                             const std::string username = text("username");
                             const std::string digest = text("password_digest");
                             const std::string bucket = text("bucket");
-                            if (username.empty() || digest.empty() || bucket.empty()) {
+                            if (username.empty() || digest.empty()) {
                                 respond(response, make_error(
                                                         ErrorCode::InvalidArgument,
-                                                        "登录必须给 username、password_digest 与 "
-                                                        "bucket（库名）"));
+                                                        "登录必须给 username 与 password_digest"
+                                                        "（bucket 可选：不填用服务端 current_bucket）"));
                                 return;
                             }
                             respond(response, login_payload(login(username, digest, bucket)));

@@ -387,14 +387,14 @@ cmake --build cmake-build-release --parallel
 
 ### 3.4 版本号与构建日期
 
-单一来源：`CMakeLists.txt` 的 `project(FMT VERSION 2.1.0)`。
+单一来源：`CMakeLists.txt` 的 `project(FMT VERSION 2.2.0)`。
 经 `cmake/version.hpp.in` 生成 `fmt/version.hpp`（`fmt::version::MAJOR/MINOR/PATCH/STRING`）：
 
 ```cpp
 inline constexpr std::string_view MAJOR = "2";
 inline constexpr std::string_view MINOR = "0";
 inline constexpr std::string_view PATCH = "1";
-inline constexpr std::string_view STRING = "2.1.0";
+inline constexpr std::string_view STRING = "2.2.0";
 ```
 
 **构建日期也由 CMake 在配置时生成**，格式 `%Y.%m.%d`（本地时间），进同一个头文件：
@@ -431,7 +431,7 @@ std::string banner_text() {
 | 项 | 约定 |
 |---|---|
 | 程序名 | 固定 **`File Manager Tool`**（文档名/工程名仍叫 FMT，只有程序横幅用这个名字） |
-| 版本部分 | `v<MAJOR>.<MINOR>`，当前 `v2.0`；工程版本仍是 `2.1.0`（`PATCH` 不出现在横幅里） |
+| 版本部分 | `v<MAJOR>.<MINOR>`，当前 `v2.0`；工程版本仍是 `2.2.0`（`PATCH` 不出现在横幅里） |
 | 构建日期 | `BUILD_DATE`，CMake 配置时按本地时间生成，**每次重新配置都会变** |
 | 空格 | 「Tool」与「v2.0」之间、`(` 与 `build` 之间、`build` 与日期之间都是**两个空格**（照实现原样） |
 | 单一来源 | `--version` 与交互横幅调同一个 `banner_text()`，不各写一份 |
@@ -4338,12 +4338,12 @@ HTTP 状态码（12.5）与简短文本。CLI 不访问它们，只把链接打�
 | GET | `/api/config` | `config list`（**本次改动（未提交）新增；只读**）。**响应里的 `data.token` 一律删掉——任何情况下都不返回，连 `?include_token=1` 这类开关都不提供**——调用方虽然已经拿 token 认证过，但凭证不该因为「顺手」而多出现在日志 / 转发 / 工单里（响应体会进日志、被代理转发、被贴进工单，多一份副本就多一处泄漏面）；要 token 只有两条路：CLI `fmt config list`，或直接读数据根下的 `data/user.json`。**HTTP 侧没有改配置的入口**（改 `max_upload_size` 会动服务进程的全局状态，仍是 CLI 的活） |
 | GET | `/api/bucket` | `bucket list`（**本次改动（未提交）新增；只读列表**）：`buckets[{name,is_current}]` + `count` + `current_bucket`。**桶的写接口（create / use / delete）仍然故意不提供**——`current_bucket` 是服务端全局状态，多个 HTTP 调用方一起改会互相踩，删桶还有确认流程（那是 CLI 的活）。因此 `/api/bucket/<其它路径>` 仍是 **404 + `FMT-017`**（bucket **仍然不在**兜底路由的「已知模块」列表里），`POST /api/bucket` → **404 + `FMT-002`**（只有 GET 有 `/api/.*` 兜底路由，其它方法落到通用错误处理器） |
 | GET | `/api/auth/salt?username=…` | **2.1.0 新增，公开**：返回 `{"username","salt"}`；客户端拿盐在本地算 PBKDF2-SHA256 摘要，明文密码不出客户端 |
-| POST | `/api/auth/login` | **2.1.0 新增，公开**：`{"username","password_digest","bucket"}` → 会话 token + `expires_at` + 规范化的 Bucket。服务端内存会话表，**2 小时 TTL**；与 `data/user.json` 的 7 天账号 token 独立 |
+| POST | `/api/auth/login` | **2.1.0 新增，公开**：`{"username","password_digest","bucket"}` → 会话 token + `expires_at` + 规范化的 Bucket（`bucket` 可省略，2.2.0 起用服务端 `current_bucket`）。服务端内存会话表，**2 小时 TTL**；与 `data/user.json` 的 7 天账号 token 独立 |
 | POST | `/api/auth/logout` | **2.1.0 新增，要 token**：删除当前会话 token（幂等）；旧账号 token 不受影响 |
 
-> **2.1.0 的库名（Bucket）口径**：登录时 `bucket` 必填；会话 token 的每个业务请求
-> 必须带 `X-FMT-Bucket`，值必须是登录时选的那个 Bucket（缺失 → 400 `FMT-001`，
-> 不匹配 → 403 `FMT-004`）。请求级 Bucket 通过 `execute_business` 复制一份 `Config`
+> **2.2.0 的库名（Bucket）口径**：登录时 `bucket` 可省略（用 `current_bucket`）；
+> 会话 token 的业务请求 `X-FMT-Bucket` 也可省略（默认会话桶），带了就必须一致
+> （不匹配 → 403 `FMT-004`）。请求级 Bucket 通过 `execute_business` 复制一份 `Config`
 > 传给文件/回收站/分享服务，**不修改全局 `current_bucket`**，所以多个客户端可以各自
 > 访问不同的库。旧账号 token 仍可继续用：带 `X-FMT-Bucket` 就按它走，不带就沿用
 > `current_bucket`。

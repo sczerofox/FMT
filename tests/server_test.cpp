@@ -1091,9 +1091,10 @@ FMT_TEST(Server, 登录会话与请求级Bucket) {
     const auto missing = missing_bucket.Get("/api/file");
     FMT_CHECK(missing != nullptr);
     if (missing != nullptr) {
-        FMT_CHECK_EQ(missing->status, 400);
-        FMT_CHECK_EQ(nlohmann::json::parse(missing->body)["error"]["code"].get<std::string>(),
-                     std::string("FMT-001"));
+        // 会话 token 不带 X-FMT-Bucket：默认用会话绑定的桶（work）。
+        FMT_CHECK_EQ(missing->status, 200);
+        FMT_CHECK_EQ(nlohmann::json::parse(missing->body)["data"]["bucket"].get<std::string>(),
+                     std::string("work"));
     }
 
     httplib::Client wrong_bucket("127.0.0.1", server.port());

@@ -56,19 +56,28 @@ java/
 <dependency>
   <groupId>org.lazy</groupId>
   <artifactId>fmt-spring-boot-starter</artifactId>
-  <version>2.1.0</version>
+  <version>2.2.0</version>
 </dependency>
 ```
 
-**② 配置**（推荐 `fmt.data-root`：服务端换 token、重装服务后 Java 侧不用改配置）
+**② 配置**（只支持两种凭证，二选一；两者都不填会**启动失败**）
 
 ```yaml
 fmt:
   base-url: http://localhost:4122   # 别写 127.0.0.1：FMT 默认 host=localhost，Windows 上常只绑 IPv6 的 ::1
-  data-root: D:/Tools/fmt        # token 从 <data-root>/data/user.json 读
+
+  # A. 固定 token
+  token: <32 位十六进制>
+
+  # 或 B. 账号 + 密码（bucket 可选；不填用服务端 current_bucket）
+  # username: lazy
+  # password: 123456
+  # bucket: pet
 ```
 
-也可以完全不动配置文件，用环境变量：`FMT_TOKEN=<token>` 或 `FMT_ROOT=D:/Tools/fmt`。
+> Spring Boot starter **不再读取** `fmt.data-root` / `fmt.token-file` / `FMT_TOKEN` / `FMT_ROOT`。
+> 普通 Java 核心包（`FmtClientCore`）仍保留 `setDataRoot` 等底层能力，见 §3；
+> 但 Spring Boot 宿主请只用 token 或账号密码。
 
 **③ 用**
 
@@ -117,10 +126,10 @@ fmt:
   base-url: http://localhost:4122
   username: user
   password: your-password
-  bucket: work          # 库名 = FMT 的 Bucket；登录模式必填
+  bucket: work          # 可选；不填用服务端 current_bucket
 ```
 
-`fmt.username` + `fmt.password` 与 `fmt.token` / `fmt.data-root` **二选一**：
+`fmt.username` + `fmt.password` 与 `fmt.token` **二选一**（2.2.0 起 starter 不再支持 data-root）：
 
 - 登录模式：第一次业务调用时自动 `GET /api/auth/salt` → 本地 PBKDF2 摘要 →
   `POST /api/auth/login`；拿到的是 **2 小时有效的内存会话 token**，不是 `data/user.json`
@@ -187,11 +196,11 @@ try (FmtChannel fmt = Fmt.channel(core)) {
 ```powershell
 # 对着假 FMT 联调（不碰真服务）
 java java\tools\fake-fmt\FakeFmt.java 14122
-java -cp java\fmt-client-core\target\fmt-client-core-2.1.0.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-2.2.0.jar java\tools\FmtDemo.java `
      --base-url=http://127.0.0.1:14122 --token=test-token-1234567890abcdef --keep
 
 # 对着真服务：地址 + 数据根（token 从 <数据根>/data/user.json 读）
-java -cp java\fmt-client-core\target\fmt-client-core-2.1.0.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-2.2.0.jar java\tools\FmtDemo.java `
      --data-root=D:\Data\Temp\JMT\fmt --out-dir=D:\tmp\fmt-demo
 ```
 
@@ -443,7 +452,7 @@ curl -o out.bin http://127.0.0.1:18080/demo/files/fmt-1/download
 | 上面这条但**服务明明在跑** | 地址族不对：FMT 默认 `host: localhost`，Windows 上常只绑 **IPv6 `::1`**（`Get-NetTCPConnection -LocalPort 4122` 能看到 `::1`），而 JDK 客户端对多地址主机名**只试第一个解析结果、不回落**。SDK 已经内置**地址回落**（候选地址依次重试，日志里会看到 `连接 … 被拒，改用 … 重试`），所以默认配置 `http://localhost:4122` 就能用；要把服务固定成 IPv4 就改 `server.json` 的 `host` 并重启（需要管理员） |
 | `token 文件里没有 token 字段` | 部署的 `data/user.json` 还是**老形状** `{"users":[{…}]}`（部署的 exe 比工作区旧）。SDK **两种形状都认**（先读平铺 `token`，再读 `users[0].token`）；服务端升级后会自己改写成单用户形状，token 不变 |
 | 三个新接口报 `501 / 404 / FMT-016` | 部署的 `fmt.exe` **早于这三条路由**（`GET /api/config`→501、`GET /api/bucket`→404、`DELETE /api/trash/empty` 落进 `trash.delete`）。重新部署 exe 并重启服务即可（见下） |
-| `FMT-018` 且重试后仍失败 | token 不对：`fmt.exe config list` 重新取；确认 `fmt.data-root` 指向**数据根**（`fmt.exe` 所在目录） |
+| `FMT-018` 且重试后仍失败 | token 不对：`fmt.exe config list` 重新取；starter 只认 `fmt.token` 或账号密码，不再读 `fmt.data-root` |
 | 健康检查 `authenticated:false` 但 `status:UP` | 服务活着、凭证不对——正是这两个字段分开报告的意义 |
 | `FMT-303` | 超过 `max_upload_size`（默认见 `config/config.json`），或上传中途被服务端中止 |
 | `FMT-701` | 预览只支持图片与 `.txt/.md/.json/.csv/.log/.xml`；**下载不受限制** |

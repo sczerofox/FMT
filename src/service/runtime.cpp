@@ -273,8 +273,13 @@ Result<server::LoginResult> ServerRuntime::login_http(const std::string& usernam
     if (context_ == nullptr) {
         return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
     }
-    if (bucket.empty()) {
-        return make_error(ErrorCode::InvalidArgument, "登录必须指定 Bucket（库名）");
+    // 不填 Bucket 就用服务端 current_bucket；两者都没有才报错。
+    const std::string effective_bucket =
+        bucket.empty() ? context_->config.current_bucket : bucket;
+    if (effective_bucket.empty()) {
+        return make_error(ErrorCode::NoCurrentBucket,
+                          "登录没有指定 Bucket，且服务端也没有 current_bucket；"
+                          "请先 bucket create / bucket use，或在登录时给 bucket");
     }
 
     user::UserService users(*context_->paths, context_->config);
@@ -295,7 +300,7 @@ Result<server::LoginResult> ServerRuntime::login_http(const std::string& usernam
 
     // 登录时就把「库」钉住：不存在的 Bucket 不能登录，避免之后每个请求才报错。
     BucketService buckets(*context_->paths, context_->config, context_->logger.get());
-    const Result<BucketInfo> info = buckets.get(bucket);
+    const Result<BucketInfo> info = buckets.get(effective_bucket);
     if (!ok(info)) {
         return *error_of(info);
     }

@@ -2,7 +2,6 @@ package org.lazy.fmt.spring;
 
 import org.lazy.fmt.client.FmtChannel;
 import org.lazy.fmt.client.FmtCodec;
-import org.lazy.fmt.client.FmtConfigurationException;
 import org.lazy.fmt.client.json.SimpleJson;
 
 import org.junit.jupiter.api.Test;
@@ -15,6 +14,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -60,9 +60,12 @@ class FmtAutoConfigurationTest {
     }
 
     @Test
-    void loginModeRequiresBucket() {
+    void loginModeWithoutBucketUsesCurrentBucket() {
         runner.withPropertyValues("fmt.username=user", "fmt.password=password")
-                .run(context -> assertThat(context).hasFailed());
+                .run(context -> {
+                    assertThat(context).hasSingleBean(FmtChannel.class);
+                    assertNull(context.getBean(FmtChannel.class).bucket());
+                });
     }
 
     @Test
@@ -172,22 +175,9 @@ class FmtAutoConfigurationTest {
     }
 
     @Test
-    void missingCredentialFailsWithActionableMessageOnFirstAuthenticatedCall() {
-        // 指向一个必定没人监听的端口：这样"失败原因"只可能是配置，而不是服务在不在
+    void failsFastWithoutAnyCredential() {
         runner.withPropertyValues("fmt.base-url=http://127.0.0.1:1")
-                .run(context -> {
-                    FmtChannel channel = context.getBean(FmtChannel.class);
-
-                    FmtConfigurationException failure =
-                            assertThrows(FmtConfigurationException.class, channel::status);
-                    assertTrue(failure.getMessage().contains("fmt.token"), failure.getMessage());
-                    assertTrue(failure.getMessage().contains("config list"), failure.getMessage());
-
-                    // ping 是公开接口：不带凭证，所以它的失败原因是"连不上"而不是"没配 token"
-                    Throwable pingFailure = assertThrows(RuntimeException.class, channel::ping);
-                    assertFalse(pingFailure instanceof FmtConfigurationException,
-                            "ping 不该因为缺凭证而失败：" + pingFailure);
-                });
+                .run(context -> assertThat(context).hasFailed());
     }
 
     @Test

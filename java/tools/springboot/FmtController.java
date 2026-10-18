@@ -1,6 +1,6 @@
 package com.hncgy.mybatis.controller;
 
-import com.hncgy.mybatis.service.FmtService;
+import org.lazy.fmt.client.FmtChannel;
 import org.lazy.fmt.client.FmtApiException;
 import org.lazy.fmt.client.FmtError;
 import org.lazy.fmt.client.FmtErrorCodes;
@@ -45,31 +45,31 @@ import java.util.List;
 @RequestMapping("/api/fmt")
 public class FmtController {
 
-    private final FmtService fmtService;
+    private final FmtChannel fmt;
 
-    public FmtController(FmtService fmtService) {
-        this.fmtService = fmtService;
+    public FmtController(FmtChannel fmt) {
+        this.fmt = fmt;
     }
 
     /** 探活：ping 不需要 token。 */
     @GetMapping("/ping")
     public boolean ping() {
-        return fmtService.ping();
+        return fmt.ping().isOk();
     }
 
     @GetMapping("/status")
     public FmtResult<FmtServerStatus> status() {
-        return fmtService.status();                 // 直接返回 record，Jackson 自动序列化
+        return fmt.status();                 // 直接返回 record，Jackson 自动序列化
     }
 
     @GetMapping("/config")
     public Object config() {
-        return fmtService.getConfig().orThrow();
+        return fmt.getConfig().orThrow();
     }
 
     @GetMapping("/buckets")
     public Object buckets() {
-        return fmtService.listBuckets().orThrow();
+        return fmt.listBuckets().orThrow();
     }
 
     @GetMapping("/files")
@@ -77,12 +77,17 @@ public class FmtController {
                          @RequestParam(defaultValue = "NAME") FileQuery.Sort sort,
                          @RequestParam(defaultValue = "1") int page,
                          @RequestParam(name = "page_size", defaultValue = "20") int pageSize) {
-        return fmtService.listFiles(search, sort, page, pageSize).orThrow();
+        return fmt.listFiles(FileQuery.builder()
+                .search(search)
+                .sort(sort)
+                .page(page)
+                .pageSize(pageSize)
+                .build()).orThrow();
     }
 
     @GetMapping("/files/{id}")
     public FmtFile file(@PathVariable String id) {
-        return fmtService.getFile(id).orThrow();
+        return fmt.getFile(id).orThrow();
     }
 
     /** 上传：浏览器/前端 → 桥接 → FMT，流式转发不落两块盘。 */
@@ -97,7 +102,7 @@ public class FmtController {
             name = "upload.bin";
         }
         try (InputStream in = file.getInputStream()) {      // SDK 不收 Path，只收流/字节
-            return fmtService.upload(in, name).orThrow();
+            return fmt.upload(in, name).orThrow();
         }
     }
 
@@ -107,7 +112,7 @@ public class FmtController {
         Path tmp = Files.createTempFile("fmt-", ".bin");
         boolean ok = false;
         try {
-            FmtPayload payload = fmtService.download(id, tmp).orThrow();
+            FmtPayload payload = fmt.download(id, tmp).orThrow();
             String fileName = payload.fileName() == null || payload.fileName().isBlank()
                     ? "download.bin"
                     : payload.fileName();
@@ -130,33 +135,33 @@ public class FmtController {
     /** 删除预检：?dry_run=1，零副作用。 */
     @GetMapping("/files/{id}/delete-check")
     public FmtDeleteCheck deleteCheck(@PathVariable String id) {
-        return fmtService.checkDelete(id).orThrow();
+        return fmt.checkDelete(id).orThrow();
     }
 
     /** 软删除进回收站；跨桶删除要 force=true，否则 FMT-016。 */
     @DeleteMapping("/files/{id}")
     public FmtFile delete(@PathVariable String id,
                           @RequestParam(defaultValue = "false") boolean force) {
-        return fmtService.delete(id, force).orThrow();
+        return fmt.delete(id, force).orThrow();
     }
 
     @GetMapping("/trash")
     public Object trash() {
-        return fmtService.listTrash().orThrow();
+        return fmt.listTrash().orThrow();
     }
 
     @PostMapping("/shares")
     public FmtShare createShare(@RequestParam("file_id") String fileId) {
-        return fmtService.createShare(fileId).orThrow();
+        return fmt.createShare(fileId).orThrow();
     }
 
     @GetMapping("/shares")
     public List<FmtShare> shares(@RequestParam("file_id") String fileId) {
-        return fmtService.listShares(fileId).orThrow();
+        return fmt.listShares(fileId).orThrow();
     }
 
     @DeleteMapping("/shares/{shareId}")
     public FmtShare revokeShare(@PathVariable String shareId) {
-        return fmtService.revokeShare(shareId).orThrow();
+        return fmt.revokeShare(shareId).orThrow();
     }
 }

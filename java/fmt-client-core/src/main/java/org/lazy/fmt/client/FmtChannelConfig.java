@@ -296,12 +296,10 @@ public final class FmtChannelConfig {
             if (password == null) {
                 throw new FmtConfigurationException("登录密码不能为空");
             }
-            if (bucket == null || bucket.isBlank()) {
-                throw new FmtConfigurationException("登录必须给库名（Bucket）");
-            }
             this.username = username.trim();
             this.password = password;
-            this.bucket = bucket.trim();
+            // 桶名可选：不填就用服务端 current_bucket。
+            this.bucket = bucket == null || bucket.isBlank() ? null : bucket.trim();
             return this;
         }
 

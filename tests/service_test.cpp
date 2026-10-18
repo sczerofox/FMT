@@ -1666,6 +1666,14 @@ FMT_TEST(Service, 账号密码登录签发临时会话) {
     FMT_CHECK_EQ(session.bucket, std::string("work"));
     FMT_CHECK_EQ(session.token_type, std::string("session"));
 
+    // 不填 Bucket：默认用服务端 current_bucket（这里已由第一个 bucket.create 设为 work）
+    const auto login_current = runtime.login_http("user", digest, "");
+    FMT_CHECK(fmt::ok(login_current));
+    if (fmt::ok(login_current)) {
+        FMT_CHECK_EQ(std::get<fmt::server::LoginResult>(login_current).bucket,
+                     std::string("work"));
+    }
+
     // 会话 token 能验出来，并且绑定 work
     const auto identity = runtime.verify_session_http(session.token);
     FMT_CHECK(fmt::ok(identity));
