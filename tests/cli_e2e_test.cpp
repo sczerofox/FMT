@@ -456,18 +456,20 @@ FMT_TEST(CliE2e, user命令打出账号字段而不是只剩一句提示) {
     FMT_CHECK(has(refused, "已取消"));
     FMT_CHECK(fmt::file_exists(fixture.root() / "data" / "user.json"));
 
-    // token 换发（凭密码）：不需要先登录，新值和有效期都必须打出来
+    // token 换发：**要登录**（用户要求：改密码、换 token 都得先登录）。
+    const CliRun renew_denied = fixture.cli({"user", "token", "renew"});
+    FMT_CHECK(renew_denied.exit_code != 0);
+    FMT_CHECK(has(renew_denied, "需要先登录"));
+
+    // 登录之后换发：新值和有效期都必须打出来
     // ——否则"换发成功"等于什么都没发生（用户拿不到新 token）。
-    const CliRun renewed = fixture.cli({"user", "token", "renew"}, "e2e-secret\n");
+    const CliRun renewed = fixture.business({"user", "token", "renew"});
     FMT_CHECK_EQ(renewed.exit_code, 0);
     FMT_CHECK(has(renewed, "访问 token："));
     FMT_CHECK(has(renewed, "token 有效期："));
     FMT_CHECK(has(renewed, "旧 token 立即失效"));
-
-    // 口令错：不许换（否则谁都能把机主挤掉）。
-    const CliRun renew_denied = fixture.cli({"user", "token", "renew"}, "wrong-pass\n");
-    FMT_CHECK(renew_denied.exit_code != 0);
-    FMT_CHECK(has(renew_denied, "密码不正确"));
+    // 登录时已经算过摘要，换 token **不该再问第二遍密码**。
+    FMT_CHECK_EQ(count_of(renewed, "请输入密码"), std::size_t{1});
 
     // 改密：只能改一次。第一次成功，第二次被拒并提示删除用户重建。
     const CliRun changed =

@@ -1082,12 +1082,14 @@ fmt> logout                   # 退出登录
 | 需要登录 | 不需要登录 |
 |---|---|
 | `file *`、`bucket *`、`trash *`、`share *`、`config *` | `service *`（装/卸/启/停/重装/状态） |
-| `user get`、`user update password`、`user delete` | `log clean`、`help`、`version`、`exit` |
-| | `user create`（还没有账号时得先能建）、`user token renew`（自带密码校验） |
+| `user get`、`user update password`、`user token renew`、`user delete` | `log clean`、`help`、`version`、`exit` |
+| | `user create`（还没有账号时得先能建） |
 
 不受限的那几类是有意为之：服务坏了、账号进不去的时候，得靠它们把机器救回来。
 拦下时的提示必须**能照着做**：`本窗口内登录：login <用户名>`。
 `user get` 之所以也要登录：它会打印**当前 token**（用户要求），token 是凭证，不该不登录就给。
+`user token renew` 同样要登录（用户明确要求「换 token 得先登录才能改」）——登录时已经算过口令
+摘要，修完这条之后 renew 不会重复问密码。
 
 **登录会更新时间戳**：`user.verify` 验过口令之后写 `last_login_at` / `updated_at`
 （用户要求「登录之后最后登录时间要变」）。登录痕迹**不在**改密指纹里（第 18.5 节），

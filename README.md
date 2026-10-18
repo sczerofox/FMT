@@ -118,12 +118,13 @@ fmt.exe -u lazy -p file list  # 一次性命令也可以带登录
 
 - **登录态只在本次窗口的内存里**：窗口一关就要重新登录。登录成功会更新「最后登录」时间。
 - **不需要登录**：`service *`、`log clean`、`help`、`version`、`exit`、
-  `user create`（还没有账号时得先建）、`user token renew`（自己会问密码）。
+  `user create`（还没有账号时得先建）。**其余 `user` 子命令都要登录**：
+  `user get` / `user update password` / `user token renew` / `user delete`。
 - `user update password` 改密码：**只能改一次**（`config.json` 的 `uuid` 是
   `user_id + password_hash + password_salt + created_at` 四项的哈希，登录与换 token 都不影响它）；
   之后要用 `user delete` 删号重建。`user get` 会告诉你还能不能改。
 - `user get` **要登录**（它会打印当前 token 与有效期）。未登录时只回一句「需要先登录」。
-- `user token renew`：换发访问 token（要密码）。token **默认 7 天**过期，过期后 HTTP 一律
+- `user token renew`：换发访问 token。**要登录**（登录时已算过口令摘要，不会重复问密码）。token **默认 7 天**过期，过期后 HTTP 一律
   `401 + FMT-019`；换完旧 token 立刻失效，且**不消耗**「密码只能改一次」的机会。
   有效期用 `config set token_ttl 7d`（或 `12h` / `3600`）改，只影响下一次签发。
 - `user delete`：先验密码，再**逐字输入 `delete`** 才真删；删除
