@@ -56,7 +56,7 @@ java/
 <dependency>
   <groupId>org.lazy</groupId>
   <artifactId>fmt-spring-boot-starter</artifactId>
-  <version>2.0.1</version>
+  <version>2.0.2</version>
 </dependency>
 ```
 
@@ -146,11 +146,11 @@ try (FmtChannel fmt = Fmt.channel(core)) {
 ```powershell
 # 对着假 FMT 联调（不碰真服务）
 java java\tools\fake-fmt\FakeFmt.java 14122
-java -cp java\fmt-client-core\target\fmt-client-core-2.0.1.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-2.0.2.jar java\tools\FmtDemo.java `
      --base-url=http://127.0.0.1:14122 --token=test-token-1234567890abcdef --keep
 
 # 对着真服务：地址 + 数据根（token 从 <数据根>/data/user.json 读）
-java -cp java\fmt-client-core\target\fmt-client-core-2.0.1.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-2.0.2.jar java\tools\FmtDemo.java `
      --data-root=D:\Data\Temp\JMT\fmt --out-dir=D:\tmp\fmt-demo
 ```
 
@@ -211,6 +211,12 @@ try {
     // token 没配、baseUrl 非法、token 文件损坏
 }
 ```
+
+> Spring Boot 里**不用自己写 `@ControllerAdvice`**：starter 在 Servlet Web 应用里自动注册
+> `FmtExceptionAdvice`，把上面的异常翻成 `{"ok":false,"error":{"code":"FMT-002",…}}`——
+> 业务错误沿用 FMT 给的 HTTP 状态码，连不上/超时 → 502，配置错 → 500 + `FMT-008`。
+> 不想要就设 `fmt.exception-advice=false`；声明自己的 `FmtExceptionAdvice` bean 也会覆盖默认实现。
+> 它只处理 FMT 异常，不接管 `IllegalArgumentException` 之类的宿主异常。
 
 ### 4.3 上传：只有两种形态，**都不收路径**
 

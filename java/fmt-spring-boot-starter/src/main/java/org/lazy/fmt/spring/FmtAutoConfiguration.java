@@ -13,6 +13,7 @@ import org.springframework.boot.autoconfigure.AutoConfiguration;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnClass;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnWebApplication;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -74,6 +75,27 @@ public class FmtAutoConfiguration {
         codec.ifAvailable(builder::codec);
         logger.ifAvailable(builder::logger);
         return Fmt.channel(builder.build());
+    }
+
+    /**
+     * Servlet Web 应用里自动注册 FMT 异常翻译：宿主不用再复制 {@code FmtExceptionAdvice}。
+     *
+     * <p>和健康检查一样放在嵌套配置类里、条件用字符串——宿主没引 Spring Web 时，
+     * 解析外层配置的方法签名不会去链接 {@code RestControllerAdvice}，非 Web 应用照常启动。
+     * 只处理 FMT 自己的异常；{@code fmt.exception-advice=false} 可关闭，声明自己的
+     * {@code FmtExceptionAdvice} bean 也会覆盖默认实现。
+     */
+    @Configuration(proxyBeanMethods = false)
+    @ConditionalOnWebApplication(type = ConditionalOnWebApplication.Type.SERVLET)
+    @ConditionalOnClass(name = "org.springframework.web.bind.annotation.RestControllerAdvice")
+    @ConditionalOnProperty(prefix = "fmt", name = "exception-advice", havingValue = "true", matchIfMissing = true)
+    static class FmtWebConfiguration {
+
+        @Bean
+        @ConditionalOnMissingBean
+        public FmtExceptionAdvice fmtExceptionAdvice() {
+            return new FmtExceptionAdvice();
+        }
     }
 
     /**

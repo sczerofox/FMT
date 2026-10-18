@@ -404,7 +404,8 @@ if (got.isFailure()) {
 ```
 
 - `FmtResult.orThrow()` 给"失败就该中断"的场景一个异常出口（抛 `FmtApiException`），
-  由 Spring 的 `@RestControllerAdvice` 统一兜住（demo 里就是这么做的）。
+  由 starter 自动注册的 `FmtExceptionAdvice` 统一兜住（Servlet Web 应用；`fmt.exception-advice=false`
+  可关闭，自己声明同类型 bean 也会覆盖）。宿主不用再复制这个类。
 - 错误码表 `FmtErrorCodes` 与 `include/fmt/common/error.hpp` **一一对应**（编号照抄，仅追加）。
 - **不要**用 `message` 做判断（服务端会改措辞），要判断就判断 `code`。
 
@@ -424,6 +425,7 @@ fmt:
   max-connections: 16
   retry-on-unauthorized: true
   token-cache-ttl: 30s
+  exception-advice: true         # Servlet Web 应用里自动注册 FMT 异常 → JSON（默认开）
   headers:                       # 过网关时可能需要
     X-Request-From: billing
 ```
@@ -434,6 +436,7 @@ fmt:
 | `fmtCodec` | `FmtCodec` | 自己声明；有 `ObjectMapper` 时默认用 Jackson |
 | `fmtLogger` | `FmtLogger` | 自己声明；默认桥到 slf4j（`org.lazy.fmt.client`） |
 | `fmtHealthIndicator` | Actuator 健康检查 | `management.health.fmt.enabled=false` |
+| `fmtExceptionAdvice` | `FmtExceptionAdvice`（Servlet Web） | `fmt.exception-advice=false`，或自己的同类型 bean |
 
 健康检查的输出分两件事，便于运维分流：
 
@@ -720,7 +723,7 @@ user.json」）。所以对着**旧 exe** 跑，桥接侧看到的是（都是**
 
 | 场景 | 做法 |
 |---|---|
-| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.0.1` |
+| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.0.2` |
 | 不想动私服 | `mvn install:install-file` 把两个 jar 装进本地仓库，或直接 `<scope>system</scope>`（不推荐） |
 | 只在非 Spring 项目用 | 只依赖 `fmt-client-core`（零依赖，Java 17+） |
 | 当独立桥接服务跑 | `java -jar fmt-bridge.jar`（demo 模块打成可执行 jar），别的系统调它的 REST |

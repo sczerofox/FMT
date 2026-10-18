@@ -1,6 +1,9 @@
 package com.hncgy.mybatis.controller;
 
 import com.hncgy.mybatis.service.FmtService;
+import org.lazy.fmt.client.FmtApiException;
+import org.lazy.fmt.client.FmtError;
+import org.lazy.fmt.client.FmtErrorCodes;
 import org.lazy.fmt.client.FmtResult;
 import org.lazy.fmt.client.model.FileQuery;
 import org.lazy.fmt.client.model.FmtDeleteCheck;
@@ -36,7 +39,7 @@ import java.util.List;
  *
  * <p>失败时 {@code orThrow()} 会抛 FmtApiException（业务错误）/
  * FmtTransportException / FmtConfigurationException（连不上、配置不对），
- * 由 {@code FmtExceptionAdvice} 统一翻成 JSON。
+ * 由 starter 自动注册的 {@code FmtExceptionAdvice} 统一翻成 JSON；宿主不需要再复制那个类。
  */
 @RestController
 @RequestMapping("/api/fmt")
@@ -86,7 +89,8 @@ public class FmtController {
     @PostMapping("/upload")
     public FmtUpload upload(@RequestParam("file") MultipartFile file) throws IOException {
         if (file.isEmpty()) {
-            throw new IllegalArgumentException("上传的文件是空的");
+            throw new FmtApiException(
+                    FmtError.local(FmtErrorCodes.INVALID_ARGUMENT, "上传的文件是空的"));
         }
         String name = file.getOriginalFilename();
         if (name == null || name.isBlank()) {

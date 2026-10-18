@@ -30,6 +30,12 @@ public class FmtProperties {
     /** 关掉就完全不注册任何 FMT bean（适合只有部分环境需要连 FMT 的场景）。 */
     private boolean enabled = true;
 
+    /**
+     * 是否在 Servlet Web 应用里自动注册 FMT 异常的 JSON 翻译（{@code FmtExceptionAdvice}）。
+     * 默认开；宿主自己声明同类型 bean 时自动让位。
+     */
+    private boolean exceptionAdvice = true;
+
     /** FMT HTTP 地址；只监听本机，默认 4122。 */
     private String baseUrl = FmtChannelConfig.DEFAULT_BASE_URL;
 
@@ -116,6 +122,14 @@ public class FmtProperties {
 
     public void setEnabled(boolean enabled) {
         this.enabled = enabled;
+    }
+
+    public boolean isExceptionAdvice() {
+        return exceptionAdvice;
+    }
+
+    public void setExceptionAdvice(boolean exceptionAdvice) {
+        this.exceptionAdvice = exceptionAdvice;
     }
 
     public String getBaseUrl() {

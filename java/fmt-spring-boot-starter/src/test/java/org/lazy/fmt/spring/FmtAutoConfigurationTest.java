@@ -9,6 +9,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.test.context.FilteredClassLoader;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.test.context.runner.WebApplicationContextRunner;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -24,6 +25,10 @@ class FmtAutoConfigurationTest {
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
             .withConfiguration(AutoConfigurations.of(FmtAutoConfiguration.class));
+
+    private final WebApplicationContextRunner webRunner = new WebApplicationContextRunner()
+            .withConfiguration(AutoConfigurations.of(FmtAutoConfiguration.class))
+            .withPropertyValues("spring.main.web-application-type=servlet");
 
     @Test
     void createsAChannelFromProperties() {
@@ -76,6 +81,47 @@ class FmtAutoConfigurationTest {
     void healthIndicatorIsRegisteredWhenActuatorIsPresent() {
         runner.withPropertyValues("fmt.token=" + TOKEN)
                 .run(context -> assertThat(context).hasBean("fmtHealthIndicator"));
+    }
+
+    @Test
+    void registersExceptionAdviceInServletWebApplication() {
+        webRunner.withPropertyValues("fmt.token=" + TOKEN)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(FmtExceptionAdvice.class);
+                });
+    }
+
+    @Test
+    void exceptionAdviceCanBeDisabled() {
+        webRunner.withPropertyValues("fmt.token=" + TOKEN, "fmt.exception-advice=false")
+                .run(context -> assertThat(context).doesNotHaveBean(FmtExceptionAdvice.class));
+    }
+
+    @Test
+    void userProvidedExceptionAdviceWins() {
+        FmtExceptionAdvice custom = new FmtExceptionAdvice();
+        webRunner.withBean("myExceptionAdvice", FmtExceptionAdvice.class, () -> custom)
+                .withPropertyValues("fmt.token=" + TOKEN)
+                .run(context -> {
+                    assertThat(context).hasSingleBean(FmtExceptionAdvice.class);
+                    assertSame(custom, context.getBean(FmtExceptionAdvice.class));
+                });
+    }
+
+    /**
+     * 宿主没引 Spring Web 时不能因为异常翻译而起不来：嵌套配置类里的
+     * {@code FmtExceptionAdvice} 方法签名引用了 Web 类型，条件必须在加载它之前生效。
+     */
+    @Test
+    void startsWithoutWebOnTheClasspath() {
+        runner.withClassLoader(new FilteredClassLoader("org.springframework.web"))
+                .withPropertyValues("fmt.token=" + TOKEN)
+                .run(context -> {
+                    assertThat(context).hasNotFailed();
+                    assertThat(context).hasSingleBean(FmtChannel.class);
+                    assertThat(context).doesNotHaveBean("fmtExceptionAdvice");
+                });
     }
 
     /**
