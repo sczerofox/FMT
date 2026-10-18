@@ -1,9 +1,6 @@
 package com.hncgy.mybatis.controller;
 
-import org.lazy.fmt.client.FmtChannel;
-import org.lazy.fmt.client.FmtApiException;
-import org.lazy.fmt.client.FmtError;
-import org.lazy.fmt.client.FmtErrorCodes;
+import com.hncgy.mybatis.service.FmtService;
 import org.lazy.fmt.client.FmtResult;
 import org.lazy.fmt.client.model.FileQuery;
 import org.lazy.fmt.client.model.FmtDeleteCheck;
@@ -35,41 +32,41 @@ import java.nio.file.Path;
 import java.util.List;
 
 /**
- * FMT 的 REST 桥接：HTTP 进来，通道出去。这里没有 token 参数。
+ * FMT 的 REST 桥接：HTTP 进来，业务层出去。
  *
- * <p>失败时 {@code orThrow()} 会抛 FmtApiException（业务错误）/
- * FmtTransportException / FmtConfigurationException（连不上、配置不对），
- * 由 starter 自动注册的 {@code FmtExceptionAdvice} 统一翻成 JSON；宿主不需要再复制那个类。
+ * <p>这里**没有 token 参数**：token/账号密码由 starter 绑在 {@code FmtChannel} 上，
+ * 业务方法只管调 {@link FmtService}；调用本 Controller 的外部系统也不需要带 token
+ * （除非你自己在 Spring Security 里另加一层）。
  */
 @RestController
 @RequestMapping("/api/fmt")
 public class FmtController {
 
-    private final FmtChannel fmt;
+    private final FmtService fmtService;
 
-    public FmtController(FmtChannel fmt) {
-        this.fmt = fmt;
+    public FmtController(FmtService fmtService) {
+        this.fmtService = fmtService;
     }
 
-    /** 探活：ping 不需要 token。 */
+    /** 探活：ping 不需要凭证。 */
     @GetMapping("/ping")
     public boolean ping() {
-        return fmt.ping().isOk();
+        return fmtService.ping();
     }
 
     @GetMapping("/status")
     public FmtResult<FmtServerStatus> status() {
-        return fmt.status();                 // 直接返回 record，Jackson 自动序列化
+        return fmtService.status();                 // 保留 {ok,data} 信封
     }
 
     @GetMapping("/config")
     public Object config() {
-        return fmt.getConfig().orThrow();
+        return fmtService.config();
     }
 
     @GetMapping("/buckets")
     public Object buckets() {
-        return fmt.listBuckets().orThrow();
+        return fmtService.buckets();
     }
 
     @GetMapping("/files")
@@ -77,33 +74,18 @@ public class FmtController {
                          @RequestParam(defaultValue = "NAME") FileQuery.Sort sort,
                          @RequestParam(defaultValue = "1") int page,
                          @RequestParam(name = "page_size", defaultValue = "20") int pageSize) {
-        return fmt.listFiles(FileQuery.builder()
-                .search(search)
-                .sort(sort)
-                .page(page)
-                .pageSize(pageSize)
-                .build()).orThrow();
+        return fmtService.listFiles(search, sort, page, pageSize);
     }
 
     @GetMapping("/files/{id}")
     public FmtFile file(@PathVariable String id) {
-        return fmt.getFile(id).orThrow();
+        return fmtService.getFile(id);
     }
 
-    /** 上传：浏览器/前端 → 桥接 → FMT，流式转发不落两块盘。 */
+    /** 上传：空文件/文件名兜底由业务层处理，返回的 FmtUpload 可继续落库。 */
     @PostMapping("/upload")
     public FmtUpload upload(@RequestParam("file") MultipartFile file) throws IOException {
-        if (file.isEmpty()) {
-            throw new FmtApiException(
-                    FmtError.local(FmtErrorCodes.INVALID_ARGUMENT, "上传的文件是空的"));
-        }
-        String name = file.getOriginalFilename();
-        if (name == null || name.isBlank()) {
-            name = "upload.bin";
-        }
-        try (InputStream in = file.getInputStream()) {      // SDK 不收 Path，只收流/字节
-            return fmt.upload(in, name).orThrow();
-        }
+        return fmtService.upload(file);
     }
 
     /** 下载：先落到临时文件（流式，SDK 内部 .part → 改名），再原样吐给调用方，最后删临时文件。 */
@@ -112,7 +94,7 @@ public class FmtController {
         Path tmp = Files.createTempFile("fmt-", ".bin");
         boolean ok = false;
         try {
-            FmtPayload payload = fmt.download(id, tmp).orThrow();
+            FmtPayload payload = fmtService.download(id, tmp);
             String fileName = payload.fileName() == null || payload.fileName().isBlank()
                     ? "download.bin"
                     : payload.fileName();
@@ -135,33 +117,33 @@ public class FmtController {
     /** 删除预检：?dry_run=1，零副作用。 */
     @GetMapping("/files/{id}/delete-check")
     public FmtDeleteCheck deleteCheck(@PathVariable String id) {
-        return fmt.checkDelete(id).orThrow();
+        return fmtService.checkDelete(id);
     }
 
     /** 软删除进回收站；跨桶删除要 force=true，否则 FMT-016。 */
     @DeleteMapping("/files/{id}")
     public FmtFile delete(@PathVariable String id,
                           @RequestParam(defaultValue = "false") boolean force) {
-        return fmt.delete(id, force).orThrow();
+        return fmtService.delete(id, force);
     }
 
     @GetMapping("/trash")
     public Object trash() {
-        return fmt.listTrash().orThrow();
+        return fmtService.trash();
     }
 
     @PostMapping("/shares")
     public FmtShare createShare(@RequestParam("file_id") String fileId) {
-        return fmt.createShare(fileId).orThrow();
+        return fmtService.createShare(fileId);
     }
 
     @GetMapping("/shares")
     public List<FmtShare> shares(@RequestParam("file_id") String fileId) {
-        return fmt.listShares(fileId).orThrow();
+        return fmtService.listShares(fileId);
     }
 
     @DeleteMapping("/shares/{shareId}")
     public FmtShare revokeShare(@PathVariable String shareId) {
-        return fmt.revokeShare(shareId).orThrow();
+        return fmtService.revokeShare(shareId);
     }
 }
