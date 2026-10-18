@@ -160,6 +160,9 @@ FmtChannel fmt = Fmt.channel("http://localhost:4122", token, "work");
 
 ## 3. 快速开始：普通 Java 项目（不带 Spring）
 
+> 这一节是**核心包**用法，保留 `setDataRoot` / 环境变量等底层能力；
+> **Spring Boot starter 只支持 token 或账号密码**（见 §2），两者都没有会启动失败。
+
 调用流程只有三步：**调参数（`FmtClientCore`）→ 建通道（`Fmt.channel`）→ 调方法**。
 
 ```java
