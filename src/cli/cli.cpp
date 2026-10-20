@@ -278,7 +278,7 @@ bool read_password_masked(const char* prompt, std::string* out) {
 namespace {
 
 std::string banner_text() {
-    return "File Manager Tool  v" + std::string(version::MAJOR) + "." +           std::string(version::MINOR) + "  ( build  " + std::string(version::BUILD_DATE) + " )";
+    return "File Manager Tool  v" + std::string(version::STRING) + "  ( build  " + std::string(version::BUILD_DATE) + " )";
 }
 
 void print_version() { std::printf("%s\n", version_text().c_str()); }
