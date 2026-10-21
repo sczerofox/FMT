@@ -25,7 +25,12 @@ struct Config {
     int version = kVersion;
     std::string current_user;
     std::string current_bucket;
-    std::uint64_t max_upload_size = 52428800;  // 50 MB
+    std::uint64_t max_upload_size = 52428800;  // 50 MB（单请求上限）
+    // 分片上传（大文件）的默认参数。普通文件仍然走上面的单请求路径。
+    std::uint64_t max_large_upload_size = 8ULL * 1024 * 1024 * 1024;  // 8 GB
+    std::uint64_t upload_chunk_size = 8ULL * 1024 * 1024;              // 8 MB
+    std::uint64_t upload_session_ttl_seconds = 24ULL * 60 * 60;        // 24 小时
+    std::uint32_t upload_max_active_per_user = 4;
     std::string size_unit = "MB";
     std::string language = "zh-CN";
 

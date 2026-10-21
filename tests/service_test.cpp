@@ -3,7 +3,9 @@
 #include "fmt/service/service.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1619,6 +1621,146 @@ FMT_TEST(Service, 未实现的操作与未知操作被明确拒绝) {
     FMT_CHECK_EQ(fmt::exit_code(rejected.error.code), 2);
 }
 
+FMT_TEST(Service, 大文件分片会话可后台完成) {
+    fmt_test::TempDir temp("service-upload-session");
+    const auto root = temp / "root";
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("password", salt);
+    fmt::ipc::Request create_user;
+    create_user.id = 1;
+    create_user.op = "user.create";
+    create_user.args["username"] = "user";
+    create_user.args["password_digest"] = digest;
+    FMT_CHECK(runtime.handle(create_user).ok);
+
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 2;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+
+    fmt::ipc::Request use_bucket;
+    use_bucket.id = 20;
+    use_bucket.op = "bucket.use";
+    use_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(use_bucket).ok);
+
+    const std::filesystem::path source = temp / "large.bin";
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        std::vector<char> block(256 * 1024, 'x');
+        for (int i = 0; i < 8; ++i) {
+            out.write(block.data(), static_cast<std::streamsize>(block.size()));
+        }
+    }
+
+    fmt::ipc::Request start;
+    start.id = 3;
+    start.op = "upload.start";
+    start.args["argv"] = nlohmann::json::array({source.string(), "large.bin"});
+    start.args["chunk_size"] = 256 * 1024;
+    const fmt::ipc::Response started = runtime.handle(start);
+    if (!started.ok) {
+        std::fprintf(stderr, "upload.start failed: %s\n", started.error.message.c_str());
+        FMT_CHECK(started.ok);
+        return;
+    }
+    const std::string upload_id = started.data.value("upload_id", std::string{});
+    FMT_CHECK(!upload_id.empty());
+    FMT_CHECK_EQ(started.data.value("chunk_count", std::uint64_t{0}), std::uint64_t{8});
+
+    fmt::ipc::Response status;
+    for (int i = 0; i < 300; ++i) {
+        fmt::ipc::Request query;
+        query.id = 100 + i;
+        query.op = "upload.status";
+        query.args["argv"] = nlohmann::json::array({upload_id});
+        status = runtime.handle(query);
+        if (!status.ok || status.data.value("state", std::string{}) == "completed") {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    FMT_CHECK(status.ok);
+    FMT_CHECK_EQ(status.data.value("state", std::string{}), std::string("completed"));
+    FMT_CHECK(!status.data.value("final_file_id", std::string{}).empty());
+
+    const std::filesystem::path session_dir =
+        root / "temp" / "upload-sessions" / upload_id;
+    FMT_CHECK(!std::filesystem::exists(session_dir / "chunks"));
+}
+
+FMT_TEST(Service, 大文件分片会话可取消) {
+    fmt_test::TempDir temp("service-upload-cancel");
+    const auto root = temp / "root";
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("password", salt);
+    fmt::ipc::Request create_user;
+    create_user.id = 1;
+    create_user.op = "user.create";
+    create_user.args["username"] = "user";
+    create_user.args["password_digest"] = digest;
+    FMT_CHECK(runtime.handle(create_user).ok);
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 2;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+
+    fmt::ipc::Request use_bucket;
+    use_bucket.id = 20;
+    use_bucket.op = "bucket.use";
+    use_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(use_bucket).ok);
+
+    const std::filesystem::path source = temp / "cancel.bin";
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        out << "cancel-me";
+    }
+    fmt::ipc::Request start;
+    start.id = 3;
+    start.op = "upload.start";
+    start.args["argv"] = nlohmann::json::array({source.string(), "cancel.bin"});
+    start.args["chunk_size"] = 64 * 1024;
+    const fmt::ipc::Response started = runtime.handle(start);
+    if (!started.ok) {
+        std::fprintf(stderr, "upload.start failed: %s\n", started.error.message.c_str());
+        FMT_CHECK(started.ok);
+        return;
+    }
+    const std::string upload_id = started.data.value("upload_id", std::string{});
+
+    fmt::ipc::Request cancel;
+    cancel.id = 4;
+    cancel.op = "upload.cancel";
+    cancel.args["argv"] = nlohmann::json::array({upload_id});
+    const fmt::ipc::Response canceled = runtime.handle(cancel);
+    FMT_CHECK(canceled.ok);
+    FMT_CHECK(canceled.data.value("state", std::string{}) == "canceled" ||
+              canceled.data.value("state", std::string{}) == "completed");
+
+    // 给后台线程一个分片边界；最终状态只能是 canceled 或已抢先完成。
+    for (int i = 0; i < 100; ++i) {
+        fmt::ipc::Request query;
+        query.id = 200 + i;
+        query.op = "upload.status";
+        query.args["argv"] = nlohmann::json::array({upload_id});
+        const fmt::ipc::Response current = runtime.handle(query);
+        if (!current.ok || current.data.value("state", std::string{}) != "uploading") {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+
 FMT_TEST(Service, 账号密码登录签发临时会话) {
     fmt_test::TempDir temp("service-login");
     const auto root = temp / "root";
@@ -1646,6 +1788,12 @@ FMT_TEST(Service, 账号密码登录签发临时会话) {
     create_bucket.op = "bucket.create";
     create_bucket.args["argv"] = nlohmann::json::array({"work"});
     FMT_CHECK(runtime.handle(create_bucket).ok);
+
+    fmt::ipc::Request use_bucket;
+    use_bucket.id = 20;
+    use_bucket.op = "bucket.use";
+    use_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(use_bucket).ok);
 
     // 盐接口：客户端拿它算摘要
     const auto salt_result = runtime.salt_http("user");

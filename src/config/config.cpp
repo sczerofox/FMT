@@ -16,6 +16,10 @@ nlohmann::json to_json(const Config& config) {
     value["current_user"] = config.current_user;
     value["current_bucket"] = config.current_bucket;
     value["max_upload_size"] = config.max_upload_size;
+    value["max_large_upload_size"] = config.max_large_upload_size;
+    value["upload_chunk_size"] = config.upload_chunk_size;
+    value["upload_session_ttl_seconds"] = config.upload_session_ttl_seconds;
+    value["upload_max_active_per_user"] = config.upload_max_active_per_user;
     value["size_unit"] = config.size_unit;
     value["language"] = config.language;
     value["token_ttl_seconds"] = config.token_ttl_seconds;
@@ -88,6 +92,10 @@ Result<Config> load_config(const PathManager& paths) {
     read_field(value, "current_user", config.current_user, patched);
     read_field(value, "current_bucket", config.current_bucket, patched);
     read_field(value, "max_upload_size", config.max_upload_size, patched);
+    read_field(value, "max_large_upload_size", config.max_large_upload_size, patched);
+    read_field(value, "upload_chunk_size", config.upload_chunk_size, patched);
+    read_field(value, "upload_session_ttl_seconds", config.upload_session_ttl_seconds, patched);
+    read_field(value, "upload_max_active_per_user", config.upload_max_active_per_user, patched);
     read_field(value, "size_unit", config.size_unit, patched);
     read_field(value, "language", config.language, patched);
     read_field(value, "token_ttl_seconds", config.token_ttl_seconds, patched);

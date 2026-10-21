@@ -185,6 +185,11 @@ Status ServerRuntime::start() {
 
         // current_bucket 失效时置空（开发文档第 61 节）：启动即校一次。
         refresh_current_bucket_locked();
+
+        // 大文件会话独立于业务锁；它自己持久化到 temp/upload-sessions/，
+        // 服务重启后仍可 upload resume。
+        uploads_ = std::make_shared<UploadSessionManager>(*context_->paths, context_->config,
+                                                          context_->logger.get());
     }
 
     // 上次异常退出可能留下提权结果之类的临时文件，启动时顺手清掉。
@@ -542,6 +547,11 @@ Status ServerRuntime::apply_root(const std::string& requested_root, std::string*
 
         previous = context_ != nullptr ? to_forward_slashes(path_to_utf8(context_->paths->root()))
                                        : std::string{};
+        // 旧根的后台上传线程必须先停下来，否则它们会继续往旧根写分片。
+        if (uploads_) {
+            uploads_->stop();
+            uploads_.reset();
+        }
         context_ = std::move(std::get<std::unique_ptr<AppContext>>(created));
         context_->logger->info("Main", "数据根切换: " +
                                            (previous.empty() ? std::string("(无)") : previous) +
@@ -561,6 +571,8 @@ Status ServerRuntime::apply_root(const std::string& requested_root, std::string*
 
         // 换根后同样校一次：新根里的 current_bucket 可能指向不存在的 Bucket。
         refresh_current_bucket_locked();
+        uploads_ = std::make_shared<UploadSessionManager>(*context_->paths, context_->config,
+                                                          context_->logger.get());
         // 旧根的会话 token 不能带到新根：账号与 Bucket 都可能不同。
         clear_sessions();
     }
@@ -602,6 +614,37 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
             // CLI 据此打印「数据根已切换：旧 -> 新」，双击时就能看见服务跟过来了。
             response.data["previous_root"] = previous;
         }
+        return response;
+    }
+
+    // 分片上传会话有自己的锁与后台线程；不能放在 runtime 的大锁里跑 5GB 拼接。
+    if (starts_with(request.op, "upload.")) {
+        std::shared_ptr<UploadSessionManager> uploads;
+        Config current;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (context_ == nullptr) {
+                response.ok = false;
+                response.error = make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+                return response;
+            }
+            uploads = uploads_;
+            current = context_->config;
+        }
+        if (!uploads) {
+            response.ok = false;
+            response.error = make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+            return response;
+        }
+        uploads->set_config(current);
+        Result<nlohmann::json> result = uploads->handle(request.op, request.args);
+        if (ok(result)) {
+            response.ok = true;
+            response.data = std::get<nlohmann::json>(result);
+            return response;
+        }
+        response.ok = false;
+        response.error = *error_of(result);
         return response;
     }
 

@@ -85,6 +85,18 @@ constexpr Entry kTable[] = {
     // ---- FMT-7xx HTTP ----
     {ErrorCode::HttpRequestInvalid, "HttpRequestInvalid", 2, "HTTP 请求参数错误"},
     {ErrorCode::PreviewUnsupported, "PreviewUnsupported", 2, "该文件类型不支持预览"},
+
+    // ---- FMT-8xx 分片上传 ----
+    {ErrorCode::UploadSessionNotFound, "UploadSessionNotFound", 3, "上传会话不存在"},
+    {ErrorCode::UploadSessionExpired, "UploadSessionExpired", 3, "上传会话已过期"},
+    {ErrorCode::ChunkIndexInvalid, "ChunkIndexInvalid", 2, "分片下标非法"},
+    {ErrorCode::ChunkMismatch, "ChunkMismatch", 4, "分片大小或内容不匹配"},
+    {ErrorCode::UploadIncomplete, "UploadIncomplete", 4, "分片不完整，不能完成"},
+    {ErrorCode::UploadCanceled, "UploadCanceled", 4, "上传已取消"},
+    {ErrorCode::UploadStateInvalid, "UploadStateInvalid", 4, "当前上传状态不允许该操作"},
+    {ErrorCode::UploadMd5Mismatch, "UploadMd5Mismatch", 4, "整文件 MD5 不匹配"},
+    {ErrorCode::InsufficientStorage, "InsufficientStorage", 1, "磁盘空间不足"},
+    {ErrorCode::UploadLimitExceeded, "UploadLimitExceeded", 2, "超过大文件或活动会话上限"},
 };
 
 const Entry* find(ErrorCode code) {

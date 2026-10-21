@@ -87,6 +87,18 @@ enum class ErrorCode : int {
     // ---- FMT-7xx HTTP ----
     HttpRequestInvalid = 700,      // HTTP 请求参数错误      退出码 2
     PreviewUnsupported = 701,      // 该文件类型不支持预览   退出码 2
+
+    // ---- FMT-8xx 分片上传 ----
+    UploadSessionNotFound = 800,   // 上传会话不存在         退出码 3
+    UploadSessionExpired = 801,    // 上传会话已过期         退出码 3
+    ChunkIndexInvalid = 802,       // 分片下标非法           退出码 2
+    ChunkMismatch = 803,           // 分片大小/内容不匹配    退出码 4
+    UploadIncomplete = 804,        // 分片不完整             退出码 4
+    UploadCanceled = 805,          // 上传已取消             退出码 4
+    UploadStateInvalid = 806,      // 当前状态不允许该操作   退出码 4
+    UploadMd5Mismatch = 807,       // 整文件 MD5 不匹配      退出码 4
+    InsufficientStorage = 808,     // 磁盘空间不足           退出码 1
+    UploadLimitExceeded = 809,     // 超过大文件/活动会话上限 退出码 2
 };
 
 // 错误值：错误码 + 可修改的消息。

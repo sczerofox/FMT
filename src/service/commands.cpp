@@ -1009,6 +1009,10 @@ Result<nlohmann::json> config_command(AppContext& context, const std::string& op
         data["current_user"] = context.config.current_user;
         data["current_bucket"] = context.config.current_bucket;
         data["max_upload_size"] = context.config.max_upload_size;
+        data["max_large_upload_size"] = context.config.max_large_upload_size;
+        data["upload_chunk_size"] = context.config.upload_chunk_size;
+        data["upload_session_ttl_seconds"] = context.config.upload_session_ttl_seconds;
+        data["upload_max_active_per_user"] = context.config.upload_max_active_per_user;
         data["size_unit"] = context.config.size_unit;
         data["language"] = context.config.language;
         data["path"] = relative_path_text(context.paths->root(), context.paths->config_file());
@@ -1517,7 +1521,7 @@ Result<nlohmann::json> user_command(AppContext& context, const std::string& oper
 
 bool is_known_business(const std::string& operation) {
     for (const std::string_view prefix :
-         {"bucket.", "file.", "share.", "trash.", "config.", "server.", "user."}) {
+         {"bucket.", "file.", "share.", "trash.", "config.", "server.", "user.", "upload."}) {
         if (starts_with(operation, prefix)) {
             return true;
         }

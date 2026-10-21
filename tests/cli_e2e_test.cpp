@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <thread>
@@ -820,6 +821,43 @@ FMT_TEST(CliE2e, 分享能按文件名创建并打印完整链接) {
     const CliRun absent = fixture.business({"share", "create", "nope.txt"});
     FMT_CHECK_EQ(absent.exit_code, 3);
     FMT_CHECK(has(absent, "FMT-002"));
+}
+
+FMT_TEST(CliE2e, 大文件上传会话) {
+    E2eFixture fixture;
+    FMT_CHECK_EQ(fixture.business({"bucket", "create", "large"}).exit_code, 0);
+    FMT_CHECK_EQ(fixture.business({"bucket", "use", "large"}).exit_code, 0);
+
+    const std::filesystem::path source = fixture.source("large.bin");
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        std::vector<char> block(1024 * 1024, 'x');
+        // 超过默认 max_upload_size（50MB），确保走分片路径。
+        for (int i = 0; i < 60; ++i) {
+            out.write(block.data(), static_cast<std::streamsize>(block.size()));
+        }
+    }
+
+    // 小文件仍走原来的单请求，不建 upload_id。
+    const CliRun small = fixture.business(
+        {"upload", "start", fmt::path_to_utf8(fixture.source("first.txt")), "small.txt"});
+    FMT_CHECK_EQ(small.exit_code, 0);
+    FMT_CHECK(has(small, "file_id"));
+    FMT_CHECK(!has(small, "upload_id"));
+
+    const CliRun uploaded = fixture.business(
+        {"upload", "start", fmt::path_to_utf8(source), "large.bin", "--chunk-size", "4MB",
+         "--wait"});
+    if (uploaded.exit_code != 0) {
+        std::fprintf(stderr, "[e2e] upload output:\n%s\n", uploaded.output.c_str());
+    }
+    FMT_CHECK_EQ(uploaded.exit_code, 0);
+    FMT_CHECK(has(uploaded, "upload_id"));
+    FMT_CHECK(has(uploaded, "完成"));
+
+    const CliRun listed = fixture.business({"file", "list"});
+    FMT_CHECK_EQ(listed.exit_code, 0);
+    FMT_CHECK(has(listed, "large.bin"));
 }
 
 FMT_TEST(CliE2e, 交互式确认答n不删答y才删) {

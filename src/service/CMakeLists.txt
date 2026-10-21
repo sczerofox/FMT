@@ -10,6 +10,7 @@ target_sources(fmt_core PRIVATE
     service.cpp
     runtime.cpp
     commands.cpp
+    upload_sessions.cpp
 )
 
 if(WIN32)

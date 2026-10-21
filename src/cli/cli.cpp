@@ -292,6 +292,7 @@ void print_command_list() {
     std::printf("  (user)     create  get  update password  delete  token renew\n");
     std::printf("  (bucket)   create  list  get  use  delete\n");
     std::printf("  (file)     upload  list  get  delete\n");
+    std::printf("  (upload)   start  status  pause  resume  cancel  list  wait\n");
     std::printf("  (trash)    list  get  restore  delete  empty\n");
     std::printf("  (share)    create  get  list  delete\n");
     std::printf("  (config)   list  set\n");
@@ -397,6 +398,22 @@ bool print_command_help(const std::string& topic) {
             "名称统一使用小写：create WORK 会建成 work（会提示你）；\n"
             "其余命令按名找桶时不区分大小写，找得到就按磁盘上的实际名字处理。\n"
             "回收站的桶级记录在 trash/<用户>/.original 里，回退用 trash restore。\n");
+        return true;
+    }
+    if (topic == "upload") {
+        std::printf(
+            "upload —— 大文件分片上传（普通文件仍用 file upload，single request）\n"
+            "  start <本地文件> [文件名] [--chunk-size 8MB] [--wait]\n"
+            "                           建分片会话并让服务后台传；--wait 阻塞到完成\n"
+            "  status <upload_id>       查看进度、缺少的分片与错误\n"
+            "  pause <upload_id>        当前分片写完后暂停\n"
+            "  resume <upload_id>       从缺少的分片继续\n"
+            "  cancel <upload_id>       取消并清理临时分片\n"
+            "  list                     列出当前用户的上传会话\n"
+            "  wait <upload_id>         持续打印进度直到完成\n"
+            "\n"
+            "上限：max_large_upload_size；分片默认取 config.json 的 upload_chunk_size。\n"
+            "服务重启后会话与已传分片仍在，upload resume 继续。\n");
         return true;
     }
     if (topic == "file") {
@@ -1822,8 +1839,261 @@ int run_user_command(const std::vector<std::string>& parts, Session& session,
     return 0;
 }
 
+// ---- upload：大文件分片上传（CLI-1） ----
+//
+// 服务端 upload.start 起后台线程，所以这里不需要自己逐片发送，也不会长期占着
+// 单管道连接；pause/status/cancel 还能在同一个窗口继续发。
+Result<ipc::Response> upload_call(Session& session, const Options& options,
+                                  const std::string& operation, nlohmann::json args) {
+    if (const Status connected = ensure_connected(session, options); !ok(connected)) {
+        return *error_of(connected);
+    }
+    ipc::Request request;
+    request.id = session.next_id++;
+    request.op = operation;
+    request.root = options.data_root;
+    request.pid = GetCurrentProcessId();
+    request.args = std::move(args);
+    return session.client.call(request, ipc::kCommandTimeoutMs);
+}
+
+void print_upload_one(const nlohmann::json& data) {
+    std::printf("upload_id = %s\n", data.value("upload_id", std::string{}).c_str());
+    std::printf("file      = %s\n", data.value("file_name", std::string{}).c_str());
+    std::printf("size      = %s\n",
+                format_size(data.value("size", std::uintmax_t{0})).c_str());
+    std::printf("chunk     = %s × %llu\n",
+                format_size(data.value("chunk_size", std::uintmax_t{0})).c_str(),
+                static_cast<unsigned long long>(data.value("chunk_count", std::uint64_t{0})));
+    std::printf("state     = %s\n", data.value("state", std::string{}).c_str());
+    std::printf("progress  = %s / %s（%d%%）\n",
+                format_size(data.value("uploaded_bytes", std::uintmax_t{0})).c_str(),
+                format_size(data.value("size", std::uintmax_t{0})).c_str(),
+                data.value("percent", 0));
+    std::printf("chunks    = %llu / %llu\n",
+                static_cast<unsigned long long>(data.value("received_count", std::uint64_t{0})),
+                static_cast<unsigned long long>(data.value("chunk_count", std::uint64_t{0})));
+    if (data.contains("expires_at")) {
+        std::printf("expires   = %s\n", data.value("expires_at", std::string{}).c_str());
+    }
+    if (!data.value("final_file_id", std::string{}).empty()) {
+        std::printf("file_id   = %s\n", data.value("final_file_id", std::string{}).c_str());
+    }
+    if (!data.value("error", std::string{}).empty()) {
+        std::printf("error     = %s\n", data.value("error", std::string{}).c_str());
+    }
+}
+
+int run_upload_command(const std::vector<std::string>& parts, Session& session,
+                       const Options& options) {
+    const std::string usage =
+        "用法：upload start <本地文件> [文件名] [--chunk-size 8MB] [--wait]\n"
+        "      upload status|pause|resume|cancel <upload_id>\n"
+        "      upload list | upload wait <upload_id>";
+    if (parts.size() < 2) {
+        std::fprintf(stderr, "%s\n", usage.c_str());
+        return exit_code(ErrorCode::InvalidArgument);
+    }
+
+    const std::string& verb = parts[1];
+    nlohmann::json args = nlohmann::json::object();
+    args["argv"] = nlohmann::json::array();
+
+    if (verb == "start") {
+        std::string path;
+        std::string name;
+        std::uintmax_t chunk_size = 0;
+        bool wait = false;
+        for (std::size_t i = 2; i < parts.size(); ++i) {
+            if (parts[i] == "--wait") {
+                wait = true;
+                continue;
+            }
+            if (parts[i] == "--chunk-size" && i + 1 < parts.size()) {
+                if (!parse_log_budget(parts[++i], &chunk_size)) {
+                    std::fprintf(stderr, "无效的 --chunk-size：%s\n%s\n", parts[i].c_str(), usage.c_str());
+                    return exit_code(ErrorCode::InvalidArgument);
+                }
+                continue;
+            }
+            if (path.empty()) {
+                path = parts[i];
+            } else if (name.empty()) {
+                name = parts[i];
+            } else {
+                std::fprintf(stderr, "%s\n", usage.c_str());
+                return exit_code(ErrorCode::InvalidArgument);
+            }
+        }
+        if (path.empty()) {
+            std::fprintf(stderr, "%s\n", usage.c_str());
+            return exit_code(ErrorCode::InvalidArgument);
+        }
+
+        // 50MB 以下保持旧的单请求路径；只有大文件才建分片会话。
+        std::error_code size_error;
+        const std::uintmax_t file_size = std::filesystem::file_size(path_from_utf8(path), size_error);
+        if (!size_error) {
+            Result<ipc::Response> config_response =
+                upload_call(session, options, "config.list", nlohmann::json::object());
+            if (ok(config_response)) {
+                const ipc::Response& config = std::get<ipc::Response>(config_response);
+                const std::uint64_t max_upload =
+                    config.ok ? config.data.value("max_upload_size", std::uint64_t{0}) : 0;
+                if (config.ok && max_upload > 0 && file_size <= max_upload) {
+                    if (const Status connected = ensure_connected(session, options); !ok(connected)) {
+                        print_failure(*error_of(connected));
+                        return exit_code(error_of(connected)->code);
+                    }
+                    ipc::Request request;
+                    request.id = session.next_id++;
+                    request.op = "file.upload";
+                    request.root = options.data_root;
+                    request.pid = GetCurrentProcessId();
+                    request.args["argv"] = nlohmann::json::array({path});
+                    if (!name.empty()) {
+                        request.args["argv"].push_back(name);
+                    }
+                    Result<ipc::Response> response =
+                        session.client.call(request, ipc::kUploadTimeoutMs);
+                    if (!ok(response)) {
+                        print_failure(*error_of(response));
+                        return exit_code(error_of(response)->code);
+                    }
+                    const ipc::Response& value = std::get<ipc::Response>(response);
+                    if (!value.ok) {
+                        print_failure(value.error);
+                        return exit_code(value.error.code);
+                    }
+                    print_business_data(value.data);
+                    return 0;
+                }
+            }
+        }
+
+        args["argv"].push_back(path);
+        if (!name.empty()) {
+            args["argv"].push_back(name);
+        }
+        if (chunk_size > 0) {
+            args["chunk_size"] = chunk_size;
+        }
+
+        Result<ipc::Response> response = upload_call(session, options, "upload.start", args);
+        if (!ok(response)) {
+            print_failure(*error_of(response));
+            return exit_code(error_of(response)->code);
+        }
+        const ipc::Response& value = std::get<ipc::Response>(response);
+        if (!value.ok) {
+            print_failure(value.error);
+            return exit_code(value.error.code);
+        }
+        print_upload_one(value.data);
+        if (!wait) {
+            std::printf("后台上传中：upload status %s / upload pause %s\n",
+                        value.data.value("upload_id", std::string{}).c_str(),
+                        value.data.value("upload_id", std::string{}).c_str());
+            return 0;
+        }
+        // --wait：转成 upload wait，复用同一套轮询输出。
+        const std::string upload_id = value.data.value("upload_id", std::string{});
+        return run_upload_command({"upload", "wait", upload_id}, session, options);
+    }
+
+    std::string id;
+    if (verb == "status" || verb == "pause" || verb == "resume" || verb == "cancel" ||
+        verb == "wait") {
+        if (parts.size() < 3 || parts[2].empty()) {
+            std::fprintf(stderr, "%s\n", usage.c_str());
+            return exit_code(ErrorCode::InvalidArgument);
+        }
+        id = parts[2];
+    }
+
+    if (verb == "list") {
+        Result<ipc::Response> response = upload_call(session, options, "upload.list", args);
+        if (!ok(response)) {
+            print_failure(*error_of(response));
+            return exit_code(error_of(response)->code);
+        }
+        const ipc::Response& value = std::get<ipc::Response>(response);
+        if (!value.ok) {
+            print_failure(value.error);
+            return exit_code(value.error.code);
+        }
+        const auto uploads = value.data.find("uploads");
+        if (uploads != value.data.end() && uploads->is_array()) {
+            for (const auto& item : *uploads) {
+                std::printf("  %s  %s  %d%%  %s\n",
+                            item.value("upload_id", std::string{}).c_str(),
+                            item.value("file_name", std::string{}).c_str(),
+                            item.value("percent", 0),
+                            item.value("state", std::string{}).c_str());
+            }
+            std::printf("共 %zu 个上传会话\n", uploads->size());
+        }
+        return 0;
+    }
+
+    if (verb == "wait") {
+        while (true) {
+            nlohmann::json one;
+            one["argv"] = nlohmann::json::array({id});
+            Result<ipc::Response> response = upload_call(session, options, "upload.status", one);
+            if (!ok(response)) {
+                print_failure(*error_of(response));
+                return exit_code(error_of(response)->code);
+            }
+            const ipc::Response& value = std::get<ipc::Response>(response);
+            if (!value.ok) {
+                print_failure(value.error);
+                return exit_code(value.error.code);
+            }
+            std::printf("\r%s  %d%%  %s", value.data.value("file_name", std::string{}).c_str(),
+                        value.data.value("percent", 0),
+                        value.data.value("state", std::string{}).c_str());
+            std::fflush(stdout);
+            const std::string state = value.data.value("state", std::string{});
+            if (state == "completed") {
+                std::printf("\n完成：%s\n",
+                            value.data.value("final_file_id", std::string{}).c_str());
+                return 0;
+            }
+            if (state == "error" || state == "canceled") {
+                std::printf("\n%s\n", value.data.value("error", std::string{}).c_str());
+                return exit_code(state == "canceled" ? ErrorCode::UploadCanceled
+                                                     : ErrorCode::UploadStateInvalid);
+            }
+            ::Sleep(1000);
+        }
+    }
+
+    const std::string operation = "upload." + verb;
+    if (verb != "status" && verb != "pause" && verb != "resume" && verb != "cancel") {
+        std::fprintf(stderr, "%s\n", usage.c_str());
+        return exit_code(ErrorCode::InvalidArgument);
+    }
+    args["argv"].push_back(id);
+    Result<ipc::Response> response = upload_call(session, options, operation, args);
+    if (!ok(response)) {
+        print_failure(*error_of(response));
+        return exit_code(error_of(response)->code);
+    }
+    const ipc::Response& value = std::get<ipc::Response>(response);
+    if (!value.ok) {
+        print_failure(value.error);
+        return exit_code(value.error.code);
+    }
+    print_upload_one(value.data);
+    return 0;
+}
+
 int run_business_command(const std::vector<std::string>& parts, Session& session,
                          const Options& options, bool interactive) {
+    if (parts[0] == "upload") {
+        return run_upload_command(parts, session, options);
+    }
     const std::string operation = parts[0] + "." + parts[1];
     // user 组：口令在 CLI 侧就地哈希 / 走挑战-应答，**明文不进管道**，
     // 与其余业务命令（只发位置参数）的形态不同，所以单独一条路。

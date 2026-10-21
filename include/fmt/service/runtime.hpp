@@ -20,6 +20,7 @@
 #include "fmt/ipc/pipe.hpp"
 #include "fmt/server/server.hpp"
 #include "fmt/service/service.hpp"
+#include "fmt/service/upload_sessions.hpp"
 
 namespace fmt::service {
 
@@ -102,6 +103,7 @@ private:
     mutable std::mutex session_mutex_;
     std::unordered_map<std::string, HttpSession> sessions_;
     std::unique_ptr<AppContext> context_;
+    std::shared_ptr<UploadSessionManager> uploads_;
     std::unique_ptr<server::HttpServer> http_;
     std::filesystem::path fallback_root_;
     std::filesystem::path state_directory_;
