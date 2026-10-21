@@ -91,6 +91,7 @@ private:
 
     void spawn_worker(const std::string& id);
     void worker(const std::string& id);
+    bool prepare_target(const std::string& id, const std::string& md5);
     void complete_in_worker(const std::string& id);
     void reap_finished();
     void cleanup_session_files(const std::string& id) const;

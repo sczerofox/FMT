@@ -10,6 +10,7 @@
 #include "fmt/common/hash.hpp"
 #include "fmt/common/string.hpp"
 #include "fmt/common/time.hpp"
+#include "fmt/common/validation.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/file/file.hpp"
 #include "fmt/storage/storage.hpp"
@@ -32,6 +33,23 @@ std::string chunk_name(std::uint64_t index) {
 bool read_exact(std::ifstream& in, char* data, std::size_t length) {
     in.read(data, static_cast<std::streamsize>(length));
     return in.gcount() == static_cast<std::streamsize>(length);
+}
+
+std::string md5_file(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    Md5 hash;
+    std::vector<char> buffer(kCopyBuffer);
+    while (in) {
+        in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const std::streamsize got = in.gcount();
+        if (got > 0 && !hash.update(buffer.data(), static_cast<std::size_t>(got))) {
+            return {};
+        }
+    }
+    return hash.finish();
 }
 
 }  // namespace
@@ -275,6 +293,10 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
     if (name.empty()) {
         return make_error(ErrorCode::FileNameEmpty, "无法从路径推断文件名，请显式给文件名");
     }
+    // 文件名在**开始上传前**就校验；不要等 7GB 传完到 commit 才报 FMT-10x。
+    if (const Status valid = validate_file_name(name); !ok(valid)) {
+        return *error_of(valid);
+    }
 
     const std::uintmax_t raw_size = std::filesystem::file_size(source, code);
     if (code) {
@@ -517,6 +539,47 @@ void UploadSessionManager::spawn_worker(const std::string& id) {
 }
 
 void UploadSessionManager::worker(const std::string& id) {
+    // 先算源文件 MD5，再开始分片：
+    //   * 若桶里已有相同内容（不管名字），直接复用，不白传 7GB；
+    //   * 若同名但内容不同，先把目标名改成 xxx01，再传；
+    //   * 最终拼接后还会用这个 MD5 校验一次。
+    std::string expected_md5;
+    std::string source_path;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto found = sessions_.find(id);
+        if (found == sessions_.end()) {
+            running_.erase(id);
+            return;
+        }
+        expected_md5 = found->second.md5;
+        source_path = found->second.source_path;
+    }
+    if (expected_md5.empty()) {
+        expected_md5 = md5_file(path_from_utf8(source_path));
+        if (expected_md5.empty()) {
+            set_error(id, "无法计算源文件 MD5：" + source_path);
+            std::lock_guard<std::mutex> guard(mutex_);
+            running_.erase(id);
+            return;
+        }
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto found = sessions_.find(id);
+        if (found == sessions_.end()) {
+            running_.erase(id);
+            return;
+        }
+        found->second.md5 = expected_md5;
+        touch(found->second);
+        save_session(found->second);
+    }
+
+    if (prepare_target(id, expected_md5)) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        running_.erase(id);
+        return;
+    }
+
     bool completed = false;
     while (!stopping_.load()) {
         std::uint64_t index = 0;
@@ -635,6 +698,70 @@ void UploadSessionManager::worker(const std::string& id) {
             sessions_.erase(found);
         }
     }
+}
+
+bool UploadSessionManager::prepare_target(const std::string& id, const std::string& md5) {
+    Session snapshot;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto found = sessions_.find(id);
+        if (found == sessions_.end()) {
+            return true;
+        }
+        snapshot = found->second;
+    }
+
+    Config commit_config = config_;
+    commit_config.current_user = snapshot.user;
+    commit_config.current_bucket = snapshot.bucket;
+    FileService files(paths_, commit_config, logger_);
+
+    // 同内容验证：当前用户 + 当前 Bucket 里已有相同 MD5，直接复用。
+    Result<std::vector<FileRecord>> listed = files.list();
+    if (!ok(listed)) {
+        set_error(id, "检查已有文件失败：" + error_of(listed)->message);
+        return true;
+    }
+    for (const FileRecord& record : std::get<std::vector<FileRecord>>(listed)) {
+        if (!record.md5.empty() && iequals(record.md5, md5)) {
+            cleanup_session_files(id);
+            std::lock_guard<std::mutex> guard(mutex_);
+            const auto found = sessions_.find(id);
+            if (found != sessions_.end()) {
+                found->second.state = "completed";
+                found->second.final_file_id = record.file_id;
+                found->second.final_file_name = record.file_name;
+                found->second.uploaded_bytes = found->second.size;
+                touch(found->second);
+                save_session(found->second);
+            }
+            return true;
+        }
+    }
+
+    // 同名不同内容：在开始传分片前就改成 xxx01，避免传完 7GB 才发现冲突。
+    std::string target = snapshot.file_name;
+    for (int attempt = 0; attempt < kNameAttempts; ++attempt) {
+        Result<FileRecord> existing = files.get_by_name(target);
+        if (!ok(existing)) {
+            if (error_of(existing)->code == ErrorCode::FileNotFound) {
+                break;
+            }
+            set_error(id, "检查文件名失败：" + error_of(existing)->message);
+            return true;
+        }
+        target = next_name(snapshot.file_name, attempt + 1);
+    }
+    if (!iequals(target, snapshot.file_name)) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto found = sessions_.find(id);
+        if (found != sessions_.end()) {
+            found->second.file_name = target;
+            touch(found->second);
+            save_session(found->second);
+        }
+    }
+    return false;
 }
 
 void UploadSessionManager::complete_in_worker(const std::string& id) {

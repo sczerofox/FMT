@@ -1761,6 +1761,93 @@ FMT_TEST(Service, 大文件分片会话可取消) {
 }
 
 
+FMT_TEST(Service, 大文件内容与文件名验证) {
+    fmt_test::TempDir temp("service-upload-validate");
+    const auto root = temp / "root";
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("password", salt);
+    fmt::ipc::Request create_user;
+    create_user.id = 1;
+    create_user.op = "user.create";
+    create_user.args["username"] = "user";
+    create_user.args["password_digest"] = digest;
+    FMT_CHECK(runtime.handle(create_user).ok);
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 2;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+    fmt::ipc::Request use_bucket;
+    use_bucket.id = 20;
+    use_bucket.op = "bucket.use";
+    use_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(use_bucket).ok);
+
+    const auto write_file = [&](const char* name, const std::string& text) {
+        const std::filesystem::path path = temp / name;
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        out << text;
+        return path;
+    };
+    const auto start = [&](const std::filesystem::path& path, const std::string& name) {
+        fmt::ipc::Request request;
+        request.id = 30;
+        request.op = "upload.start";
+        request.args["argv"] = nlohmann::json::array({path.string(), name});
+        request.args["chunk_size"] = 64 * 1024;
+        return runtime.handle(request);
+    };
+    const auto wait_completed = [&](const std::string& id) {
+        for (int i = 0; i < 200; ++i) {
+            fmt::ipc::Request query;
+            query.id = 40 + i;
+            query.op = "upload.status";
+            query.args["argv"] = nlohmann::json::array({id});
+            const fmt::ipc::Response current = runtime.handle(query);
+            if (current.ok && current.data.value("state", std::string{}) == "completed") {
+                return current;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return fmt::ipc::Response{};
+    };
+
+    const auto first = write_file("first.bin", "same-content");
+    const fmt::ipc::Response first_start = start(first, "same.bin");
+    FMT_CHECK(first_start.ok);
+    const std::string first_id = first_start.data.value("upload_id", std::string{});
+    const fmt::ipc::Response first_done = wait_completed(first_id);
+    FMT_CHECK(first_done.ok);
+    const std::string first_file = first_done.data.value("final_file_id", std::string{});
+    FMT_CHECK(!first_file.empty());
+
+    // 同内容不同文件名：应直接复用 first_file，不重新传。
+    const fmt::ipc::Response duplicate = start(first, "other-name.bin");
+    FMT_CHECK(duplicate.ok);
+    const fmt::ipc::Response duplicate_done =
+        wait_completed(duplicate.data.value("upload_id", std::string{}));
+    FMT_CHECK(duplicate_done.ok);
+    FMT_CHECK_EQ(duplicate_done.data.value("final_file_id", std::string{}), first_file);
+
+    // 同名不同内容：开始前就改成 same01.bin。
+    const auto second = write_file("second.bin", "different-content");
+    const fmt::ipc::Response conflict = start(second, "same.bin");
+    FMT_CHECK(conflict.ok);
+    const fmt::ipc::Response conflict_done =
+        wait_completed(conflict.data.value("upload_id", std::string{}));
+    FMT_CHECK(conflict_done.ok);
+    FMT_CHECK_EQ(conflict_done.data.value("file_name", std::string{}),
+                 std::string("same01.bin"));
+
+    // 非法文件名在 upload.start 就拒绝，不建会话、不传分片。
+    const fmt::ipc::Response invalid = start(first, "fmt-20261021-1");
+    FMT_CHECK(!invalid.ok);
+    FMT_CHECK(invalid.error.code == fmt::ErrorCode::FileNameLikeFileId);
+}
+
 FMT_TEST(Service, 账号密码登录签发临时会话) {
     fmt_test::TempDir temp("service-login");
     const auto root = temp / "root";
