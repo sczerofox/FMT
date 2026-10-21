@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1540,14 +1541,19 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
             requested_bucket = found->get<std::string>();
         }
     }
-    Config effective = context.config;
+    Config* effective = &context.config;
+    std::optional<Config> scoped_config;
     if (!requested_bucket.empty()) {
         BucketService buckets(*context.paths, context.config, context.logger.get());
         const Result<BucketInfo> info = buckets.get(requested_bucket);
         if (!ok(info)) {
             return *error_of(info);
         }
-        effective.current_bucket = std::get<BucketInfo>(info).name;
+        // 只有请求级 Bucket 才复制 Config；普通 token/CLI 请求直接复用全局配置，
+        // 免得每个请求都复制一遍字符串和 map。
+        scoped_config = context.config;
+        scoped_config->current_bucket = std::get<BucketInfo>(info).name;
+        effective = &*scoped_config;
     }
 
     if (starts_with(operation, "bucket.")) {
@@ -1555,11 +1561,11 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
     }
 
     if (starts_with(operation, "trash.")) {
-        return trash_command(context, effective, !requested_bucket.empty(), operation, args);
+        return trash_command(context, *effective, !requested_bucket.empty(), operation, args);
     }
 
     if (starts_with(operation, "file.")) {
-        return file_command(context, effective, !requested_bucket.empty(), operation, args);
+        return file_command(context, *effective, !requested_bucket.empty(), operation, args);
     }
 
     if (starts_with(operation, "config.")) {
@@ -1567,7 +1573,7 @@ Result<nlohmann::json> execute_business(AppContext& context, const std::string& 
     }
 
     if (starts_with(operation, "share.")) {
-        return share_command(context, effective, !requested_bucket.empty(), operation, args);
+        return share_command(context, *effective, !requested_bucket.empty(), operation, args);
     }
 
     if (starts_with(operation, "user.")) {

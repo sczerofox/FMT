@@ -89,6 +89,25 @@ class FmtClientTest {
     }
 
     @Test
+    void streamUploadComputesMd5WhileSpooling() throws IOException {
+        try (StubFmtServer stub = StubFmtServer.start(TOKEN)) {
+            stub.on("POST", "/api/file/upload", request -> StubFmtServer.Reply.error(
+                    409, FmtErrorCodes.MD5_DUPLICATE, "文件已存在"));
+            stub.on("GET", "/api/file/avatar.png", request -> StubFmtServer.Reply.ok("""
+                    {"file_id":"fmt-stream","file_name":"avatar.png","bucket":"work",
+                     "extension":".png","file_type":"image","size":3,
+                     "md5":"900150983cd24fb0d6963f7d28e17f72","path":"repository/work/avatar.png"}"""));
+
+            try (FmtClient client = FmtClient.token(TOKEN, "work").setBaseUrl(stub.baseUrl())) {
+                FmtFilePackage pkg = client.upload(
+                        new java.io.ByteArrayInputStream("abc".getBytes(StandardCharsets.UTF_8)),
+                        "avatar.png");
+                assertEquals("fmt-stream", pkg.fileId());
+            }
+        }
+    }
+
+    @Test
     void sameContentAndNameReturnsExistingRecord() {
         try (StubFmtServer stub = StubFmtServer.start(TOKEN)) {
             stub.on("POST", "/api/file/upload", request -> StubFmtServer.Reply.error(

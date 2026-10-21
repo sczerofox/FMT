@@ -20,6 +20,7 @@ import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
@@ -344,8 +345,11 @@ public final class FmtClient implements AutoCloseable {
         }
         Path spool = Files.createTempFile("fmt-upload-", ".bin");
         try {
-            Files.copy(in, spool, StandardCopyOption.REPLACE_EXISTING);
-            String md5 = md5(Files.newInputStream(spool));
+            // 边落临时文件边算 MD5：原来落盘后再完整读一遍，大文件会多一次 I/O。
+            MessageDigest digest = digest();
+            Files.copy(new DigestInputStream(in, digest), spool,
+                    StandardCopyOption.REPLACE_EXISTING);
+            String md5 = hex(digest.digest());
             return uploadInternal(() -> Files.newInputStream(spool), fileName, md5);
         } finally {
             Files.deleteIfExists(spool);
