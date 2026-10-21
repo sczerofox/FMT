@@ -16,6 +16,35 @@ java/
 
 ---
 
+## 0. 最简单：FmtClient（普通 Java / Spring Boot 通用）
+
+不写 builder、不碰 token、不自己判断 FMT-304/FMT-105：
+
+```java
+// 账号密码 + 桶（地址默认 http://localhost:4122；桶不填 = current_bucket）
+try (FmtClient fmt = new FmtClient("lazy", "123456", "pet")) {
+
+    fmt.ping();                 // boolean
+    fmt.status();               // FmtServerStatus（失败抛 FmtApiException）
+
+    // 一次调用：上传 / 同内容复用 / 同名不同内容自动改名重传
+    FmtFilePackage pkg = fmt.upload(
+            Files.newInputStream(Path.of("avatar.png")), "avatar.png");
+
+    String fileId = pkg.fileId();       // fmt-20261021-0
+    String fileName = pkg.fileName();
+    FmtMedia preview = pkg.preview();   // 图片/文本；不支持时 previewOrNull()
+    FmtMedia download = pkg.download();
+}
+```
+
+- token 模式：`FmtClient.token(token, "pet")`（桶可省）。
+- set 方式：`new FmtClient().setBaseUrl(...).setUsername(...).setPassword(...).setBucket(...)`。
+- Spring Boot 直接注入 `FmtClient`（starter 自动配置），不需要自己 new。
+- 预览/下载是惰性取内容，`close()` 会清理临时文件。
+
+---
+
 ## 1. 前置条件（FMT 侧）
 
 1. **打开 HTTP**（默认关闭）：数据根下 `config/server.json`
@@ -56,7 +85,7 @@ java/
 <dependency>
   <groupId>org.lazy</groupId>
   <artifactId>fmt-spring-boot-starter</artifactId>
-  <version>2.2.1</version>
+  <version>2.3.0</version>
 </dependency>
 ```
 
@@ -199,11 +228,11 @@ try (FmtChannel fmt = Fmt.channel(core)) {
 ```powershell
 # 对着假 FMT 联调（不碰真服务）
 java java\tools\fake-fmt\FakeFmt.java 14122
-java -cp java\fmt-client-core\target\fmt-client-core-2.2.1.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-2.3.0.jar java\tools\FmtDemo.java `
      --base-url=http://127.0.0.1:14122 --token=test-token-1234567890abcdef --keep
 
 # 对着真服务：地址 + 数据根（token 从 <数据根>/data/user.json 读）
-java -cp java\fmt-client-core\target\fmt-client-core-2.2.1.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-2.3.0.jar java\tools\FmtDemo.java `
      --data-root=D:\Data\Temp\JMT\fmt --out-dir=D:\tmp\fmt-demo
 ```
 

@@ -1,6 +1,7 @@
 package org.lazy.fmt.spring;
 
 import org.lazy.fmt.client.FmtChannel;
+import org.lazy.fmt.client.FmtClient;
 import org.lazy.fmt.client.FmtCodec;
 import org.lazy.fmt.client.json.SimpleJson;
 
@@ -39,6 +40,8 @@ class FmtAutoConfigurationTest {
                 .run(context -> {
                     assertThat(context).hasSingleBean(FmtChannel.class);
                     FmtChannel channel = context.getBean(FmtChannel.class);
+                    assertThat(context).hasSingleBean(FmtClient.class);
+                    assertSame(channel, context.getBean(FmtClient.class).channel());
                     assertEquals("http://127.0.0.1:4999", channel.baseUri().toString());
                     assertTrue(channel.describe().contains("1a28…693f"));
                     assertFalse(channel.describe().contains(TOKEN), "描述里不能有 token 明文");

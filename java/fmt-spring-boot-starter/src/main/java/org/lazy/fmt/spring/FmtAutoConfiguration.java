@@ -3,6 +3,7 @@ package org.lazy.fmt.spring;
 import org.lazy.fmt.client.Fmt;
 import org.lazy.fmt.client.FmtChannel;
 import org.lazy.fmt.client.FmtChannelConfig;
+import org.lazy.fmt.client.FmtClient;
 import org.lazy.fmt.client.FmtCodec;
 import org.lazy.fmt.client.FmtConfigurationException;
 import org.lazy.fmt.client.FmtLogger;
@@ -101,6 +102,18 @@ public class FmtAutoConfiguration {
         codec.ifAvailable(builder::codec);
         logger.ifAvailable(builder::logger);
         return Fmt.channel(builder.build());
+    }
+
+    /**
+     * 业务层用的简化入口：直接注入 {@link FmtClient}，不需要先拿 {@link FmtChannel}。
+     *
+     * <p>它包装同一个通道（生命周期仍由 {@code fmtChannel} 管），因此不会重复建连接；
+     * 新代码可以只注入 {@code FmtClient}，老代码继续注入 {@code FmtChannel}。
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public FmtClient fmtClient(FmtChannel fmtChannel) {
+        return FmtClient.wrap(fmtChannel);
     }
 
     /**

@@ -143,7 +143,33 @@ POST /api/auth/logout                           （要 token）→ 会话立即�
   两者都没配会**启动失败**。`fmt.data-root` / `fmt.token-file` / `FMT_TOKEN` / `FMT_ROOT`
   不再被 starter 读取（核心包 `FmtClientCore` 仍保留这些底层能力）。
 
-### 2.3 信封与状态码
+### 2.2.2 FmtClient 与统一上传包（2.3.0）
+
+`FmtClient` 是给业务代码用的简化入口：构造器/setter 建连接，业务方法直接返回领域对象；
+Spring Boot starter 同时注册 `FmtClient` bean（包装 `FmtChannel`，不重复建连接）。
+
+```java
+try (FmtClient fmt = new FmtClient("lazy", "123456", "pet")) {
+    fmt.ping();
+    FmtFilePackage pkg = fmt.upload(inputStream, "avatar.png");
+    String fileId = pkg.fileId();
+    FmtMedia preview = pkg.previewOrNull();   // 不支持预览时为 null
+    FmtMedia download = pkg.download();
+}
+```
+
+`upload(...)` 是**一次调用**，内部按顺序处理：
+
+1. 成功 → 返回；
+2. `FMT-304`（同内容已存在）→ 查已有记录（先按名，再按 MD5 翻页）→ 返回；
+3. `FMT-105`（同名不同内容）→ 自动改名 `名字 + 01 + 扩展名`（如 `1234567.jpg` →
+   `123456701.jpg`）→ 重传；再次冲突继续 02、03…（最多 100 次）。
+
+`FmtFilePackage` 含 `FmtFile` 基本信息；`preview()` / `download()` 惰性取内容到临时文件，
+`FmtMedia` 提供 `contentType/fileName/bytes/openStream/readBytes`，Spring Boot 可直接流式返回；
+`close()` 负责清理临时文件。
+
+
 
 ```json
 {"ok": true,  "data": { … }}
@@ -478,6 +504,7 @@ fmt:
 | bean | 类型 | 覆盖方式 |
 |---|---|---|
 | `fmtChannel` | `FmtChannel`（`destroyMethod=close`） | 自己声明一个 `FmtChannel` bean |
+| `fmtClient` | `FmtClient`（包装上面的通道，生命周期不重复关闭） | 自己声明一个 `FmtClient` bean |
 | `fmtCodec` | `FmtCodec` | 自己声明；有 `ObjectMapper` 时默认用 Jackson |
 | `fmtLogger` | `FmtLogger` | 自己声明；默认桥到 slf4j（`org.lazy.fmt.client`） |
 | `fmtHealthIndicator` | Actuator 健康检查 | `management.health.fmt.enabled=false` |
@@ -769,7 +796,7 @@ user.json」）。所以对着**旧 exe** 跑，桥接侧看到的是（都是**
 
 | 场景 | 做法 |
 |---|---|
-| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.2.1` |
+| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.3.0` |
 | 不想动私服 | `mvn install:install-file` 把两个 jar 装进本地仓库，或直接 `<scope>system</scope>`（不推荐） |
 | 只在非 Spring 项目用 | 只依赖 `fmt-client-core`（零依赖，Java 17+） |
 | 当独立桥接服务跑 | `java -jar fmt-bridge.jar`（demo 模块打成可执行 jar），别的系统调它的 REST |
