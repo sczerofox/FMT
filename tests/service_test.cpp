@@ -6,6 +6,8 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1846,6 +1848,233 @@ FMT_TEST(Service, 大文件内容与文件名验证) {
     const fmt::ipc::Response invalid = start(first, "fmt-20261021-1");
     FMT_CHECK(!invalid.ok);
     FMT_CHECK(invalid.error.code == fmt::ErrorCode::FileNameLikeFileId);
+}
+
+FMT_TEST(Service, 大文件暂停重启后从缺口继续) {
+    fmt_test::TempDir temp("service-upload-resume");
+    const auto root = temp / "root";
+    const auto state = temp / "state";
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("password", salt);
+
+    const std::filesystem::path source = temp / "resume.bin";
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        std::vector<char> block(1024 * 1024, 'r');
+        for (int i = 0; i < 128; ++i) {
+            out.write(block.data(), static_cast<std::streamsize>(block.size()));
+        }
+    }
+
+    std::string upload_id;
+    {
+        fmt::service::ServerRuntime runtime(root, state);
+        FMT_CHECK(fmt::ok(runtime.start()));
+
+        fmt::ipc::Request create_user;
+        create_user.id = 1;
+        create_user.op = "user.create";
+        create_user.args["username"] = "user";
+        create_user.args["password_digest"] = digest;
+        FMT_CHECK(runtime.handle(create_user).ok);
+        fmt::ipc::Request create_bucket;
+        create_bucket.id = 2;
+        create_bucket.op = "bucket.create";
+        create_bucket.args["argv"] = nlohmann::json::array({"work"});
+        FMT_CHECK(runtime.handle(create_bucket).ok);
+        fmt::ipc::Request use_bucket;
+        use_bucket.id = 3;
+        use_bucket.op = "bucket.use";
+        use_bucket.args["argv"] = nlohmann::json::array({"work"});
+        FMT_CHECK(runtime.handle(use_bucket).ok);
+
+        fmt::ipc::Request start;
+        start.id = 4;
+        start.op = "upload.start";
+        start.args["argv"] = nlohmann::json::array({source.string(), "resume.bin"});
+        start.args["chunk_size"] = 1024 * 1024;
+        const fmt::ipc::Response started = runtime.handle(start);
+        FMT_CHECK(started.ok);
+        upload_id = started.data.value("upload_id", std::string{});
+        FMT_CHECK(!upload_id.empty());
+
+        fmt::ipc::Request pause;
+        pause.id = 5;
+        pause.op = "upload.pause";
+        pause.args["argv"] = nlohmann::json::array({upload_id});
+        const fmt::ipc::Response paused = runtime.handle(pause);
+        FMT_CHECK(paused.ok);
+        FMT_CHECK_EQ(paused.data.value("state", std::string{}), std::string("paused"));
+    }
+
+    {
+        fmt::service::ServerRuntime runtime(root, state);
+        FMT_CHECK(fmt::ok(runtime.start()));
+
+        fmt::ipc::Request query;
+        query.id = 10;
+        query.op = "upload.status";
+        query.args["argv"] = nlohmann::json::array({upload_id});
+        const fmt::ipc::Response before = runtime.handle(query);
+        FMT_CHECK(before.ok);
+        FMT_CHECK_EQ(before.data.value("state", std::string{}), std::string("paused"));
+
+        fmt::ipc::Request resume;
+        resume.id = 11;
+        resume.op = "upload.resume";
+        resume.args["argv"] = nlohmann::json::array({upload_id});
+        FMT_CHECK(runtime.handle(resume).ok);
+
+        fmt::ipc::Response done;
+        for (int i = 0; i < 500; ++i) {
+            fmt::ipc::Request poll;
+            poll.id = 20 + i;
+            poll.op = "upload.status";
+            poll.args["argv"] = nlohmann::json::array({upload_id});
+            done = runtime.handle(poll);
+            if (!done.ok || done.data.value("state", std::string{}) == "completed") {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        FMT_CHECK(done.ok);
+        FMT_CHECK_EQ(done.data.value("state", std::string{}), std::string("completed"));
+        FMT_CHECK(!done.data.value("final_file_id", std::string{}).empty());
+    }
+}
+
+FMT_TEST(Service, 大文件分片损坏会被发现并可重传) {
+    fmt_test::TempDir temp("service-upload-corrupt");
+    const auto root = temp / "root";
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("password", salt);
+    fmt::ipc::Request create_user;
+    create_user.id = 1;
+    create_user.op = "user.create";
+    create_user.args["username"] = "user";
+    create_user.args["password_digest"] = digest;
+    FMT_CHECK(runtime.handle(create_user).ok);
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 2;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+    fmt::ipc::Request use_bucket;
+    use_bucket.id = 3;
+    use_bucket.op = "bucket.use";
+    use_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(use_bucket).ok);
+
+    const std::filesystem::path source = temp / "corrupt.bin";
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        std::vector<char> block(1024 * 1024, 'c');
+        for (int i = 0; i < 256; ++i) {
+            out.write(block.data(), static_cast<std::streamsize>(block.size()));
+        }
+    }
+
+    fmt::ipc::Request start;
+    start.id = 4;
+    start.op = "upload.start";
+    start.args["argv"] = nlohmann::json::array({source.string(), "corrupt.bin"});
+    start.args["chunk_size"] = 1024 * 1024;
+    const fmt::ipc::Response started = runtime.handle(start);
+    FMT_CHECK(started.ok);
+    const std::string upload_id = started.data.value("upload_id", std::string{});
+
+    std::uint64_t corrupt_index = 0;
+    for (int i = 0; i < 1000; ++i) {
+        fmt::ipc::Request query;
+        query.id = 10 + i;
+        query.op = "upload.status";
+        query.args["argv"] = nlohmann::json::array({upload_id});
+        const fmt::ipc::Response current = runtime.handle(query);
+        if (!current.ok) {
+            break;
+        }
+        if (current.data.value("received_count", std::uint64_t{0}) > 0) {
+            corrupt_index = current.data["received"][0].get<std::uint64_t>();
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    FMT_CHECK(corrupt_index < 256);
+
+    fmt::ipc::Request pause;
+    pause.id = 5;
+    pause.op = "upload.pause";
+    pause.args["argv"] = nlohmann::json::array({upload_id});
+    FMT_CHECK(runtime.handle(pause).ok);
+
+    std::ostringstream chunk_name;
+    chunk_name << std::setw(6) << std::setfill('0') << corrupt_index << ".part";
+    const std::filesystem::path chunk =
+        root / "temp" / "upload-sessions" / upload_id / "chunks" / chunk_name.str();
+    {
+        std::fstream file(chunk, std::ios::binary | std::ios::in | std::ios::out);
+        FMT_CHECK(file.good());
+        char byte = 0;
+        file.read(&byte, 1);
+        byte = static_cast<char>(byte ^ 0x5a);
+        file.seekp(0);
+        file.write(&byte, 1);
+    }
+
+    fmt::ipc::Request resume;
+    resume.id = 6;
+    resume.op = "upload.resume";
+    resume.args["argv"] = nlohmann::json::array({upload_id});
+    FMT_CHECK(runtime.handle(resume).ok);
+
+    fmt::ipc::Response failed;
+    for (int i = 0; i < 1000; ++i) {
+        fmt::ipc::Request query;
+        query.id = 100 + i;
+        query.op = "upload.status";
+        query.args["argv"] = nlohmann::json::array({upload_id});
+        failed = runtime.handle(query);
+        if (!failed.ok || failed.data.value("state", std::string{}) == "error" ||
+            failed.data.value("state", std::string{}) == "completed") {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    FMT_CHECK(failed.ok);
+    FMT_CHECK_EQ(failed.data.value("state", std::string{}), std::string("error"));
+    FMT_CHECK(failed.data.value("error", std::string{}).find("校验失败") != std::string::npos);
+
+    // 坏分片已被删除，再 resume 会重传并完成。
+    bool resumed = false;
+    for (int attempt = 0; attempt < 20 && !resumed; ++attempt) {
+        fmt::ipc::Request again;
+        again.id = 300 + attempt;
+        again.op = "upload.resume";
+        again.args["argv"] = nlohmann::json::array({upload_id});
+        resumed = runtime.handle(again).ok;
+        if (!resumed) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    FMT_CHECK(resumed);
+
+    fmt::ipc::Response done;
+    for (int i = 0; i < 500; ++i) {
+        fmt::ipc::Request query;
+        query.id = 400 + i;
+        query.op = "upload.status";
+        query.args["argv"] = nlohmann::json::array({upload_id});
+        done = runtime.handle(query);
+        if (!done.ok || done.data.value("state", std::string{}) == "completed") {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    FMT_CHECK(done.ok);
+    FMT_CHECK_EQ(done.data.value("state", std::string{}), std::string("completed"));
 }
 
 FMT_TEST(Service, 账号密码登录签发临时会话) {

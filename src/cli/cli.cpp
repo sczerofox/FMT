@@ -405,13 +405,14 @@ bool print_command_help(const std::string& topic) {
             "upload —— 大文件分片上传（普通文件仍用 file upload，single request）\n"
             "  start <本地文件> [文件名] [--chunk-size 8MB] [--wait]\n"
             "                           建分片会话并让服务后台传；--wait 阻塞到完成\n"
-            "  status <upload_id>       查看进度、缺少的分片与错误\n"
-            "  pause <upload_id>        当前分片写完后暂停\n"
-            "  resume <upload_id>       从缺少的分片继续\n"
+            "  status <upload_id>       查看进度、缺少的分片与错误；verified 是已记录 MD5 的分片数\n"
+            "  pause <upload_id>        当前分片写完后暂停（算源文件 MD5 时也会尽快停）\n"
+            "  resume <upload_id>       从缺少的分片继续；服务重启后也可用\n"
             "  cancel <upload_id>       取消并清理临时分片\n"
             "  list                     列出当前用户的上传会话\n"
             "  wait <upload_id>         持续打印进度直到完成\n"
             "\n"
+            "每个分片写入时记录 MD5，拼接时逐片校验；坏片会删除并提示 resume 重传。\n"
             "上限：max_large_upload_size；分片默认取 config.json 的 upload_chunk_size。\n"
             "服务重启后会话与已传分片仍在，upload resume 继续。\n");
         return true;
@@ -1873,6 +1874,11 @@ void print_upload_one(const nlohmann::json& data) {
     std::printf("chunks    = %llu / %llu\n",
                 static_cast<unsigned long long>(data.value("received_count", std::uint64_t{0})),
                 static_cast<unsigned long long>(data.value("chunk_count", std::uint64_t{0})));
+    if (data.contains("verified_count")) {
+        std::printf("verified  = %llu（分片 MD5 已记录）\n",
+                    static_cast<unsigned long long>(
+                        data.value("verified_count", std::uint64_t{0})));
+    }
     if (data.contains("expires_at")) {
         std::printf("expires   = %s\n", data.value("expires_at", std::string{}).c_str());
     }

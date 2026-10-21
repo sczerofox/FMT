@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 #include <system_error>
@@ -35,14 +36,22 @@ bool read_exact(std::ifstream& in, char* data, std::size_t length) {
     return in.gcount() == static_cast<std::streamsize>(length);
 }
 
-std::string md5_file(const std::filesystem::path& path) {
+std::string md5_file(const std::filesystem::path& path,
+                     const std::function<bool()>& keep_going, bool* aborted) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
         return {};
     }
     Md5 hash;
     std::vector<char> buffer(kCopyBuffer);
+    int tick = 0;
     while (in) {
+        if ((++tick % 64) == 0 && !keep_going()) {
+            if (aborted != nullptr) {
+                *aborted = true;
+            }
+            return {};
+        }
         in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const std::streamsize got = in.gcount();
         if (got > 0 && !hash.update(buffer.data(), static_cast<std::size_t>(got))) {
@@ -152,6 +161,17 @@ nlohmann::json UploadSessionManager::session_json(const Session& session,
     }
     value["received"] = std::move(received);
     value["received_count"] = received_count;
+    nlohmann::json chunk_hashes = nlohmann::json::array();
+    std::uint64_t verified_count = 0;
+    for (std::uint64_t i = 0; i < session.chunk_hashes.size(); ++i) {
+        chunk_hashes.push_back(session.chunk_hashes[i]);
+        if (i < session.received.size() && session.received[i] &&
+            !session.chunk_hashes[i].empty()) {
+            ++verified_count;
+        }
+    }
+    value["chunk_hashes"] = std::move(chunk_hashes);
+    value["verified_count"] = verified_count;
     value["percent"] = session.size == 0
                            ? (session.state == "completed" ? 100 : 0)
                            : static_cast<int>((session.uploaded_bytes * 100) / session.size);
@@ -212,6 +232,15 @@ Result<UploadSessionManager::Session> UploadSessionManager::load_session(
             }
         }
     }
+    session.chunk_hashes.assign(static_cast<std::size_t>(session.chunk_count), std::string{});
+    if (const auto items = value.find("chunk_hashes"); items != value.end() && items->is_array()) {
+        const std::size_t limit = std::min<std::size_t>(items->size(), session.chunk_hashes.size());
+        for (std::size_t i = 0; i < limit; ++i) {
+            if ((*items)[i].is_string()) {
+                session.chunk_hashes[i] = (*items)[i].get<std::string>();
+            }
+        }
+    }
     return session;
 }
 
@@ -247,6 +276,14 @@ void UploadSessionManager::load_existing() {
             std::error_code ignored;
             std::filesystem::remove_all(entry.path(), ignored);
             continue;
+        }
+        // 服务重启/崩溃时后台线程已经没了；把“传输中”标成暂停，
+        // 让 upload resume 能重新拉起，而不是永远卡在 uploading。
+        if (session.state == "uploading" || session.state == "completing") {
+            session.state = "paused";
+            session.error = "服务重启，上传已暂停；执行 upload resume 继续";
+            touch(session);
+            save_session(session);
         }
         sessions_[session.id] = std::move(session);
     }
@@ -358,6 +395,7 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
     session.chunk_size = chunk_size;
     session.chunk_count = chunk_count;
     session.received.assign(static_cast<std::size_t>(chunk_count), false);
+    session.chunk_hashes.assign(static_cast<std::size_t>(chunk_count), std::string{});
     session.created_at = local_datetime_iso();
     touch(session);
 
@@ -422,6 +460,8 @@ Result<nlohmann::json> UploadSessionManager::pause(const std::string& id) {
 }
 
 Result<nlohmann::json> UploadSessionManager::resume(const std::string& id) {
+    std::thread old_worker;
+    bool wait_for_old = false;
     {
         std::lock_guard<std::mutex> guard(mutex_);
         const auto found = sessions_.find(id);
@@ -432,9 +472,56 @@ Result<nlohmann::json> UploadSessionManager::resume(const std::string& id) {
         if (session.state == "completed") {
             return session_json(session, false);
         }
-        if (session.state != "paused" && session.state != "error") {
+        if (session.state == "uploading") {
+            // 正常情况下 worker 还在；如果状态是 uploading 但线程已经没了
+            // （异常退出/旧会话），也允许重新拉起。
+            if (running_.count(id) > 0) {
+                return session_json(session, false);
+            }
+        } else if (session.state == "paused" || session.state == "error") {
+            // 暂停/报错时旧 worker 可能还在收尾。先把线程交出来，锁外 join；
+            // 否则 resume 设置 uploading 会让旧 worker 继续跑，或者新 worker
+            // 因为 running_ 仍是 true 而根本起不来。
+            if (running_.count(id) > 0) {
+                const auto worker = workers_.find(id);
+                if (worker != workers_.end()) {
+                    if (worker->second.joinable()) {
+                        old_worker = std::move(worker->second);
+                    }
+                    workers_.erase(worker);
+                }
+                wait_for_old = true;
+            }
+        } else {
             return make_error(ErrorCode::UploadStateInvalid,
                               "当前状态不能继续：" + session.state);
+        }
+        if (!wait_for_old) {
+            session.state = "uploading";
+            session.error.clear();
+            touch(session);
+            if (const Status saved = save_session(session); !ok(saved)) {
+                return *error_of(saved);
+            }
+        }
+    }
+
+    if (old_worker.joinable()) {
+        old_worker.join();
+    }
+
+    if (wait_for_old) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const auto found = sessions_.find(id);
+        if (found == sessions_.end()) {
+            return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
+        }
+        Session& session = found->second;
+        if (session.state == "canceled") {
+            return session_json(session, false);
+        }
+        if (session.state == "completed") {
+            return session_json(session, false);
         }
         session.state = "uploading";
         session.error.clear();
@@ -443,6 +530,7 @@ Result<nlohmann::json> UploadSessionManager::resume(const std::string& id) {
             return *error_of(saved);
         }
     }
+
     spawn_worker(id);
     return status(id);
 }
@@ -501,6 +589,15 @@ bool UploadSessionManager::all_received(const Session& session) const {
                        [](bool value) { return value; });
 }
 
+bool UploadSessionManager::should_upload_continue(const std::string& id) const {
+    if (stopping_.load()) {
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(mutex_);
+    const auto found = sessions_.find(id);
+    return found != sessions_.end() && found->second.state == "uploading";
+}
+
 std::uint64_t UploadSessionManager::next_missing(const Session& session) const {
     for (std::uint64_t i = 0; i < session.received.size(); ++i) {
         if (!session.received[i]) {
@@ -556,7 +653,20 @@ void UploadSessionManager::worker(const std::string& id) {
         source_path = found->second.source_path;
     }
     if (expected_md5.empty()) {
-        expected_md5 = md5_file(path_from_utf8(source_path));
+        bool aborted = false;
+        expected_md5 = md5_file(
+            path_from_utf8(source_path),
+            [this, &id]() { return should_upload_continue(id); }, &aborted);
+        if (aborted) {
+            std::lock_guard<std::mutex> guard(mutex_);
+            running_.erase(id);
+            const auto found = sessions_.find(id);
+            if (found != sessions_.end() && found->second.state == "canceled") {
+                std::filesystem::remove_all(session_dir(id));
+                sessions_.erase(found);
+            }
+            return;
+        }
         if (expected_md5.empty()) {
             set_error(id, "无法计算源文件 MD5：" + source_path);
             std::lock_guard<std::mutex> guard(mutex_);
@@ -639,10 +749,16 @@ void UploadSessionManager::worker(const std::string& id) {
         std::vector<char> buffer(static_cast<std::size_t>(std::min<std::uint64_t>(kCopyBuffer, length)));
         std::uint64_t left = length;
         bool failed = false;
+        bool hash_failed = false;
+        Md5 chunk_hash;
         while (left > 0) {
             const std::size_t want = static_cast<std::size_t>(std::min<std::uint64_t>(left, buffer.size()));
             if (!read_exact(in, buffer.data(), want)) {
                 failed = true;
+                break;
+            }
+            if (!chunk_hash.update(buffer.data(), want)) {
+                hash_failed = true;
                 break;
             }
             out.write(buffer.data(), static_cast<std::streamsize>(want));
@@ -653,9 +769,15 @@ void UploadSessionManager::worker(const std::string& id) {
             left -= want;
         }
         out.close();
-        if (failed) {
+        if (failed || hash_failed) {
             std::filesystem::remove(temp, code);
-            set_error(id, "读取或写入分片失败，源文件可能已被修改");
+            set_error(id, hash_failed ? "分片 MD5 计算失败" : "读取或写入分片失败，源文件可能已被修改");
+            break;
+        }
+        const std::string chunk_digest = chunk_hash.finish();
+        if (chunk_digest.empty()) {
+            std::filesystem::remove(temp, code);
+            set_error(id, "分片 MD5 计算失败");
             break;
         }
         std::filesystem::rename(temp, target, code);
@@ -675,6 +797,7 @@ void UploadSessionManager::worker(const std::string& id) {
             Session& session = found->second;
             if (!session.received[static_cast<std::size_t>(index)]) {
                 session.received[static_cast<std::size_t>(index)] = true;
+                session.chunk_hashes[static_cast<std::size_t>(index)] = chunk_digest;
                 session.uploaded_bytes += length;
             }
             touch(session);
@@ -794,21 +917,78 @@ void UploadSessionManager::complete_in_worker(const std::string& id) {
         for (std::uint64_t index = 0; index < snapshot.chunk_count; ++index) {
             std::ifstream in(chunk_path(id, index), std::ios::binary);
             if (!in) {
+                out.close();
                 std::filesystem::remove(assembled);
-                set_error(id, "分片缺失：" + std::to_string(index));
+                {
+                    std::lock_guard<std::mutex> guard(mutex_);
+                    const auto found = sessions_.find(id);
+                    if (found != sessions_.end()) {
+                        const std::uint64_t offset = index * found->second.chunk_size;
+                        const std::uint64_t length =
+                            std::min(found->second.chunk_size, found->second.size - offset);
+                        found->second.received[static_cast<std::size_t>(index)] = false;
+                        found->second.chunk_hashes[static_cast<std::size_t>(index)].clear();
+                        found->second.uploaded_bytes =
+                            found->second.uploaded_bytes > length
+                                ? found->second.uploaded_bytes - length
+                                : 0;
+                        found->second.state = "error";
+                        found->second.error = "分片 " + std::to_string(index) +
+                                              " 缺失，可 upload resume 重传";
+                        touch(found->second);
+                        save_session(found->second);
+                    }
+                }
                 return;
             }
+            Md5 chunk_hash;
             while (in) {
                 in.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
                 const std::streamsize got = in.gcount();
                 if (got > 0) {
-                    if (!hash.update(buffer.data(), static_cast<std::size_t>(got))) {
+                    if (!chunk_hash.update(buffer.data(), static_cast<std::size_t>(got)) ||
+                        !hash.update(buffer.data(), static_cast<std::size_t>(got))) {
                         std::filesystem::remove(assembled);
                         set_error(id, "MD5 计算失败");
                         return;
                     }
                     out.write(buffer.data(), got);
                 }
+            }
+            const std::string actual_chunk = chunk_hash.finish();
+            const std::string& expected_chunk =
+                snapshot.chunk_hashes[static_cast<std::size_t>(index)];
+            if (actual_chunk.empty()) {
+                std::filesystem::remove(assembled);
+                set_error(id, "分片 MD5 计算失败");
+                return;
+            }
+            if (!expected_chunk.empty() && !iequals(expected_chunk, actual_chunk)) {
+                in.close();
+                out.close();
+                std::filesystem::remove(assembled);
+                std::filesystem::remove(chunk_path(id, index));
+                {
+                    std::lock_guard<std::mutex> guard(mutex_);
+                    const auto found = sessions_.find(id);
+                    if (found != sessions_.end()) {
+                        const std::uint64_t offset = index * found->second.chunk_size;
+                        const std::uint64_t length =
+                            std::min(found->second.chunk_size, found->second.size - offset);
+                        found->second.received[static_cast<std::size_t>(index)] = false;
+                        found->second.chunk_hashes[static_cast<std::size_t>(index)].clear();
+                        found->second.uploaded_bytes =
+                            found->second.uploaded_bytes > length
+                                ? found->second.uploaded_bytes - length
+                                : 0;
+                        found->second.state = "error";
+                        found->second.error = "分片 " + std::to_string(index) +
+                                              " 校验失败，已删除，可 upload resume 重传";
+                        touch(found->second);
+                        save_session(found->second);
+                    }
+                }
+                return;
             }
         }
         out.close();

@@ -59,6 +59,8 @@ private:
         std::string md5;
         std::string state = "uploading";  // uploading/paused/completing/completed/canceled/error
         std::vector<bool> received;
+        // 每个分片的 MD5（32 位小写十六进制）；未收到的分片为空串。
+        std::vector<std::string> chunk_hashes;
         std::uint64_t uploaded_bytes = 0;
         std::string created_at;
         std::string updated_at;
@@ -98,6 +100,7 @@ private:
 
     bool all_received(const Session& session) const;
     std::uint64_t next_missing(const Session& session) const;
+    bool should_upload_continue(const std::string& id) const;
 
     nlohmann::json session_json(const Session& session, bool include_missing) const;
     std::string next_name(const std::string& original, int sequence) const;
