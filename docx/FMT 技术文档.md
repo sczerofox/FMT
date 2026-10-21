@@ -387,14 +387,14 @@ cmake --build cmake-build-release --parallel
 
 ### 3.4 版本号与构建日期
 
-单一来源：`CMakeLists.txt` 的 `project(FMT VERSION 2.3.1)`。
+单一来源：`CMakeLists.txt` 的 `project(FMT VERSION 2.3.2)`。
 经 `cmake/version.hpp.in` 生成 `fmt/version.hpp`（`fmt::version::MAJOR/MINOR/PATCH/STRING`）：
 
 ```cpp
 inline constexpr std::string_view MAJOR = "2";
 inline constexpr std::string_view MINOR = "2";
 inline constexpr std::string_view PATCH = "1";
-inline constexpr std::string_view STRING = "2.3.1";
+inline constexpr std::string_view STRING = "2.3.2";
 ```
 
 **构建日期也由 CMake 在配置时生成**，格式 `%Y.%m.%d`（本地时间），进同一个头文件：
@@ -431,9 +431,9 @@ std::string banner_text() {
 | 项 | 约定 |
 |---|---|
 | 程序名 | 固定 **`File Manager Tool`**（文档名/工程名仍叫 FMT，只有程序横幅用这个名字） |
-| 版本部分 | 直接取 `version::STRING`，当前 `v2.3.1`；横幅、`--version`、`version` 命令同源 |
+| 版本部分 | 直接取 `version::STRING`，当前 `v2.3.2`；横幅、`--version`、`version` 命令同源 |
 | 构建日期 | `BUILD_DATE`，CMake 配置时按本地时间生成，**每次重新配置都会变** |
-| 空格 | 「Tool」与「v2.3.1」之间、`(` 与 `build` 之间、`build` 与日期之间都是**两个空格**（照实现原样） |
+| 空格 | 「Tool」与「v2.3.2」之间、`(` 与 `build` 之间、`build` 与日期之间都是**两个空格**（照实现原样） |
 | 单一来源 | `--version` 与交互横幅调同一个 `banner_text()`，不各写一份 |
 | 用法标题 | `--help` 里是 `用法：fmt.exe [命令]`，**不再**用 `FMT 2.0.0 - Windows 文件管理系统` 这类旧标题 |
 

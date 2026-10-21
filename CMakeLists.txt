@@ -27,7 +27,7 @@ cmake_minimum_required(VERSION 3.20)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 project(FMT
-        VERSION 2.3.1
+        VERSION 2.3.2
         DESCRIPTION "FMT - Windows File Management System"
         LANGUAGES CXX
         HOMEPAGE_URL "https://github.com/sczerofox/FMT")
