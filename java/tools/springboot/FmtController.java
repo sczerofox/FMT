@@ -1,18 +1,11 @@
 package com.hncgy.mybatis.controller;
 
-import com.hncgy.mybatis.service.FmtService;
+import org.lazy.fmt.client.FmtClient;
 import org.lazy.fmt.client.FmtResult;
-import org.lazy.fmt.client.model.FileQuery;
-import org.lazy.fmt.client.model.FmtDeleteCheck;
-import org.lazy.fmt.client.model.FmtFile;
-import org.lazy.fmt.client.model.FmtPage;
-import org.lazy.fmt.client.model.FmtPayload;
-import org.lazy.fmt.client.model.FmtServerStatus;
-import org.lazy.fmt.client.model.FmtShare;
-import org.lazy.fmt.client.model.FmtUpload;
-import org.springframework.core.io.InputStreamResource;
+import org.lazy.fmt.client.model.*;
+import org.lazy.fmt.spring.FmtFileResponse;
+import com.hncgy.mybatis.service.FmtService;
 import org.springframework.core.io.Resource;
-import org.springframework.http.HttpHeaders;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -24,11 +17,6 @@ import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
-import java.io.InputStream;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.List;
 
 /**
@@ -43,9 +31,11 @@ import java.util.List;
 public class FmtController {
 
     private final FmtService fmtService;
+    private final FmtClient fmtClient;
 
-    public FmtController(FmtService fmtService) {
+    public FmtController(FmtService fmtService, FmtClient fmtClient) {
         this.fmtService = fmtService;
+        this.fmtClient = fmtClient;
     }
 
     /** 探活：ping 不需要凭证。 */
@@ -88,30 +78,16 @@ public class FmtController {
         return fmtService.upload(file);
     }
 
-    /** 下载：先落到临时文件（流式，SDK 内部 .part → 改名），再原样吐给调用方，最后删临时文件。 */
+    /** 下载：文件基本信息 + 附件响应都在 FmtFileResponse 里。 */
     @GetMapping("/files/{id}/download")
-    public ResponseEntity<Resource> download(@PathVariable String id) throws IOException {
-        Path tmp = Files.createTempFile("fmt-", ".bin");
-        boolean ok = false;
-        try {
-            FmtPayload payload = fmtService.download(id, tmp);
-            String fileName = payload.fileName() == null || payload.fileName().isBlank()
-                    ? "download.bin"
-                    : payload.fileName();
-            InputStream in = Files.newInputStream(tmp);
-            ok = true;                                  // 交给内存流之后由它负责关闭
-            return ResponseEntity.ok()
-                    .header(HttpHeaders.CONTENT_DISPOSITION,
-                            "attachment; filename*=UTF-8''"
-                                    + URLEncoder.encode(fileName, StandardCharsets.UTF_8)
-                                    .replace("+", "%20"))
-                    .contentLength(payload.bytes())
-                    .body(new InputStreamResource(in));
-        } finally {
-            if (!ok) {
-                Files.deleteIfExists(tmp);               // 失败路径不留临时文件
-            }
-        }
+    public ResponseEntity<Resource> download(@PathVariable String id) {
+        return FmtFileResponse.of(fmtClient, id).download();
+    }
+
+    /** 预览：图片/文本类内联返回，浏览器可直接作为 img src / iframe。 */
+    @GetMapping("/files/{id}/preview")
+    public ResponseEntity<Resource> preview(@PathVariable String id) {
+        return FmtFileResponse.of(fmtClient, id).preview();
     }
 
     /** 删除预检：?dry_run=1，零副作用。 */

@@ -23,7 +23,7 @@
 
   <groupId>org.lazy</groupId>
   <artifactId>fmt-java-parent</artifactId>
-  <version>2.3.0</version>
+  <version>2.3.1</version>
   <packaging>pom</packaging>
 
   <name>FMT Java Parent</name>
@@ -40,7 +40,7 @@
     <maven.compiler.release>17</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-    <fmt.version>2.3.0</fmt.version>
+    <fmt.version>2.3.1</fmt.version>
   </properties>
 
   <dependencyManagement>

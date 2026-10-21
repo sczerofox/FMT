@@ -169,6 +169,19 @@ try (FmtClient fmt = new FmtClient("lazy", "123456", "pet")) {
 `FmtMedia` 提供 `contentType/fileName/bytes/openStream/readBytes`，Spring Boot 可直接流式返回；
 `close()` 负责清理临时文件。
 
+Spring Boot starter 另外提供 `FmtFileResponse`，把「文件基本信息 + 预览响应 + 下载响应」封成一个对象：
+
+```java
+FmtFileResponse response = FmtFileResponse.of(pkg);
+response.fileId();
+response.fileName();
+response.preview();    // ResponseEntity<Resource>，inline
+response.download();   // ResponseEntity<Resource>，attachment
+```
+
+响应里的临时文件在 Spring 关闭流时自动删除，Controller 不再自己写临时文件清理代码。
+已有文件可用 `FmtFileResponse.of(fmtClient, fileId)` 重新构造。
+
 
 
 ```json
@@ -796,7 +809,7 @@ user.json」）。所以对着**旧 exe** 跑，桥接侧看到的是（都是**
 
 | 场景 | 做法 |
 |---|---|
-| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.3.0` |
+| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.3.1` |
 | 不想动私服 | `mvn install:install-file` 把两个 jar 装进本地仓库，或直接 `<scope>system</scope>`（不推荐） |
 | 只在非 Spring 项目用 | 只依赖 `fmt-client-core`（零依赖，Java 17+） |
 | 当独立桥接服务跑 | `java -jar fmt-bridge.jar`（demo 模块打成可执行 jar），别的系统调它的 REST |

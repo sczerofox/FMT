@@ -7,7 +7,7 @@
   <parent>
     <groupId>org.lazy</groupId>
     <artifactId>fmt-java-parent</artifactId>
-    <version>2.3.0</version>
+    <version>2.3.1</version>
     <!-- 见 fmt-client-core/pom.xml 的说明：显式给出，源码树与本地仓库两种布局都对。 -->
     <relativePath>../pom.xml</relativePath>
   </parent>
@@ -28,7 +28,7 @@
     <dependency>
       <groupId>org.lazy</groupId>
       <artifactId>fmt-client-core</artifactId>
-      <version>2.3.0</version>
+      <version>2.3.1</version>
     </dependency>
 
     <!-- 自动配置基础设施 -->
