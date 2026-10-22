@@ -3,11 +3,14 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -404,13 +407,13 @@ bool print_command_help(const std::string& topic) {
         std::printf(
             "upload —— 大文件分片上传（普通文件仍用 file upload，single request）\n"
             "  start <本地文件> [文件名] [--chunk-size 8MB] [--wait]\n"
-            "                           建分片会话并让服务后台传；--wait 阻塞到完成\n"
+            "                           建分片会话并让服务后台传；--wait 显示实时进度条\n"
             "  status <upload_id>       查看进度、缺少的分片与错误；verified 是已记录 MD5 的分片数\n"
             "  pause <upload_id>        当前分片写完后暂停（算源文件 MD5 时也会尽快停）\n"
             "  resume <upload_id>       从缺少的分片继续；服务重启后也可用\n"
             "  cancel <upload_id>       取消并清理临时分片\n"
             "  list                     列出当前用户的上传会话\n"
-            "  wait <upload_id>         持续打印进度直到完成\n"
+            "  wait <upload_id>         持续显示进度条、速度、ETA 直到完成\n"
             "\n"
             "每个分片写入时记录 MD5，拼接时逐片校验；坏片会删除并提示 resume 重传。\n"
             "上限：max_large_upload_size；分片默认取 config.json 的 upload_chunk_size。\n"
@@ -1858,6 +1861,131 @@ Result<ipc::Response> upload_call(Session& session, const Options& options,
     return session.client.call(request, ipc::kCommandTimeoutMs);
 }
 
+bool stdout_is_console() {
+    DWORD mode = 0;
+    const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+    return output != INVALID_HANDLE_VALUE && GetConsoleMode(output, &mode) != 0;
+}
+
+std::string upload_state_text(const std::string& state) {
+    if (state == "uploading") return "上传中";
+    if (state == "paused") return "已暂停";
+    if (state == "completing") return "正在完成";
+    if (state == "completed") return "已完成";
+    if (state == "canceled") return "已取消";
+    if (state == "error") return "失败";
+    return state;
+}
+
+struct UploadProgressView {
+    bool console = stdout_is_console();
+    bool started = false;
+    std::uint64_t last_bytes = 0;
+    std::chrono::steady_clock::time_point last_time{};
+    double speed = 0.0;
+    int last_percent = -1;
+    std::string last_state;
+    std::size_t last_width = 0;
+    int spinner = 0;
+};
+
+std::string upload_eta(std::uint64_t remaining, double speed) {
+    if (remaining == 0) {
+        return "00:00";
+    }
+    if (speed <= 0.0) {
+        return "--:--";
+    }
+    std::uint64_t seconds = static_cast<std::uint64_t>(remaining / speed);
+    if (seconds > 99ULL * 60 * 60) {
+        return ">99h";
+    }
+    std::ostringstream text;
+    text << std::setw(2) << std::setfill('0') << (seconds / 3600) << ':' << std::setw(2)
+         << ((seconds / 60) % 60) << ':' << std::setw(2) << (seconds % 60);
+    return text.str();
+}
+
+void render_upload_progress(const nlohmann::json& data, UploadProgressView& view,
+                            bool force = false) {
+    const std::uint64_t size = data.value("size", std::uint64_t{0});
+    const std::uint64_t uploaded = data.value("uploaded_bytes", std::uint64_t{0});
+    int percent = data.value("percent", 0);
+    percent = std::max(0, std::min(100, percent));
+    const std::string state = data.value("state", std::string{});
+    const std::string label = upload_state_text(state);
+
+    const auto now = std::chrono::steady_clock::now();
+    if (view.started) {
+        const double seconds =
+            std::chrono::duration<double>(now - view.last_time).count();
+        if (seconds >= 0.15) {
+            if (uploaded >= view.last_bytes) {
+                const double instant =
+                    static_cast<double>(uploaded - view.last_bytes) / seconds;
+                view.speed = view.speed <= 0.0 ? instant
+                                               : view.speed * 0.7 + instant * 0.3;
+            } else {
+                // 坏分片被删除时进度会回退，速度重新从 0 估。
+                view.speed = 0.0;
+            }
+            view.last_bytes = uploaded;
+            view.last_time = now;
+        }
+    } else {
+        view.started = true;
+        view.last_bytes = uploaded;
+        view.last_time = now;
+    }
+
+    const bool hashing = state == "uploading" && uploaded == 0 &&
+                         data.value("md5", std::string{}).empty();
+    std::ostringstream line;
+    if (hashing) {
+        static const char kSpinner[] = "|/-\\";
+        line << "正在校验源文件 MD5，请稍候… " << kSpinner[view.spinner++ % 4];
+    } else {
+        const int width = 28;
+        const int filled =
+            size == 0 ? (state == "completed" ? width : 0)
+                      : static_cast<int>((uploaded * width) / size);
+        std::string bar(static_cast<std::size_t>(std::max(0, std::min(width, filled))), '#');
+        bar.append(static_cast<std::size_t>(width - static_cast<int>(bar.size())), '-');
+        const double remaining =
+            static_cast<double>(size > uploaded ? size - uploaded : 0);
+        const std::string speed_text =
+            state == "uploading" && view.speed > 0.0
+                ? format_size(static_cast<std::uintmax_t>(view.speed)) + "/s"
+                : "--";
+        line << '[' << bar << "] " << std::setw(3) << percent << "%  "
+             << format_size(uploaded) << " / " << format_size(size) << "  " << speed_text
+             << "  ETA " << upload_eta(static_cast<std::uint64_t>(remaining),
+                                       state == "uploading" ? view.speed : 0.0)
+             << "  " << label;
+        if (data.value("chunk_count", std::uint64_t{0}) > 0) {
+            line << "  chunk " << data.value("received_count", std::uint64_t{0}) << '/'
+                 << data.value("chunk_count", std::uint64_t{0});
+        }
+    }
+
+    const std::string text = line.str();
+    if (view.console) {
+        std::string padded = text;
+        if (padded.size() < view.last_width) {
+            padded.append(view.last_width - padded.size(), ' ');
+        }
+        std::printf("\r%s", padded.c_str());
+        std::fflush(stdout);
+        view.last_width = padded.size();
+    } else if (force || state != view.last_state || percent / 5 != view.last_percent / 5 ||
+               view.last_percent < 0) {
+        std::printf("%s\n", text.c_str());
+        std::fflush(stdout);
+    }
+    view.last_state = state;
+    view.last_percent = percent;
+}
+
 void print_upload_one(const nlohmann::json& data) {
     std::printf("upload_id = %s\n", data.value("upload_id", std::string{}).c_str());
     std::printf("file      = %s\n", data.value("file_name", std::string{}).c_str());
@@ -2043,6 +2171,7 @@ int run_upload_command(const std::vector<std::string>& parts, Session& session,
     }
 
     if (verb == "wait") {
+        UploadProgressView view;
         while (true) {
             nlohmann::json one;
             one["argv"] = nlohmann::json::array({id});
@@ -2056,14 +2185,16 @@ int run_upload_command(const std::vector<std::string>& parts, Session& session,
                 print_failure(value.error);
                 return exit_code(value.error.code);
             }
-            std::printf("\r%s  %d%%  %s", value.data.value("file_name", std::string{}).c_str(),
-                        value.data.value("percent", 0),
-                        value.data.value("state", std::string{}).c_str());
-            std::fflush(stdout);
+            render_upload_progress(value.data, view);
             const std::string state = value.data.value("state", std::string{});
             if (state == "completed") {
-                std::printf("\n完成：%s\n",
-                            value.data.value("final_file_id", std::string{}).c_str());
+                std::printf("\n完成：%s（%s）\n",
+                            value.data.value("final_file_id", std::string{}).c_str(),
+                            value.data.value("file_name", std::string{}).c_str());
+                return 0;
+            }
+            if (state == "paused") {
+                std::printf("\n已暂停；继续：upload resume %s\n", id.c_str());
                 return 0;
             }
             if (state == "error" || state == "canceled") {
@@ -2071,7 +2202,7 @@ int run_upload_command(const std::vector<std::string>& parts, Session& session,
                 return exit_code(state == "canceled" ? ErrorCode::UploadCanceled
                                                      : ErrorCode::UploadStateInvalid);
             }
-            ::Sleep(1000);
+            ::Sleep(view.console ? 250 : 500);
         }
     }
 
