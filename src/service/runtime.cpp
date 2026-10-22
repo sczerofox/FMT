@@ -770,7 +770,22 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
                 return response;
             }
             const std::string upload_id = (*argv)[0].get<std::string>();
-            Result<nlohmann::json> upload = uploads->lookup(upload_id);
+            // 必须先取当前 user/bucket 再查会话：uploads 内部的 config_ 只在 upload.*
+            // 请求时刷新，用户切过 Bucket 后再 file delete <upload_id> 会查到旧身份。
+            Config config;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (context_ != nullptr) {
+                    config = context_->config;
+                }
+            }
+            std::string verified_bucket = config.current_bucket;
+            if (const auto scoped = effective_args.find("_bucket");
+                scoped != effective_args.end() && scoped->is_string()) {
+                verified_bucket = scoped->get<std::string>();
+            }
+            Result<nlohmann::json> upload =
+                uploads->lookup_for(upload_id, config.current_user, verified_bucket);
             if (!ok(upload)) {
                 response.ok = false;
                 response.error = *error_of(upload);
@@ -791,18 +806,6 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
                 response.error = make_error(ErrorCode::FileNotFound,
                                             "上传会话没有对应的 file_id：" + upload_id);
                 return response;
-            }
-            Config config;
-            {
-                std::lock_guard<std::mutex> guard(mutex_);
-                if (context_ != nullptr) {
-                    config = context_->config;
-                }
-            }
-            std::string verified_bucket = config.current_bucket;
-            if (const auto scoped = effective_args.find("_bucket");
-                scoped != effective_args.end() && scoped->is_string()) {
-                verified_bucket = scoped->get<std::string>();
             }
             const Result<std::string> verified =
                 uploads->verified_file_id(upload_id, config.current_user, verified_bucket);

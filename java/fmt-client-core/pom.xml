@@ -7,12 +7,12 @@
   <parent>
     <groupId>org.lazy</groupId>
     <artifactId>fmt-java-parent</artifactId>
-    <version>2.4.0</version>
+    <version>3.0.0</version>
     <!--
       相对路径显式给出：默认值 ../pom.xml 在**本地仓库布局**里会指向
       <...>/org/lazy/pom.xml（不存在），Maven 于是打一条 "points at no local POM"
       的警告再去仓库里找父 pom。装好父 pom 之后 ../pom.xml 正好就是
-      <...>/org/lazy/fmt-java-parent/2.4.0/../pom.xml —— 源码树与仓库两种布局都对。
+      <...>/org/lazy/fmt-java-parent/3.0.0/../pom.xml —— 源码树与仓库两种布局都对。
     -->
     <relativePath>../pom.xml</relativePath>
   </parent>

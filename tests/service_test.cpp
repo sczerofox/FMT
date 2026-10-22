@@ -1918,6 +1918,92 @@ FMT_TEST(Service, 大文件内容与文件名验证) {
     FMT_CHECK(invalid.error.code == fmt::ErrorCode::FileNameLikeFileId);
 }
 
+FMT_TEST(Service, 切Bucket后按upload_id删除仍用当前身份) {
+    fmt_test::TempDir temp("service-upload-stale-bucket");
+    const auto root = temp / "root";
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("password", salt);
+    fmt::ipc::Request create_user;
+    create_user.id = 1;
+    create_user.op = "user.create";
+    create_user.args["username"] = "user";
+    create_user.args["password_digest"] = digest;
+    FMT_CHECK(runtime.handle(create_user).ok);
+    for (const char* name : {"work", "other"}) {
+        fmt::ipc::Request create_bucket;
+        create_bucket.id = 2;
+        create_bucket.op = "bucket.create";
+        create_bucket.args["argv"] = nlohmann::json::array({name});
+        FMT_CHECK(runtime.handle(create_bucket).ok);
+    }
+    const auto use_bucket = [&](const char* name, int id) {
+        fmt::ipc::Request request;
+        request.id = id;
+        request.op = "bucket.use";
+        request.args["argv"] = nlohmann::json::array({name});
+        return runtime.handle(request).ok;
+    };
+    FMT_CHECK(use_bucket("work", 3));
+
+    const std::filesystem::path source = temp / "stale.bin";
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        out << std::string(200 * 1024, 's');
+    }
+    fmt::ipc::Request start;
+    start.id = 4;
+    start.op = "upload.start";
+    start.args["argv"] = nlohmann::json::array({source.string(), "stale.bin"});
+    start.args["chunk_size"] = 64 * 1024;
+    const fmt::ipc::Response started = runtime.handle(start);
+    FMT_CHECK(started.ok);
+    const std::string upload_id = started.data.value("upload_id", std::string{});
+    FMT_CHECK(!upload_id.empty());
+
+    std::string state;
+    for (int i = 0; i < 200; ++i) {
+        fmt::ipc::Request query;
+        query.id = 20 + i;
+        query.op = "upload.status";
+        query.args["argv"] = nlohmann::json::array({upload_id});
+        const fmt::ipc::Response current = runtime.handle(query);
+        if (current.ok) {
+            state = current.data.value("state", std::string{});
+            if (state == "completed") {
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    FMT_CHECK_EQ(state, std::string("completed"));
+
+    // 切到 other，做一次 upload.*（把 UploadSessionManager 内部的 config_ 刷成 other），
+    // 再切回 work；此时 file delete <upload_id> 必须按当前用户/桶重新解析，
+    // 不能用旧缓存里那个 other 桶。
+    FMT_CHECK(use_bucket("other", 300));
+    fmt::ipc::Request list;
+    list.id = 301;
+    list.op = "upload.list";
+    FMT_CHECK(runtime.handle(list).ok);
+    FMT_CHECK(use_bucket("work", 302));
+
+    fmt::ipc::Request remove;
+    remove.id = 303;
+    remove.op = "file.delete";
+    remove.args["argv"] = nlohmann::json::array({upload_id});
+    remove.args["force"] = true;
+    FMT_CHECK(runtime.handle(remove).ok);
+
+    fmt::ipc::Request get_file;
+    get_file.id = 304;
+    get_file.op = "file.get";
+    get_file.args["argv"] = nlohmann::json::array({"stale.bin"});
+    FMT_CHECK(!runtime.handle(get_file).ok);
+}
+
 FMT_TEST(Service, 大文件上传要求当前桶目录存在) {
     fmt_test::TempDir temp("service-upload-bucket-check");
     const auto root = temp / "root";

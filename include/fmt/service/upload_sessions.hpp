@@ -78,6 +78,10 @@ public:
     void stop();
 
 private:
+    // config_ 会被请求线程（set_config）与后台 worker（touch/prepare/complete）同时使用，
+    // 必须走同一把锁拷贝快照；只在请求线程把 Config 拷进内部状态，worker 只读快照。
+    Config config_snapshot() const;
+
     struct Session {
         std::string id;
         std::string user;
@@ -151,6 +155,9 @@ private:
 
     PathManager paths_;
     Config config_;
+    // 保护 config_：请求线程会 set_config，worker 会取快照；这把锁与 mutex_ 分开，
+    // 避免 worker 在持 mutex_ 时还要等请求线程。
+    mutable std::mutex config_mutex_;
     Logger* logger_ = nullptr;
 
     mutable std::mutex mutex_;

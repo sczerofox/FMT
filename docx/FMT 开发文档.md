@@ -391,6 +391,10 @@ V1 暂定：
   "current_user": "",
   "current_bucket": "",
   "max_upload_size": 52428800,
+  "max_large_upload_size": 8589934592,
+  "upload_chunk_size": 8388608,
+  "upload_session_ttl_seconds": 86400,
+  "upload_max_active_per_user": 4,
   "size_unit": "MB",
   "language": "zh-CN"
 }
@@ -401,10 +405,17 @@ V1 暂定：
 ```text
 current_user
 current_bucket
-max_upload_size
+max_upload_size                 单请求上传上限（默认 50 MB）
+max_large_upload_size           分片上传单文件上限（v3.0.0，默认 8 GB）
+upload_chunk_size               默认分片大小（v3.0.0，默认 8 MB）
+upload_session_ttl_seconds      上传会话过期时间（v3.0.0，默认 24h）
+upload_max_active_per_user      每用户活动会话上限（v3.0.0，默认 4）
 size_unit
 language
 ```
+
+> v3.0.0 的四个分片参数**只能改 `config.json`**；`config set` 只开放
+> `max_upload_size` / `token_ttl` / `server_enabled` / `server_host` / `server_port`。
 
 **阶段 4 已落地的行为**：文件里写出来的 `current_user` **不会长期为空**。数据根初始化
 （`initialize_root`）读到空值时自动置为占位名 `user` 并写回，所以 `config.json` 里
@@ -4856,7 +4867,7 @@ version —— 打印程序名、版本与构建日期
 > fmt.exe version            一次性执行
 > fmt.exe --version / -v     一次性执行（原有）
 > fmt> version               窗口里执行（也接受 --version / -v）
-> 输出都是一行：File Manager Tool  v1.0  ( build  2026.10.09 )
+> 输出都是一行：File Manager Tool  v3.0.0  ( build  2026.10.09 )
 >              版本取 version::MAJOR.MINOR，构建日期由 CMake 配置时生成
 > ```
 >
@@ -4885,7 +4896,7 @@ trash → help → exit；「业务命令（服务端尚未实现，现在会返
 > 所以拿到的是 `FMT-602`（「操作尚未实现：share.create」）而不是「未知操作」的 `FMT-001`；
 > **`share` 落地（`d5779db`）之后这一条不再成立**。
 
-`help <组>` 支持 `service` / `bucket` / `file` / `share` / `trash` / `help` / `exit`
+`help <组>` 支持 `service` / `bucket` / `file` / `upload` / `share` / `trash` / `help` / `exit`
 （`quit` 等同 `exit`；**提交 `d108c80` 起多了 `version`**）。`help service`：
 
 ```text
@@ -6493,6 +6504,12 @@ fmt.exe
 │   └── delete <file_id|文件名>        软删除，file_id 不变（第 43 节）；
 │                                      定位与 get 同一套规则（0ad9efc）
 │
+├── upload                            **v3.0.0 大文件分片上传**（第 129 节）
+│   ├── start <本地文件> [文件名] [--chunk-size 8MB] [--wait]
+│   ├── status|pause|resume|cancel <upload_id>
+│   ├── list [--all]
+│   └── wait <upload_id>
+│
 ├── share                             **已落地**（数据面提交 `d5779db`；公开下载端点 `d3aeb3d`，第 105 节）
 │   ├── create <file_id>
 │   ├── get <share_id>
@@ -6529,7 +6546,7 @@ exit / quit 是交互循环里的正式命令（help exit 有说明）
 ```
 
 帮助有两个入口：`--help` 打印带横幅与退出码表的完整用法（内含命令总览）；`help` 不带参数
-只列命令、`help <组>` 打印该组详情（`service` / `bucket` / `file` / `share` / `trash` /
+只列命令、`help <组>` 打印该组详情（`service` / `bucket` / `file` / `upload` / `share` / `trash` /
 `help` / `exit`），交互式与一次性都支持；`help <未知组>` → stderr 一行 + 退出码 2（`FMT-001`）。
 各子命令的详细说明必须与实际命令一致（见第 68 节）。
 
@@ -7960,7 +7977,7 @@ CLI 体检不触碰已有内容（预置同名目录与自写 JSON 后双击，�
 数据根无法补齐（只读目录等）→ stderr 出现「数据根无法补齐：FMT-013 …」且不阻断后续流程
 help 命令（`help` 列命令总览、`help service` 看详情、`help 未知组` → stderr + 退出码 2、
   交互式与一次性都支持；不提权、不连服务、不写日志）
-横幅与 --version 同一串 `File Manager Tool  v1.0  ( build  <日期> )`；重跑 CMake 后日期变化
+横幅与 --version 同一串 `File Manager Tool  v3.0.0  ( build  <日期> )`；重跑 CMake 后日期变化
 控制台整洁：双击后 stdout 只有横幅 + 状态行 + 提示符（外加需要提权时的四行），无「建了什么」
 数据根不可写（exe 放在只读位置）→ 提权结果文件退回 %TEMP% 并写一行 WARN，命令仍能完成
 单实例（再次双击 → 激活已有窗口，不新建第二个窗口）
@@ -8202,7 +8219,7 @@ V2
 36. 控制台只留交互：双击时数据根体检的结果（新建目录 / 新建文件 / 完整）与服务当前状态
     只进日志；只有异常（无法补齐、文件损坏）走 stderr
 37. help 是正式命令：help 列命令总览（只列命令、不加描述），help <组> 看详情，
-    支持 service / bucket / file / share / trash / help / exit；help <未知组> →
+    支持 service / bucket / file / upload / share / trash / help / exit；help <未知组> →
     stderr 一行 + FMT-001 / 退出码 2；exit / quit 也是正式命令
 38. current_user 默认为占位名 user：数据根初始化时若为空就置 user 并保存，
     不需要用户先设置；FMT-604 保留给「用户被显式清空」（第 18、93 节）
@@ -8297,7 +8314,7 @@ V2
     `FMT 技术文档.md` 第 5.2、12.1、19.1 节）
 54. `version` 是正式命令，与横幅、`--version` / `-v` **同源**（提交 `d108c80`）：
     三处都走 `cli::version_text()`（内部是 `banner_text()`），输出一行
-    「File Manager Tool  v1.0  ( build  <CMake 配置日期> )」；
+    「File Manager Tool  v3.0.0  ( build  <CMake 配置日期> )」；
     窗口里、`fmt.exe version`、`fmt.exe --version` / `-v` 都能用。
     **不需要服务在运行**（不连管道、不查状态）；**不写任何磁盘内容**——一次性分支在
     开日志器之前，`log/fmt.log` 不会因此多记录（与 `--help` / `--version` 同口径）。
@@ -8635,7 +8652,7 @@ ServiceMain 初始化失败上报 FMT 编号（dwServiceSpecificExitCode），CL
 等待落定按 SCM 的 dwWaitHint 自适应（100 ms – 2000 ms，兜底 30 秒），不写死时长
 服务状态文件 %ProgramData%\FMT\service.json
 CLI 单实例与固定界面输出（横幅、提示符、stdout / stderr）
-横幅 = File Manager Tool  v1.0  ( build  <CMake 配置日期> )，与 --version 同一串
+横幅 = File Manager Tool  v3.0.0  ( build  <CMake 配置日期> )，与 --version 同一串
 控制台只留交互与异常：数据根体检结果与服务当前状态只进日志
 help 命令（总览 / 分组详情 / 未知组 → FMT-001 退出码 2）；exit / quit 是正式命令
 V1 不做 --json 结构化输出，机器可读通道是退出码
@@ -9016,7 +9033,7 @@ with 404, unimplemented ones with 501」，2026-10-09 对已安装服务跑了 6
       fmt.exe version            一次性执行
       fmt.exe --version / -v     一次性执行（原有）
       fmt> version               窗口里执行（也接受 --version / -v）
-      输出一行：File Manager Tool  v1.0  ( build  2026.10.09 )
+      输出一行：File Manager Tool  v3.0.0  ( build  2026.10.09 )
                 （版本取 version::MAJOR.MINOR，构建日期由 CMake 配置时生成）
 两个性质：① 不需要服务在运行（不连管道、不查服务状态）；
          ② 不写任何磁盘内容——一次性分支放在「开日志器」之前，
@@ -9403,8 +9420,8 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 > `Service.永久删除后分享如实报文件不存在` / `Service.并发最后一次下载不会超发` /
 > `Server.分享路由与公开下载`；实测 `fmt_tests.exe` → 「共 162 项：通过 162，失败 0」，
 > `Service.` 19 项、`Server.` 8 项全绿，`ctest` 100%）**。
-> 用例条数只维护在上面这条台阶链里（当前 **162**；第 109、112 节是按覆盖范围列用例、
-> 不写条数）。
+> 用例条数只维护在上面这条台阶链里（**v3.0.0 当前 200**；第 109、112 节是按覆盖范围列用例、
+> 不写条数）。v3.0.0 新增的 38 条分片上传用例见第 129.6 节。
 
 后续开发过程中，如果发现：
 
@@ -9631,7 +9648,7 @@ service status 已安装但未运行           → 照常打印「已停止」/ 
 成功：
 
 ```text
-File Manager Tool  v1.0  ( build  2026.10.08 )
+File Manager Tool  v3.0.0  ( build  2026.10.08 )
 Service Running...
 
 fmt >service stop
@@ -9646,7 +9663,7 @@ fmt >
 失败（后两行替换为执行失败行与错误码行）：
 
 ```text
-File Manager Tool  v1.0  ( build  2026.10.08 )
+File Manager Tool  v3.0.0  ( build  2026.10.08 )
 Service Running...
 
 fmt >service stop
@@ -9678,7 +9695,7 @@ CLI 启动时打印（`banner_text()` 产出，与 `--version`、`version` 命�
 **提交 `8f2fbc5` 起横幅区永远多一行数据根**）：
 
 ```text
-File Manager Tool  v1.0  ( build  2026.10.09 )
+File Manager Tool  v3.0.0  ( build  2026.10.09 )
 Service Running...
 数据根：D:/Data/Temp/JMT/fmt
 ```
@@ -9686,7 +9703,7 @@ Service Running...
 服务未运行时第二行改为：
 
 ```text
-File Manager Tool  v1.0  ( build  2026.10.09 )
+File Manager Tool  v3.0.0  ( build  2026.10.09 )
 Service Stopped...
 数据根：D:/Data/Temp/JMT/fmt
 ```
@@ -9699,7 +9716,7 @@ Service Stopped...
 | 项 | 约定 |
 | --- | --- |
 | 程序名 | 固定 `File Manager Tool`（文档名/工程名仍叫 FMT，只有横幅用这个名字） |
-| 版本部分 | 直接取 `version::STRING`，当前 `v2.4.0`；横幅与 `--version` 同源 |
+| 版本部分 | 直接取 `version::STRING`，当前 `v3.0.0`；横幅与 `--version` 同源 |
 | 构建日期 | CMake 配置时生成（`FMT_BUILD_DATE`，`%Y.%m.%d` 本地时间），每次重新配置都会变 |
 | 单一来源 | 横幅、`--version` / `-v`、以及 `version` 命令（提交 `d108c80`）调同一个 `version_text()`（内部就是 `banner_text()`），不各写一份；源码里不得硬编码版本号或日期 |
 | 用法标题 | `--help` 里是 `用法：fmt.exe [命令]`，不再用 `FMT 2.0.0 - Windows 文件管理系统` 这类旧标题 |
@@ -9712,7 +9729,7 @@ Service Stopped...
 执行成功...
 错误码：0
 
-File Manager Tool  v1.0  ( build  2026.10.08 )
+File Manager Tool  v3.0.0  ( build  2026.10.08 )
 Service Running...
 
 fmt> 
@@ -9754,7 +9771,7 @@ fmt>
 提交 `8f2fbc5`）：
 
 ```text
-File Manager Tool  v1.0  ( build  2026.10.09 )
+File Manager Tool  v3.0.0  ( build  2026.10.09 )
 Service Running...
 数据根：D:/Data/Temp/JMT/fmt
 ```
@@ -9837,7 +9854,7 @@ fmt> help
 
 ```text
 fmt> version
-File Manager Tool  v1.0  ( build  2026.10.09 )
+File Manager Tool  v3.0.0  ( build  2026.10.09 )
 执行成功...
 错误码：0
 ```
@@ -10331,7 +10348,7 @@ blocked 的情况     歧义（file.delete）、同名冲突 / 随桶删除 / �
 | 14 | 等待服务起来写死一个固定时长 | 改为按 SCM 的 `dwWaitHint` 自适应（100 ms – 2000 ms 夹取，兜底 30 秒，不是等待类就立即结束） | 慢机器上「还在启动」会被误判成「启动失败」，白弹一次解决不了问题的 UAC 重装 |
 | 15 | 各命令各自调 `QueryServiceStatus` 再自己 `map_state` | 统一走 `service::query_status()` / `query_state()` / `installed_binary_path()` / `last_start_failure()`；「未安装」是正常结果而非错误 | 三处调用方（status / 落定判定 / 失败编号）判断一致，状态名只映射一次 |
 | 16 | 结构化的 `--json` 输出被当作「将来加」 | **V1 明确不做，也不预留参数名** | 机器可读通道已由命令退出码覆盖，现在加只会提前冻结一个没想清楚的参数形状 |
-| 17 | 横幅是 `FMT v1.0.0`，用法标题写 `FMT 1.0.0 - Windows 文件管理系统` | 横幅与 `--version` 共用 `File Manager Tool  v1.0  ( build  <配置日期> )`；用法标题改 `用法：fmt.exe [命令]` | 程序对外名字固定、构建日期由 CMake 生成，避免源码里再硬编码一个日期 |
+| 17 | 横幅是 `FMT v1.0.0`，用法标题写 `FMT 1.0.0 - Windows 文件管理系统` | 横幅与 `--version` 共用 `File Manager Tool  v3.0.0  ( build  <配置日期> )`；用法标题改 `用法：fmt.exe [命令]` | 程序对外名字固定、构建日期由 CMake 生成，避免源码里再硬编码一个日期 |
 | 18 | 双击时把「数据根：… / 新建目录：… / 新建文件：… / 数据根完整 / 服务状态：…」都打到控制台 | 这些行**只进日志**（模块 `Cli` / `Service`），控制台只留横幅、提示符、命令结果与异常 | 太杂乱，把提示符淹掉；按「控制台负责交互与异常，日志负责完整记录」归位 |
 | 19 | 只有 `--help`（一次性、带完整用法） | 新增 `help` 命令：`help` 列命令总览（只列命令、不加描述）、`help <组>` 看该组详情；交互与一次性都支持；`help <未知组>` → `FMT-001` / 退出码 2 | 交互式里需要一个轻量的「我有哪些命令」，而 `--help` 太重 |
 | 20 | Bucket 有独立标识、删除即丢弃数据（旧文档的口气） | **Bucket 就是目录**：`repository/<user>/<bucket>/`，无独立 ID；删除 = 整个目录移到 `trash/<user>/<bucket>_<时间戳>/`，**数据不丢**；回收站目录名一律带时间戳（同秒再加 `_2`），桶级身份记在 `trash/<user>/.original`，回退是整单判定（目标已存在拒绝，不做部分恢复）；桶级 `trash list` / `get` / `restore` / `delete` 四条命令都已落地（`get` / `delete` 提交 `4fee290`，永久删除要显式确认，且只清 `trash_reason="bucket"` 的 file.json 记录） | 目录本身就是最好的 ID；删除必须可恢复（第 1 节的范围里就写了「回收站」）。**时间戳后缀从「重名才加」改成「一律带」**：否则同一个桶删两次会有两条条目抢同一个回退位置，回退必然撞车 |
@@ -10396,10 +10413,10 @@ blocked 的情况     歧义（file.delete）、同名冲突 / 随桶删除 / �
 | 结构化输出 | **V1 不做**：没有 `--json`，也不预留参数名；机器可读通道是命令退出码（`0` / 未安装 `FMT-601` → `8`），人类可读通道是固定顺序的几行文本，见第 70、127.4 节 |
 | 双击引导 | 单实例 → 数据根体检与补齐 → 查 SCM（走 `query_status()`；未安装 install / 运行中不动 / 已安装未运行提权 start 并用 `settle_state()` 等它落定）→ 仍没起读失败编号，命中数据根/配置类错误码（FMT-005/006/007/008/009/011/013/014）不重装、其余提权 reinstall 一次 → 宿主 exe 丢失询问 reinstall → hello 声明数据根 → 横幅与提示符，见第 75 节 |
 | 服务状态文件 | `%ProgramData%\FMT\service.json`（当前数据根 + 安装信息），不属于业务数据 |
-| 横幅与版本 | 程序名固定 `File Manager Tool`，横幅与 `--version` 共用 `banner_text()`：`File Manager Tool  v1.0  ( build  <CMake 配置时生成的日期> )`；日期来自 `FMT_BUILD_DATE`（`%Y.%m.%d` 本地时间）→ `version.hpp` 的 `BUILD_DATE`；用法标题 `用法：fmt.exe [命令]`，见第 127.1 节 |
+| 横幅与版本 | 程序名固定 `File Manager Tool`，横幅与 `--version` 共用 `banner_text()`：`File Manager Tool  v3.0.0  ( build  <CMake 配置时生成的日期> )`；日期来自 `FMT_BUILD_DATE`（`%Y.%m.%d` 本地时间）→ `version.hpp` 的 `BUILD_DATE`；用法标题 `用法：fmt.exe [命令]`，见第 127.1 节 |
 | 控制台约定 | 控制台只留交互与异常：横幅、提示符、命令结果、stderr 上的异常。双击时的数据根体检结果（新建目录 / 新建文件 / 完整）、服务当前状态只进日志（模块 `Cli` / `Service`）；**换根通知是例外**（提交 `8f2fbc5`）：切换时 stderr 打印 `root_switch_notice()`，交互窗口横幅永远显示「数据根：…」（**原口径「换根通知也只进日志」已作废**），见第 65、127.1 节 |
-| help 命令 | `--help` 打印带横幅与退出码表的完整用法（内含命令总览）；`help` 不带参数只列命令、`help <组>` 打印该组详情（`service` / `bucket` / `file` / `share` / `trash` / `help` / `version` / `exit`），交互式与一次性都支持，不提权、不连服务、不写日志；`help <未知组>` → stderr 一行 + `FMT-001` / 退出码 2；`exit` / `quit` 是正式命令，见第 68、95、127.2 节 |
-| CLI 界面 | 横幅 `File Manager Tool  v1.0  ( build  2026.10.09 )` + `Service Running...` + **`数据根：…`**（提交 `8f2fbc5`），提示符 `fmt> `（打印前先输出一个空行，空命令不重复空行），正常 → stdout / 错误 → stderr，见第 127 节 |
+| help 命令 | `--help` 打印带横幅与退出码表的完整用法（内含命令总览）；`help` 不带参数只列命令、`help <组>` 打印该组详情（`service` / `bucket` / `file` / `upload` / `share` / `trash` / `help` / `version` / `exit`），交互式与一次性都支持，不提权、不连服务、不写日志；`help <未知组>` → stderr 一行 + `FMT-001` / 退出码 2；`exit` / `quit` 是正式命令，见第 68、95、127.2 节 |
+| CLI 界面 | 横幅 `File Manager Tool  v3.0.0  ( build  2026.10.09 )` + `Service Running...` + **`数据根：…`**（提交 `8f2fbc5`），提示符 `fmt> `（打印前先输出一个空行，空命令不重复空行），正常 → stdout / 错误 → stderr，见第 127 节 |
 | Bucket 名称统一小写（提交 `9c3d2cb`） | `create` 先 `to_lower()`（只折叠 ASCII）再校验再建目录，`WORK` 建成 `work`，`renamed` 为真时回 `note` 让 CLI 提示；`use` / `get` / `delete` 用 `canonical_name()` 规范化到**磁盘上的实际名字**，`current_bucket`、`file.json` 的 `bucket`、`.original` 的 `original` 只留一份拼写，见第 27～30 节 |
 | 文件名的保留形状（提交 `9c3d2cb`） | 与 `file_id` 同形（`fmt-YYYYMMDD-N`）的名字是**保留形状**：上传时 `FMT-106 FileNameLikeFileId` 拒绝（退出码 2，`looks_like_file_id()`，属 `FMT-1xx` 文件名校验、与 Windows 保留设备名同类）；旧数据里已有的这种名字，`file delete` 在两条索引命中不同记录时报 `FMT-001` 歧义并点名两条记录，**只给 delete 加**，见第 25、42、43 节 |
 | `file get` 的回收站字段（提交 `9c3d2cb`） | 命中回收站记录时在 `is_trash` / `trash_reason` 之外**增加** `trash_path`（相对数据根、正斜杠）；仓库里没有该文件时**不返回** `path`（设计如此），CLI 多打一行「回收站路径：…」。按 `file_id` 查是全局含回收站、按文件名只查当前用户的正常文件，见第 42 节 |
@@ -10408,6 +10425,97 @@ blocked 的情况     歧义（file.delete）、同名冲突 / 随桶删除 / �
 | 粘贴污染清理与不可见字符（提交 `a9af276`） | `clean_user_path()` 清掉不可见格式字符（`U+00A0` / `U+00AD` / `U+200B`–`U+200F` / `U+202A`–`U+202E` / `U+2060`–`U+2064` / `U+2066`–`U+2069` / `U+FEFF`）与**成对**引号、首尾空白；在 `argument()`（所有位置参数的唯一入口，CLI 与 HTTP 共用）一处收口，`prepare_upload()` 再清一次来源与显式文件名。清掉后仍找不到 → `FMT-002` 且**点名码位**（`U+202A`、`U+202C`…）；**名字里不允许**这些字符：`validate_file_name()` → `FMT-101`、`validate_bucket_name()` → `FMT-202`。见第 25、33.2、35 节 |
 | 回收站是一份两级视图（提交 `0fc242b`；列表计数 `18f16ca`） | 新建 `src/trash/` 的 `TrashService`：组合 `FileService`（文件级，权威 = `file.json`，含 `deleted_at`）与 `BucketService`（桶级，权威 = `trash/<user>/.original`），合并 `TrashEntry` 列表 + 跨命名空间标识解析；**`data/trash.json` 不再写入**（只读兼容）。`trash.list` → `{entries, count, files, buckets}` 并标出 `[文件]` / `[桶]`；**桶级条目的 `files`/`bytes` 在列表里就对每个 `present` 条目遍历一次目录算出来**（代价：`trash list` 不是纯索引查询，显式命令可接受）；`get` / `restore` / `delete` → `{entry, message?}`；回退的三种硬拒绝（`FMT-401` / `FMT-402` / `FMT-002`）都是 `blocked`；`bucket.delete` 也有预检（非空桶提醒「只能整体恢复这个桶」，缺 `force` → `FMT-016`），见第 30、52～55、59 节 |
 | 目标 Bucket 已存在时回退改走**合并**（本次修复，取代原来的 `FMT-401` 整单拒绝） | **问题**：`file delete a3.jpg` → `bucket delete test` → `trash restore a3.jpg`（这一步会把 `repository/<用户>/test/` 建出来）→ `trash restore test` 得到「FMT-401 回退失败：Bucket 已存在」——回收站里的其它文件一个都拿不回来。**新口径**：目标 Bucket 已存在不再等于失败，而是**合并**——`BucketService::check_merge()` 只读预检数出「要搬几个、目标已有几个、占多少字节」，并同时按磁盘文件树与目标路径两处判定同名冲突；有冲突 → **`FMT-403 RestoreMergeConflict`**（退出码 4、HTTP 409，**一个文件都不搬**，消息列出冲突名字并提示改名或永久删除）；没冲突 → `needs_confirm`，缺 `force` → `FMT-016`，确认后 `merge()` 逐个搬文件进目标桶（**不覆盖、不改名**），全部搬完才摘 `.original`、只翻真正搬过去的 `file.json` 记录、收掉只剩空目录的条目。CLI 把 `trash.restore` 加进「先预检再确认」清单（普通回退预检 `needs_confirm=false`，不受影响）。服务端闸门是 `TrashService::restore(identifier, confirmed)`；预检多带 `merge` / `merge_target_exists` / `merge_files` / `merge_bytes` / `target_files` / `conflicts?`。见第 54～56.3、112、113 节 | 目标桶往往就是**回退文件时顺手建出来的空目录**，它不该把整桶数据锁死；但「自动合并」会在用户没看见的情况下改动现有桶，「自动改名」会让 `file.json` 的 `bucket` 与磁盘路径对不上——所以合并**必须确认**、冲突**必须由用户处理**。`FMT-403` 不动 `FMT-401` 的编号与语义（文件级回退撞名仍然是 `FMT-401`），只是按「编号只能追加」的规矩补一个新的下位错误码 |
+
+# 129. v3.0.0 大文件分片上传
+
+**需求口径**：`file upload` 是一次请求、受 `max_upload_size`（默认 50 MB）限制；v3.0.0 要
+支持大文件**分片、暂停、续传、进度**，并让 CLI 与 HTTP（Java SDK）共用同一套会话存储。
+
+## 129.1 命令语义
+
+```text
+upload start <本地文件> [文件名] [--chunk-size 8MB] [--wait]
+upload status|pause|resume|cancel <upload_id>
+upload list [--all]
+upload wait <upload_id>
+```
+
+- `upload start` 先取文件大小：**≤ `max_upload_size` 自动走 `file.upload`**，不创建会话；
+  大文件才 `upload.start`（服务端起后台线程切片）。
+- `--chunk-size` 是 CLI 本地解析后放进 `args.chunk_size` 的请求参数，不是服务端全局配置；
+  服务端会夹在 64 KB～64 MB，且不超过文件大小。
+- `--wait` 与 `upload wait` 是同一套轮询：每 250 ms 取一次 `upload.status`，渲染
+  进度条、速度、ETA、分片数；输出被重定向时按 5% 采样，暂停时退出并提示 `upload resume`。
+- `upload list` 默认把同一 `final_file_id` 或相同 MD5 的历史合并成一行（`duplicate_count`），
+  `--all` 展开；HTTP 会话带 `origin=http`，CLI 打印 `[HTTP]`。
+
+## 129.2 会话状态机与落盘
+
+```text
+uploading ──pause──▶ paused ──resume──▶ uploading
+    │                   │
+    ├──complete────────▶ completing ──成功──▶ completed
+    │                        └──失败──▶ error（清分片，可 resume 从源文件重传）
+    └──cancel──────────▶ canceled（清分片；已完成不能取消）
+```
+
+- 目录：`<数据根>/temp/upload-sessions/<upload_id>/{session.json,chunks/*.part}`。
+- `session.json` 的字段见 `FMT 技术文档.md` 第 18.49 节；`received[]` / `chunk_hashes[]`
+  与 `chunk_count` 等长，`session.json` 与分片一起构成续传依据。
+- **每个分片写盘时记录 MD5**，拼接时逐片复核；坏片删除并清空该片状态，`resume` 会重传。
+- 整文件 MD5 开始算一次（秒传/改名）、完成再校验一次；不一致 → `error`（HTTP `409 FMT-806`）。
+- 服务重启时把 `uploading` / `completing` 改成 `paused`，`resume` 重新起 worker；
+  `error` 状态启动时清掉残片；过期会话（`upload_session_ttl_seconds`，默认 24h）在下次访问时清理。
+- 每用户活动会话上限 `upload_max_active_per_user`（默认 4）；单文件上限
+  `max_large_upload_size`（默认 8 GB）。
+
+## 129.3 入库规则（与普通上传一致）
+
+- 桶内已有**相同内容**（MD5）→ 直接复用，不重复入库（`upload start` 的秒传快路径）。
+- 同名但内容不同 → **开始传之前**就把目标名改成 `name01.ext`，避免传完才冲突。
+- 完成后仍走 `FileService::commit_upload`：一次移动入库、写 `file.json`、登记 file_id。
+- `file delete <upload_id>` 对 **completed** 会话解析成 `final_file_id` 再软删除；
+  解析前用 `verified_file_id()` 核对 size/md5，防止 file_id 被回收复用后删错。
+- 会话以创建时的 **user + bucket** 绑定；CLI 之后切换 Bucket 不影响它。
+
+## 129.4 HTTP 与 Java SDK
+
+```text
+POST   /api/upload/init                {file_name,size,chunk_size?,md5?}
+GET    /api/upload/list[?all=1]
+GET    /api/upload/<upload_id>
+PUT    /api/upload/<upload_id>/chunk?index=N     body = 原始分片，X-Chunk-MD5 可选
+POST   /api/upload/<upload_id>/complete
+POST   /api/upload/<upload_id>/pause | /resume
+DELETE /api/upload/<upload_id>
+```
+
+- 全部要 token；用户取 token 身份，Bucket 取 `X-FMT-Bucket` 或会话 token 的登录桶。
+  跨用户 / 跨 Bucket 一律 `404 + FMT-800`。
+- HTTP 会话没有本地源文件，`pause/resume` 只切状态；客户端按 `missing` 重传缺片。
+- `upload.complete` 成功返回 `state=completed` + `file_id`；失败直接 `409 + FMT-806`，
+  **不再返回 200 + data.error**。
+- Java：`FmtClient.uploadLarge(Path, name, FmtLargeUploadOptions)` 自动算 MD5、init、
+  逐片 PUT、回调进度、complete；`resumeLargeUpload` / `pauseLargeUpload` /
+  `cancelLargeUpload` / `largeUploadStatus` 对应上面四条会话接口。
+
+## 129.5 错误码
+
+新增 `FMT-800`～`FMT-809`：`UploadSessionNotFound` / `UploadSessionExpired` /
+`ChunkIndexInvalid` / `ChunkMismatch` / `UploadIncomplete` / `UploadCanceled` /
+`UploadStateInvalid` / `UploadMd5Mismatch` / `InsufficientStorage` /
+`UploadLimitExceeded`。HTTP 映射见 `FMT 技术文档.md` 第 12.5 节。
+
+## 129.6 验证与边界
+
+- C++ **200 项全绿**：分片会话完成 / 取消 / 暂停跨重启续传 / 分片损坏重传 /
+  内容与名字校验 / 桶目录校验 / HTTP 全链路 / 60 MB 真实 exe 端到端。
+- Java `FmtLargeUploadTest` 覆盖 init、逐片、暂停、取消、续传与进度回调。
+- **不做**：多线程并发上传同一会话、分片级断点重试（客户端自行实现）、
+  HTTP 会话的服务端本地源文件（只服务 `upload start`）。
+- 四个分片参数目前只能改 `config/config.json`，`config set` 未开放。
+
+---
 
 ## 附录 A.1 错误码枚举
 
@@ -10436,8 +10544,12 @@ enum class ErrorCode {
     // FMT-300 ~ FMT-305：上传下载
     // FMT-400 ~ FMT-403：Trash（403 = 合并回退撞上同名文件，见第 56.3 节）
     // FMT-500 ~ FMT-503：Share
-    // FMT-600 ~ FMT-603：Service
+    // FMT-600 ~ FMT-604：Service
     // FMT-700 ~ FMT-701：HTTP
+    // FMT-800 ~ FMT-809：分片上传（v3.0.0；800 会话不存在 / 801 已过期 /
+    //   802 分片下标非法 / 803 分片大小或 MD5 不匹配 / 804 分片不完整 /
+    //   805 已取消 / 806 状态不允许 / 807 整文件 MD5 不匹配 /
+    //   808 磁盘空间不足 / 809 超过大文件或活动会话上限）
 };
 ```
 

@@ -375,6 +375,7 @@ GET /api/ping
 | 列桶 / 看当前桶 | `fmt.listBuckets()` | `GET /api/bucket`（**只读**） |
 | 清空回收站 | `fmt.emptyTrash(dryRun, force)` | `DELETE /api/trash/empty[?dry_run=1\|force=1]` |
 | 上传字节/流 | `fmt.upload(byte[], name)` / `fmt.upload(InputStream, name)` | `POST /api/file/upload?name=<编码后的文件名>`，**请求体就是文件内容**；流走 `Transfer-Encoding: chunked`。**SDK 不收 `Path`**（安全口径，见下）。服务端**也收** `multipart/form-data`（取第一个带 `filename` 的 part，Postman / 浏览器表单 / Spring 的 `MultipartFile` 直接可用），但 **SDK 仍然只推裸字节**——这样大文件不必先拼进内存、也不过一遍 multipart 编解码；Demo 从 `MultipartFile` 取出流再交给 SDK（见下） |
+| 大文件分片 | `fmt.uploadLarge(Path, name, options)` / `resumeLargeUpload` / `pauseLargeUpload` / `cancelLargeUpload` / `largeUploadStatus` | `POST /api/upload/init` → `PUT /api/upload/<id>/chunk?index=N` → `POST /api/upload/<id>/complete`；暂停/继续/取消/查询各一条（v3.0.0） |
 | 列文件 | `fmt.listFiles(FileQuery)` | `GET /api/file?search=&sort=&page=&page_size=` |
 | 单条信息 | `fmt.getFile(id)` | `GET /api/file/<id或名>`（含相对数据根的 `path`） |
 | 下载 | `fmt.download(id, target, overwrite)` | `GET /api/file/<…>/download`（流式落盘，先 `.part` 再改名） |
@@ -445,6 +446,43 @@ GET /api/ping
 | 上传（`byte[]`） | 不整块进内存（`BodyPublishers.ofByteArray`） | 带 `Content-Length`，服务端可提前拦超限 |
 | 上传（`InputStream`） | 不整块进内存 | `chunked`；**不参与 401 重试** |
 | 下载/预览 | 流式写盘（`BodyHandlers.ofInputStream` + `transferTo`） | 先写 `<name>.part`，校验 `Content-Length` 一致后 `Files.move` 到目标；不一致/中断则删掉半成品，抛 `FmtTransportException` |
+
+#### 5.3.1 大文件分片（v3.0.0）
+
+`upload(...)` 仍然是一次 HTTP 请求；超过 FMT 的 `max_upload_size`（默认 50 MB）时用
+`uploadLarge(...)`：
+
+```java
+try (FmtClient fmt = new FmtClient("lazy", "123456", "pet")) {
+    FmtFilePackage pkg = fmt.uploadLarge(
+            Path.of("D:/big.rar"), "big.rar",
+            FmtLargeUploadOptions.builder()
+                    .chunkSize(8L * 1024 * 1024)
+                    .progress(p -> System.out.printf("%d%% %d/%d%n",
+                            p.percent(), p.chunkIndex() + 1, p.chunkCount()))
+                    .build());
+}
+```
+
+流程：客户端先算整文件 MD5 → `POST /api/upload/init`（带 `file_name/size/md5`）→ 按
+`received`/`missing` 逐片 `PUT`（每片带 `X-Chunk-MD5`）→ `POST .../complete`。
+服务端会拼接、逐片复核、整文件 MD5 校验，再按与普通上传相同的规则入库（同内容秒传、
+同名不同内容自动 `name01.ext`）。
+
+断点续传与暂停：
+
+```java
+FmtUploadSession s = fmt.largeUploadStatus(uploadId);
+if ("paused".equals(s.state()) || s.failed()) {
+    fmt.resumeLargeUpload(path, uploadId);       // 只补 missing 里的分片
+}
+fmt.pauseLargeUpload(uploadId);
+fmt.cancelLargeUpload(uploadId);                 // 取消并清理临时分片
+```
+
+边界：文件大小必须与会话一致；`complete` 失败（分片损坏 / MD5 不符）服务端返回
+`409 + FMT-806`，不会用 200 假装成功；HTTP 会话的 `resume` 只切状态，缺片由客户端重传；
+会话默认 24h 过期、单文件 8 GB、每用户 4 个活动会话。
 
 ### 5.4 并发与幂等
 
@@ -642,8 +680,10 @@ POST <url>  X-FMT-Signature: HMAC-SHA256(secret, body)   负载 {"event":"file.u
 | `fallsBackToTheOtherLoopbackFamilyWhenLocalhostResolvesToTheDeadOne` | 真机教训固化：stub **只绑 `::1`**，通道用 `localhost` 也要能通（换地址重试） |
 | `CandidateAddressesTest` | 候选地址计算：字面 IP 只有一个、主机名保留原样并补上解析结果、端口/路径不丢 |
 | `SdkModelJacksonTest`（starter） | record 模型能被宿主 Jackson 干净序列化，布尔助手不会覆盖同名字段（`bucket` 不再是 `false`） |
+| `FmtLargeUploadTest`（v3.0.0） | 大文件分片：init / 逐片 PUT / 暂停 / 取消 / 断点续传 / 进度回调 / 失败会话 |
 
-> Java 侧共 **75 项**（core 66 + starter 9），全绿；C++ 侧 **162 项**，`ctest` 100% 通过。
+> **v3.0.0 当前**：Java 侧共 **111 项**（core 83 + starter 28），全绿；C++ 侧 **200 项**，
+> `ctest` 100% 通过。
 
 ### 10.2 真机 smoke（**已实测**，2026-10-10）
 
@@ -809,7 +849,7 @@ user.json」）。所以对着**旧 exe** 跑，桥接侧看到的是（都是**
 
 | 场景 | 做法 |
 |---|---|
-| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:2.4.0` |
+| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:3.0.0` |
 | 不想动私服 | `mvn install:install-file` 把两个 jar 装进本地仓库，或直接 `<scope>system</scope>`（不推荐） |
 | 只在非 Spring 项目用 | 只依赖 `fmt-client-core`（零依赖，Java 17+） |
 | 当独立桥接服务跑 | `java -jar fmt-bridge.jar`（demo 模块打成可执行 jar），别的系统调它的 REST |

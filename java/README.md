@@ -1,5 +1,7 @@
 # FMT Java 客户端（jar）
 
+> 当前版本：**3.0.0**（v3.0.0 新增 `FmtClient.uploadLarge(...)` 大文件分片续传）。
+
 把 FMT 的 HTTP 服务接进 Java / Spring Boot 项目：**建一条通道，token 交给通道**，
 之后业务代码里再也看不到 token。
 
@@ -47,26 +49,22 @@ try (FmtClient fmt = new FmtClient("lazy", "123456", "pet")) {
 
 ## 1. 前置条件（FMT 侧）
 
-1. **打开 HTTP**（默认关闭）：数据根下 `config/server.json`
+1. **确认 HTTP 已打开**（新数据根默认就是开的）：数据根下 `config/server.json`
 
    ```json
    { "version": 1, "enabled": true, "host": "localhost", "port": 4122 }
    ```
 
-2. **重启服务**（改完配置必须重启，需要管理员）：
+   关闭过就用 `fmt.exe config set server_enabled true`（CLI 会自动重启服务），或手工改文件后
+   执行 `service stop` → `service start`。
+
+2. **拿到 token**：
 
    ```powershell
-   fmt.exe service stop
-   fmt.exe service start
+   fmt.exe config list --show-token   # 默认隐藏 token，显式加 --show-token 才打印
    ```
 
-3. **拿到 token**：
-
-   ```powershell
-   fmt.exe config list      # 打印「用户 ID / 访问 token / 建议的请求头」
-   ```
-
-4. 确认服务在：
+3. 确认服务在：
 
    ```powershell
    Invoke-WebRequest http://localhost:4122/api/ping    # 公开接口，不需要 token
@@ -85,7 +83,7 @@ try (FmtClient fmt = new FmtClient("lazy", "123456", "pet")) {
 <dependency>
   <groupId>org.lazy</groupId>
   <artifactId>fmt-spring-boot-starter</artifactId>
-  <version>2.4.0</version>
+  <version>3.0.0</version>
 </dependency>
 ```
 
@@ -228,11 +226,11 @@ try (FmtChannel fmt = Fmt.channel(core)) {
 ```powershell
 # 对着假 FMT 联调（不碰真服务）
 java java\tools\fake-fmt\FakeFmt.java 14122
-java -cp java\fmt-client-core\target\fmt-client-core-2.4.0.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-3.0.0.jar java\tools\FmtDemo.java `
      --base-url=http://127.0.0.1:14122 --token=test-token-1234567890abcdef --keep
 
 # 对着真服务：地址 + 数据根（token 从 <数据根>/data/user.json 读）
-java -cp java\fmt-client-core\target\fmt-client-core-2.4.0.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-3.0.0.jar java\tools\FmtDemo.java `
      --data-root=D:\Data\Temp\JMT\fmt --out-dir=D:\tmp\fmt-demo
 ```
 
@@ -447,7 +445,7 @@ java -jar fmt-client-demo/target/fmt-bridge.jar `
 WARN org.lazy.fmt.client : 连接 http://localhost:4122 被拒，改用 http://127.0.0.1:4122 重试（GET /api/ping）
 WARN org.lazy.fmt.client : 连接 http://127.0.0.1:4122 被拒，改用 http://[0:0:0:0:0:0:0:1]:4122 重试（GET /api/ping）
 [fmt-smoke] GET /api/ping：ok（公开接口，不需要 token）
-[fmt-smoke] GET /api/status：数据根=D:/Data/Temp/JMT/fmt，版本=2.0.0，pid=23420
+[fmt-smoke] GET /api/status：数据根=D:/Data/Temp/JMT/fmt，版本=3.0.0，pid=23420
 [fmt-smoke] GET /api/file：2 个文件（共 2）
 [fmt-smoke]   · fmt-20261008-2  17364485.jpg  3889891 B
 [fmt-smoke]   · fmt-20261008-0  asdva.jpg  130184 B

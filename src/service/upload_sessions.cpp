@@ -74,8 +74,13 @@ UploadSessionManager::UploadSessionManager(PathManager paths, Config config, Log
 UploadSessionManager::~UploadSessionManager() { stop(); }
 
 void UploadSessionManager::set_config(const Config& config) {
-    std::lock_guard<std::mutex> guard(mutex_);
+    std::lock_guard<std::mutex> guard(config_mutex_);
     config_ = config;
+}
+
+Config UploadSessionManager::config_snapshot() const {
+    std::lock_guard<std::mutex> guard(config_mutex_);
+    return config_;
 }
 
 void UploadSessionManager::stop() {
@@ -127,8 +132,9 @@ bool UploadSessionManager::is_expired(const Session& session) const {
 
 void UploadSessionManager::touch(Session& session) const {
     session.updated_at = local_datetime_iso();
-    session.expires_at =
-        local_datetime_iso_after_seconds(static_cast<std::int64_t>(config_.upload_session_ttl_seconds));
+    const Config settings = config_snapshot();
+    session.expires_at = local_datetime_iso_after_seconds(
+        static_cast<std::int64_t>(settings.upload_session_ttl_seconds));
 }
 
 nlohmann::json UploadSessionManager::session_json(const Session& session,
@@ -329,6 +335,11 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args,
     if (bucket.empty()) {
         return make_error(ErrorCode::NoCurrentBucket, "未设置当前 Bucket");
     }
+    // HTTP 的 X-FMT-Bucket 也会走到这里；先做名称校验，禁止路径分隔符 / .. 拼出
+    // repository 之外的目录。
+    if (const Status valid = validate_bucket_name(bucket); !ok(valid)) {
+        return *error_of(valid);
+    }
     // 大文件开始前先确认桶目录仍在：user delete / 手工删目录后，
     // config.json 里的旧桶名可能已经失效，不能等 7GB 传完才在 commit 报错。
     {
@@ -341,7 +352,7 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args,
                                   "；请先 bucket create / bucket use");
         }
     }
-    Config request_config = config_;
+    Config request_config = config_snapshot();
     request_config.current_user = user;
     request_config.current_bucket = bucket;
 
@@ -376,10 +387,10 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args,
         return make_error(ErrorCode::StorageError, "读取文件大小失败：" + source_text);
     }
     const std::uint64_t size = static_cast<std::uint64_t>(raw_size);
-    if (size > config_.max_large_upload_size) {
+    if (size > request_config.max_large_upload_size) {
         return make_error(ErrorCode::UploadLimitExceeded,
                           "文件超过大文件上限：" + std::to_string(size) + " > " +
-                              std::to_string(config_.max_large_upload_size));
+                              std::to_string(request_config.max_large_upload_size));
     }
 
     std::int64_t source_mtime = 0;
@@ -441,7 +452,7 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args,
 
     std::uint64_t chunk_size = args.value("chunk_size", std::uint64_t{0});
     if (chunk_size == 0) {
-        chunk_size = config_.upload_chunk_size;
+        chunk_size = request_config.upload_chunk_size;
     }
     chunk_size = std::max(kMinChunkSize, std::min(chunk_size, kMaxChunkSize));
     if (size > 0 && chunk_size > size) {
@@ -462,10 +473,10 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args,
             }
         }
     }
-    if (active >= config_.upload_max_active_per_user) {
+    if (active >= request_config.upload_max_active_per_user) {
         return make_error(ErrorCode::UploadLimitExceeded,
                           "活动上传会话过多（上限 " +
-                              std::to_string(config_.upload_max_active_per_user) + "）");
+                              std::to_string(request_config.upload_max_active_per_user) + "）");
     }
 
     // 完成时需要分片 + 拼接临时文件两份空间；先拒绝，避免传到一半才炸。
@@ -518,6 +529,9 @@ Result<nlohmann::json> UploadSessionManager::init_for(const nlohmann::json& args
     if (bucket.empty()) {
         return make_error(ErrorCode::NoCurrentBucket, "未设置当前 Bucket");
     }
+    if (const Status valid = validate_bucket_name(bucket); !ok(valid)) {
+        return *error_of(valid);
+    }
     std::error_code bucket_code;
     const std::filesystem::path bucket_dir =
         paths_.repository() / path_from_utf8(user) / path_from_utf8(bucket);
@@ -537,15 +551,16 @@ Result<nlohmann::json> UploadSessionManager::init_for(const nlohmann::json& args
         return *error_of(valid);
     }
 
+    const Config settings = config_snapshot();
     const std::uint64_t size = args.value("size", std::uint64_t{0});
-    if (size > config_.max_large_upload_size) {
+    if (size > settings.max_large_upload_size) {
         return make_error(ErrorCode::UploadLimitExceeded,
                           "文件超过大文件上限：" + std::to_string(size) + " > " +
-                              std::to_string(config_.max_large_upload_size));
+                              std::to_string(settings.max_large_upload_size));
     }
     std::uint64_t chunk_size = args.value("chunk_size", std::uint64_t{0});
     if (chunk_size == 0) {
-        chunk_size = config_.upload_chunk_size;
+        chunk_size = settings.upload_chunk_size;
     }
     chunk_size = std::max(kMinChunkSize, std::min(chunk_size, kMaxChunkSize));
     if (size > 0 && chunk_size > size) {
@@ -558,7 +573,7 @@ Result<nlohmann::json> UploadSessionManager::init_for(const nlohmann::json& args
     if (!md5.empty()) {
         std::lock_guard<std::mutex> guard(mutex_);
         cleanup_expired_locked();
-        Config request_config = config_;
+        Config request_config = config_snapshot();
         request_config.current_user = user;
         request_config.current_bucket = bucket;
         FileService files(paths_, request_config, logger_);
@@ -598,10 +613,10 @@ Result<nlohmann::json> UploadSessionManager::init_for(const nlohmann::json& args
             }
         }
     }
-    if (active >= config_.upload_max_active_per_user) {
+    if (active >= settings.upload_max_active_per_user) {
         return make_error(ErrorCode::UploadLimitExceeded,
                           "活动上传会话过多（上限 " +
-                              std::to_string(config_.upload_max_active_per_user) + "）");
+                              std::to_string(settings.upload_max_active_per_user) + "）");
     }
 
     const std::filesystem::space_info space = std::filesystem::space(paths_.temp(), bucket_code);
@@ -705,7 +720,8 @@ Result<nlohmann::json> UploadSessionManager::put_chunk_for(const std::string& up
 }
 
 Result<nlohmann::json> UploadSessionManager::lookup(const std::string& upload_id) {
-    return lookup_for(upload_id, config_.current_user, config_.current_bucket);
+    const Config settings = config_snapshot();
+    return lookup_for(upload_id, settings.current_user, settings.current_bucket);
 }
 
 Result<nlohmann::json> UploadSessionManager::lookup_for(const std::string& upload_id,
@@ -718,7 +734,7 @@ std::size_t UploadSessionManager::prune_missing_files(const std::string& user,
                                                        const std::string& bucket) {
     std::lock_guard<std::mutex> guard(mutex_);
     cleanup_expired_locked();
-    Config config = config_;
+    Config config = config_snapshot();
     config.current_user = user;
     if (!bucket.empty()) {
         config.current_bucket = bucket;
@@ -778,7 +794,8 @@ Result<nlohmann::json> UploadSessionManager::list(bool all, const std::string& u
     std::unordered_map<std::string, std::size_t> seen_final;
     std::unordered_map<std::string, std::size_t> seen_md5;
     std::vector<std::string> stale;
-    Config list_config = config_;
+    std::size_t owned_total = 0;
+    Config list_config = config_snapshot();
     list_config.current_user = user;
     list_config.current_bucket = bucket;
     for (const auto& item : sessions_) {
@@ -786,6 +803,7 @@ Result<nlohmann::json> UploadSessionManager::list(bool all, const std::string& u
         if (!owned(session, user, bucket)) {
             continue;
         }
+        ++owned_total;
         if (!all && session.state == "canceled") {
             continue;
         }
@@ -856,7 +874,7 @@ Result<nlohmann::json> UploadSessionManager::list(bool all, const std::string& u
     nlohmann::json data = nlohmann::json::object();
     data["uploads"] = std::move(uploads);
     data["count"] = data["uploads"].size();
-    data["total_sessions"] = sessions_.size();
+    data["total_sessions"] = owned_total;
     data["all"] = all;
     return data;
 }
@@ -1022,6 +1040,12 @@ Result<nlohmann::json> UploadSessionManager::complete(const std::string& id,
         if (found->second.state == "completed") {
             return session_json(found->second, false);
         }
+        // 两路 complete 同时进来会让两次拼接写同一个 fmt-upload-*.tmp，
+        // 后到的直接拒绝；调用方轮询 status 等前一次结束。
+        if (found->second.state == "completing") {
+            return make_error(ErrorCode::UploadStateInvalid,
+                              "上传正在完成，请稍后用 upload status 查询");
+        }
         found->second.state = "completing";
         touch(found->second);
         if (const Status saved = save_session(found->second); !ok(saved)) {
@@ -1029,7 +1053,16 @@ Result<nlohmann::json> UploadSessionManager::complete(const std::string& id,
         }
     }
     complete_in_worker(id);
-    return status(id, user, bucket);
+    Result<nlohmann::json> done = status(id, user, bucket);
+    if (!ok(done)) {
+        return done;
+    }
+    const nlohmann::json& data = std::get<nlohmann::json>(done);
+    if (data.value("state", std::string{}) == "error") {
+        return make_error(ErrorCode::UploadStateInvalid,
+                          data.value("error", std::string{"上传完成失败"}));
+    }
+    return done;
 }
 
 bool UploadSessionManager::all_received(const Session& session) const {
@@ -1074,7 +1107,7 @@ Result<std::string> UploadSessionManager::verified_file_id(const std::string& up
     if (session.state != "completed" || session.final_file_id.empty()) {
         return make_error(ErrorCode::UploadStateInvalid, "上传会话尚未完成：" + upload_id);
     }
-    Config config = config_;
+    Config config = config_snapshot();
     config.current_user = user;
     config.current_bucket = bucket;
     FileService files(paths_, config, logger_);
@@ -1326,7 +1359,7 @@ bool UploadSessionManager::prepare_target(const std::string& id, const std::stri
         snapshot = found->second;
     }
 
-    Config commit_config = config_;
+    Config commit_config = config_snapshot();
     commit_config.current_user = snapshot.user;
     commit_config.current_bucket = snapshot.bucket;
     FileService files(paths_, commit_config, logger_);
@@ -1483,7 +1516,7 @@ void UploadSessionManager::complete_in_worker(const std::string& id) {
         prepared.md5 = md5;
 
         // 会话绑定创建时的 user/bucket；CLI 之后切换当前 Bucket 不能影响它。
-        Config commit_config = config_;
+        Config commit_config = config_snapshot();
         commit_config.current_user = snapshot.user;
         commit_config.current_bucket = snapshot.bucket;
         FileService files(paths_, commit_config, logger_);
@@ -1576,7 +1609,8 @@ void UploadSessionManager::cleanup_session_files(const std::string& id) const {
 
 Result<nlohmann::json> UploadSessionManager::handle(const std::string& operation,
                                                      const nlohmann::json& args) {
-    return handle_for(operation, args, config_.current_user, config_.current_bucket);
+    const Config settings = config_snapshot();
+    return handle_for(operation, args, settings.current_user, settings.current_bucket);
 }
 
 Result<nlohmann::json> UploadSessionManager::handle_for(const std::string& operation,

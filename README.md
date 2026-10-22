@@ -1,5 +1,7 @@
 # FMT — Windows 文件管理工具
 
+> 当前版本：**v3.0.0**（2026-10-23）——新增大文件分片续传；C++ 200 项、Java 111 项测试全绿。
+
 一个**单文件**（`fmt.exe`）的本地文件管理工具：既是命令行，也是 Windows 服务，
 还带一套给程序调用的 HTTP 接口。没有安装包、没有第三方 DLL、没有运行库依赖。
 
@@ -9,8 +11,8 @@
 | 语言与构建 | C++17 · CMake ≥ 3.20 · Ninja · MSVC（`/MT` 静态链接运行库） |
 | 依赖 | 只用 Windows 自带组件（WinHTTP + Schannel 下载、CNG/bcrypt 随机数与哈希、`cpp-httplib` 单头文件已 vendored） |
 | 接口 | CLI 走命名管道 `\\.\pipe\fmt.control`；HTTP 走 `localhost:4122`（**默认打开**，可用 `config set server_enabled false` 关闭） |
-| 业务 | Bucket、File、Trash、Share、Config |
-| 测试 | 176 个用例，全绿 |
+| 业务 | Bucket、File、Trash、Share、Config，以及**大文件分片续传**（v3.0.0） |
+| 测试 | 200 个用例，全绿 |
 | 设计文档 | [技术文档](<docx/FMT 技术文档.md>) · [开发文档](<docx/FMT 开发文档.md>) · [项目架构](<docx/FMT 项目架构.md>) |
 
 ---
@@ -96,6 +98,7 @@ cmake --build --preset debug
 | `user` | `create` `get` `update password` `delete` `token renew` |
 | `bucket` | `create` `list` `get` `use` `delete` |
 | `file` | `upload` `list` `get` `delete` |
+| `upload` | `start` `status` `list` `pause` `resume` `cancel` `wait`（大文件分片） |
 | `trash` | `list` `get` `restore` `delete` `empty` |
 | `share` | `create` `get` `list` `delete` |
 | `config` | `list` `set` |
@@ -174,6 +177,39 @@ config set server_enabled true  开/关网络服务；另有 server_host / serve
 log clean [--keep 8MB] [--dry-run]  清理日志（本地执行、不需要服务）
 ```
 
+### 大文件分片上传（v3.0.0）
+
+`file upload` 是**一次 HTTP/管道请求**，受 `max_upload_size`（默认 50 MB）限制。
+超过这个大小的文件用 `upload` 组——服务端按分片接收、逐片校验、可暂停、可跨重启续传：
+
+```text
+upload start <本地文件> [文件名] [--chunk-size 8MB] [--wait]
+upload status <upload_id>       进度、已收分片、缺少的分片与错误
+upload pause <upload_id>        当前分片写完后暂停（算源文件 MD5 时也会尽快停）
+upload resume <upload_id>       从缺少的分片继续；服务重启后也可用
+upload cancel <upload_id>       取消并清理临时分片
+upload list [--all]             列出上传记录（默认合并同一 file_id / MD5 的历史）
+upload wait <upload_id>         前台等它完成，显示进度条、速度与 ETA
+
+# 例：8 MB 分片 + 前台进度条
+fmt.exe -u lazy -p upload start D:\大文件.rar --wait
+```
+
+- **小文件仍自动走旧路径**：`upload start` 发现文件不超过 `max_upload_size` 时，直接发
+  `file.upload`，不建会话；只有大文件才进分片流程。
+- **上限与参数**（`config/config.json`，v3.0.0 新增）：
+  `max_large_upload_size` 默认 **8 GB**、`upload_chunk_size` 默认 **8 MB**、
+  `upload_session_ttl_seconds` 默认 **24 小时**、`upload_max_active_per_user` 默认 **4**。
+  这四项目前**只能编辑 `config.json`**，`config set` 尚未开放。
+- **会话落盘**：`<数据根>/temp/upload-sessions/<upload_id>/session.json` + `chunks/*.part`。
+  服务重启会把「传输中」标成「已暂停」，`upload resume` 继续；过期会话启动时清理。
+- **每个分片写盘时记录 MD5**，拼接时逐片复核；坏片会被丢弃，`upload resume` 重传缺片。
+  整文件 MD5 在开始和完成时各校验一次（同内容秒传也靠它）。
+- **完成后入库**：同名不同内容自动改名（`name01.ext`）；桶内已有相同内容直接复用，
+  返回已有 `file_id`。`file delete <upload_id>` 可以删掉已完成会话对应的文件（软删除）。
+- `upload list` 默认把指向同一 `file_id` 或相同 MD5 的历史合并成一行并标
+  `(N 条历史)`；`--all` 看全部（含已取消）；HTTP 发起的会话标 `[HTTP]`。
+
 **Bucket 是命名空间**：同一个桶里**内容相同的只留一份**，同名的也不能再来一份——
 
 | 当前桶内 | 结果 |
@@ -245,6 +281,11 @@ fmt> config list --show-token               要看 token 时加这个开关
 - `GET /api/ping` —— 健康检查，不要 token
 - `GET /api/share/<share_id>/download` —— 别人拿分享链接下载，**分享链接本身就是凭证**
 
+`/api/upload/*` 全部要 token，并且作用在**请求指定的 Bucket** 上：账号/密码登录得到的
+会话 token 自带登录时选的 Bucket；用 `data/user.json` 的旧 token 时请带
+`X-FMT-Bucket: <桶名>`（不带则用服务端 `current_bucket`）。会话只对**创建它的用户 + Bucket**
+可见，跨用户 / 跨桶一律 404 `FMT-800`。
+
 请求头两种写法都认（**`<token>` 是一个占位符，不是能直接用的值**）：
 
 ```http
@@ -286,6 +327,13 @@ Get-Content '<数据根>\data\user.json' | Select-String token
 | `GET` | `/api/config` | 读配置（**只读**）：当前用户/当前 Bucket/上传上限…**响应里永远没有 token**（连 `?include_token=1` 这种开关都不提供） |
 | `GET` | `/api/bucket` | 列出 Bucket（**只读**）：名称 + 是否当前桶。创建/切换/删除仍然由 CLI 管 |
 | `POST` | `/api/file/upload` | **上传**（两种请求体都收）：① **裸字节**——请求体就是文件内容，文件名用 `?name=` 或 `Content-Disposition`；② **`multipart/form-data`**——Postman 的 form-data / 浏览器表单 / Spring 的 `MultipartFile`，取**第一个带 `filename` 的 part** 的正文（普通文本字段读掉但不落盘）。名字优先级 `?name=` > `Content-Disposition` > part 的 `filename`；没有文件部分 → `FMT-100`，多于一个文件 → `FMT-001` |
+| `POST` | `/api/upload/init` | **大文件分片（v3.0.0）**：初始化会话，请求体 `{"file_name":"x.rar","size":123,"chunk_size":8388608,"md5":"…"}`（后两项可省）；同内容会直接秒传 |
+| `PUT` | `/api/upload/<upload_id>/chunk?index=N` | 上传一个分片：**请求体就是分片字节**，可选 `X-Chunk-MD5`；分片大小必须等于会话的 `chunk_size`（最后一片除外） |
+| `POST` | `/api/upload/<upload_id>/complete` | 拼接、逐片校验、整文件 MD5 校验并入库；成功返回 `state=completed` 与 `file_id` |
+| `POST` | `/api/upload/<upload_id>/pause` / `resume` | 暂停 / 继续（`resume` 只切状态，缺片由客户端重传） |
+| `GET` | `/api/upload/<upload_id>` | 会话状态：`received` / `missing` / `percent` / `error` |
+| `GET` | `/api/upload/list?all=1` | 列出当前 token 用户 + 请求 Bucket 的上传会话 |
+| `DELETE` | `/api/upload/<upload_id>` | 取消会话并清理临时分片 |
 | `GET` | `/api/file` | 列出文件，支持 `?search=` `?sort=` `?page=` `?page_size=` |
 | `GET` | `/api/file/<file_id或文件名>` | 单条文件信息（含相对数据根的 `path`）；按**文件名**只查当前 Bucket，按 `file_id` 全局查 |
 | `GET` | `/api/file/<…>/download` | 下载（流式，`attachment`） |
@@ -371,6 +419,8 @@ D:\Tools\fmt\
 │   ├── fmt.log.1            上一代（清理时会先删它）
 │   └── error.log            仅 ERROR 级（同样轮转、同样清理）
 └── temp/                    临时文件，随时可以清空
+    └── upload-sessions/     大文件分片会话（v3.0.0）
+        └── <upload_id>/     session.json + chunks/*.part；完成后只留 session.json
 ```
 
 **日志不会无限长**：单个文件超过 5 MB 轮转出一代 `.1`；整个 `log/` 还有一条 8 MB 的预算——
@@ -406,10 +456,11 @@ pwsh -File tools/build.ps1 -Test
 # 全部套件名（过滤时用「套件名 + 点」，例如 Service.）
 #   App  Bucket  Cli  CliE2e  Config  ErrorCode  ErrorValue  File  Hash
 #   HttpClient  Ipc  Logger  PathManager  Server  Service  Storage
-#   String  Time  Trash  Validation
+#   String  Time  Trash  User  Validation
 ```
 
-180 个用例，覆盖文件名与路径校验、Bucket/File/Trash/Share 全流程、错误码与退出码、
+200 个用例，覆盖文件名与路径校验、Bucket/File/Trash/Share 全流程、**大文件分片会话
+（暂停 / 续传 / 分片校验 / 秒传 / 取消）**、错误码与退出码、
 账号（建号 / 改密只能一次 / 老账号随机盐兼容）、登录门禁、配置与存储的并发写、
 日志轮转、命名管道协议、HTTP 路由与状态码、认证、流式上传下载、
 以及**用真实 exe + 真实管道**跑的端到端用例。
@@ -469,3 +520,6 @@ docx/            设计文档
 - 预览只支持图片（按扩展名）与文本类（`.txt/.md/.json/.csv/.log/.xml`），其余返回 `FMT-701`；
   **下载不受此限制**，任何类型都能下载。
 - 日志超过 **5MB** 轮转一代（`fmt.log.1`），只保留一代。
+- 大文件分片：单个文件默认上限 **8 GB**、分片默认 **8 MB**、每用户同时最多 **4 个活动会话**、
+  会话 **24 小时**过期；`upload start` 对不超过 `max_upload_size` 的文件仍走单请求 `file.upload`。
+  四个上传参数目前只能改 `config/config.json`，`config set` 不支持。

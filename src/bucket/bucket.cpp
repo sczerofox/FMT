@@ -307,6 +307,11 @@ Result<BucketInfo> BucketService::get(std::string_view name) {
     if (name.empty()) {
         return make_error(ErrorCode::InvalidArgument, "缺少 Bucket 名称");
     }
+    // 请求级 Bucket 来自 HTTP 头（X-FMT-Bucket），不能让它带路径分隔符或 .. 去拼路径：
+    // bucket_path() 是直接 join 的，否则 `..\..\x` 会逃出 repository/<user>/。
+    if (const Status valid = validate_bucket_name(name); !ok(valid)) {
+        return *error_of(valid);
+    }
 
     const std::filesystem::path directory = bucket_path(name);
     if (!directory_exists(directory)) {

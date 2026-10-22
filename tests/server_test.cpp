@@ -1,6 +1,7 @@
 // server 的单元测试：HTTP 监听、响应信封、错误信封
 #include "fmt/server/server.hpp"
 
+#include <fstream>
 #include <string>
 
 #include <cpp-httplib/httplib.h>
@@ -199,6 +200,46 @@ FMT_TEST(Server, 分片上传HTTP分片与完成) {
         }
     }
     FMT_CHECK(found_file);
+
+    // 完成失败必须返回错误（409 + FMT-806），不能 200 + data.error 假装成功。
+    nlohmann::json bad_init = nlohmann::json::object();
+    bad_init["file_name"] = "broken.bin";
+    bad_init["size"] = 1024 * 1024;
+    bad_init["chunk_size"] = 1024 * 1024;
+    const auto bad_initialized = client.Post("/api/upload/init", bad_init.dump(),
+                                             "application/json");
+    FMT_CHECK(bad_initialized != nullptr);
+    if (bad_initialized != nullptr) {
+        const nlohmann::json bad_body = nlohmann::json::parse(bad_initialized->body);
+        const std::string bad_id = bad_body["data"].value("upload_id", std::string{});
+        FMT_CHECK(!bad_id.empty());
+        const std::string chunk(1024 * 1024, 'c');
+        const auto put_bad = client.Put("/api/upload/" + bad_id + "/chunk?index=0", chunk,
+                                        "application/octet-stream");
+        FMT_CHECK(put_bad != nullptr);
+        if (put_bad != nullptr) {
+            FMT_CHECK_EQ(put_bad->status, 200);
+        }
+        // 篡改落盘分片：完成时要被逐片 MD5 校验发现。
+        const std::filesystem::path part =
+            paths.temp() / "upload-sessions" / bad_id / "chunks" / "000000.part";
+        {
+            std::fstream out(part, std::ios::binary | std::ios::in | std::ios::out);
+            FMT_CHECK(out.good());
+            char byte = 'x';
+            out.seekp(0);
+            out.write(&byte, 1);
+        }
+        const auto bad_completed = client.Post("/api/upload/" + bad_id + "/complete");
+        FMT_CHECK(bad_completed != nullptr);
+        if (bad_completed != nullptr) {
+            FMT_CHECK_EQ(bad_completed->status, 409);
+            const nlohmann::json bad_result = nlohmann::json::parse(bad_completed->body);
+            FMT_CHECK(!bad_result["ok"].get<bool>());
+            FMT_CHECK_EQ(bad_result["error"].value("code", std::string{}),
+                         std::string("FMT-806"));
+        }
+    }
     server.stop();
 }
 
