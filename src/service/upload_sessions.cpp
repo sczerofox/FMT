@@ -313,11 +313,13 @@ void UploadSessionManager::cleanup_expired_locked() {
     }
 }
 
-Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
-    if (config_.current_user.empty()) {
+Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args,
+                                                   const std::string& user,
+                                                   const std::string& bucket) {
+    if (user.empty()) {
         return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
     }
-    if (config_.current_bucket.empty()) {
+    if (bucket.empty()) {
         return make_error(ErrorCode::NoCurrentBucket, "未设置当前 Bucket");
     }
     // 大文件开始前先确认桶目录仍在：user delete / 手工删目录后，
@@ -325,14 +327,16 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
     {
         std::error_code bucket_code;
         const std::filesystem::path bucket_dir =
-            paths_.repository() / path_from_utf8(config_.current_user) /
-            path_from_utf8(config_.current_bucket);
+            paths_.repository() / path_from_utf8(user) / path_from_utf8(bucket);
         if (!std::filesystem::is_directory(bucket_dir, bucket_code)) {
             return make_error(ErrorCode::NoCurrentBucket,
-                              "当前 Bucket 的目录不存在：" + config_.current_bucket +
+                              "当前 Bucket 的目录不存在：" + bucket +
                                   "；请先 bucket create / bucket use");
         }
     }
+    Config request_config = config_;
+    request_config.current_user = user;
+    request_config.current_bucket = bucket;
 
     const auto argv = args.find("argv");
     if (argv == args.end() || !argv->is_array() || argv->empty() ||
@@ -386,8 +390,8 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
         std::lock_guard<std::mutex> guard(mutex_);
         cleanup_expired_locked();
         for (auto& [session_id, candidate] : sessions_) {
-            if (!iequals(candidate.user, config_.current_user) ||
-                !iequals(candidate.bucket, config_.current_bucket) ||
+            if (!iequals(candidate.user, user) ||
+                !iequals(candidate.bucket, bucket) ||
                 !iequals(candidate.source_path, source_text) || candidate.size != size) {
                 continue;
             }
@@ -407,13 +411,13 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
                 if (candidate.final_file_id.empty()) {
                     continue;
                 }
-                FileService files(paths_, config_, logger_);
+                FileService files(paths_, request_config, logger_);
                 Result<FileRecord> existing = files.get_by_id(candidate.final_file_id);
                 if (!ok(existing)) {
                     continue;
                 }
                 const FileRecord& record = std::get<FileRecord>(existing);
-                if (record.is_trash || !iequals(record.bucket, config_.current_bucket)) {
+                if (record.is_trash || !iequals(record.bucket, bucket)) {
                     continue;
                 }
             }
@@ -444,7 +448,7 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
         std::lock_guard<std::mutex> guard(mutex_);
         cleanup_expired_locked();
         for (const auto& item : sessions_) {
-            if (item.second.user == config_.current_user &&
+            if (item.second.user == user &&
                 (item.second.state == "uploading" || item.second.state == "paused" ||
                  item.second.state == "completing")) {
                 ++active;
@@ -469,8 +473,8 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
     }
 
     Session session;
-    session.user = config_.current_user;
-    session.bucket = config_.current_bucket;
+    session.user = user;
+    session.bucket = bucket;
     session.source_path = source_text;
     session.source_mtime = source_mtime;
     session.file_name = name;
@@ -497,32 +501,237 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
     return session_json(session, false);
 }
 
-Result<nlohmann::json> UploadSessionManager::lookup(const std::string& upload_id) {
-    return status(upload_id);
+Result<nlohmann::json> UploadSessionManager::init_for(const nlohmann::json& args,
+                                                      const std::string& user,
+                                                      const std::string& bucket) {
+    if (user.empty()) {
+        return make_error(ErrorCode::NoCurrentUser, "未设置当前用户");
+    }
+    if (bucket.empty()) {
+        return make_error(ErrorCode::NoCurrentBucket, "未设置当前 Bucket");
+    }
+    std::error_code bucket_code;
+    const std::filesystem::path bucket_dir =
+        paths_.repository() / path_from_utf8(user) / path_from_utf8(bucket);
+    if (!std::filesystem::is_directory(bucket_dir, bucket_code)) {
+        return make_error(ErrorCode::NoCurrentBucket, "当前 Bucket 的目录不存在：" + bucket);
+    }
+
+    std::string name = clean_user_path(args.value("file_name", std::string{}));
+    if (name.empty() && args.contains("argv") && args["argv"].is_array() &&
+        !args["argv"].empty() && args["argv"][0].is_string()) {
+        name = clean_user_path(args["argv"][0].get<std::string>());
+    }
+    if (name.empty()) {
+        return make_error(ErrorCode::FileNameEmpty, "缺少 file_name");
+    }
+    if (const Status valid = validate_file_name(name); !ok(valid)) {
+        return *error_of(valid);
+    }
+
+    const std::uint64_t size = args.value("size", std::uint64_t{0});
+    if (size > config_.max_large_upload_size) {
+        return make_error(ErrorCode::UploadLimitExceeded,
+                          "文件超过大文件上限：" + std::to_string(size) + " > " +
+                              std::to_string(config_.max_large_upload_size));
+    }
+    std::uint64_t chunk_size = args.value("chunk_size", std::uint64_t{0});
+    if (chunk_size == 0) {
+        chunk_size = config_.upload_chunk_size;
+    }
+    chunk_size = std::max(kMinChunkSize, std::min(chunk_size, kMaxChunkSize));
+    if (size > 0 && chunk_size > size) {
+        chunk_size = size;
+    }
+    const std::uint64_t chunk_count = size == 0 ? 0 : (size + chunk_size - 1) / chunk_size;
+    const std::string md5 = clean_user_path(args.value("md5", std::string{}));
+
+    // 客户端带 MD5 时可以先查已有内容，命中直接秒传。
+    if (!md5.empty()) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        cleanup_expired_locked();
+        Config request_config = config_;
+        request_config.current_user = user;
+        request_config.current_bucket = bucket;
+        FileService files(paths_, request_config, logger_);
+        for (const auto& item : sessions_) {
+            const Session& candidate = item.second;
+            if (!owned(candidate, user, bucket) || candidate.state != "completed" ||
+                !iequals(candidate.md5, md5)) {
+                continue;
+            }
+            if (candidate.final_file_id.empty()) {
+                continue;
+            }
+            Result<FileRecord> existing = files.get_by_id(candidate.final_file_id);
+            if (!ok(existing)) {
+                continue;
+            }
+            const FileRecord& record = std::get<FileRecord>(existing);
+            if (record.is_trash || !iequals(record.bucket, bucket)) {
+                continue;
+            }
+            nlohmann::json reused = session_json(candidate, false);
+            reused["reused"] = true;
+            reused["message"] = "秒传：已有相同内容，复用 upload_id " + candidate.id;
+            return reused;
+        }
+    }
+
+    std::size_t active = 0;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        cleanup_expired_locked();
+        for (const auto& item : sessions_) {
+            if (item.second.user == user &&
+                (item.second.state == "uploading" || item.second.state == "paused" ||
+                 item.second.state == "completing")) {
+                ++active;
+            }
+        }
+    }
+    if (active >= config_.upload_max_active_per_user) {
+        return make_error(ErrorCode::UploadLimitExceeded,
+                          "活动上传会话过多（上限 " +
+                              std::to_string(config_.upload_max_active_per_user) + "）");
+    }
+
+    const std::filesystem::space_info space = std::filesystem::space(paths_.temp(), bucket_code);
+    if (!bucket_code) {
+        const std::uint64_t required = size * 2 + chunk_size;
+        if (space.available < required) {
+            return make_error(ErrorCode::InsufficientStorage,
+                              "磁盘空间不足：需要约 " + std::to_string(required) + " 字节，可用 " +
+                                  std::to_string(space.available) + " 字节");
+        }
+    }
+
+    Session session;
+    session.user = user;
+    session.bucket = bucket;
+    session.file_name = name;
+    session.size = size;
+    session.chunk_size = chunk_size;
+    session.chunk_count = chunk_count;
+    session.md5 = md5;
+    session.received.assign(static_cast<std::size_t>(chunk_count), false);
+    session.chunk_hashes.assign(static_cast<std::size_t>(chunk_count), std::string{});
+    session.created_at = local_datetime_iso();
+    touch(session);
+
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        do {
+            session.id = "up-" + random_hex(16);
+        } while (sessions_.count(session.id) || std::filesystem::exists(session_dir(session.id)));
+        if (const Status saved = save_session(session); !ok(saved)) {
+            return *error_of(saved);
+        }
+        sessions_[session.id] = session;
+    }
+    return session_json(session, false);
 }
 
-Result<nlohmann::json> UploadSessionManager::status(const std::string& id) {
+Result<nlohmann::json> UploadSessionManager::put_chunk_for(const std::string& upload_id,
+                                                           std::uint64_t index,
+                                                           std::string_view data,
+                                                           const std::string& expected_md5,
+                                                           const std::string& user,
+                                                           const std::string& bucket) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    cleanup_expired_locked();
+    const auto found = sessions_.find(upload_id);
+    if (found == sessions_.end() || !owned(found->second, user, bucket)) {
+        return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + upload_id);
+    }
+    Session& session = found->second;
+    if (session.state != "uploading") {
+        return make_error(ErrorCode::UploadStateInvalid,
+                          "当前状态不能写分片：" + session.state);
+    }
+    if (index >= session.chunk_count) {
+        return make_error(ErrorCode::ChunkIndexInvalid, "分片下标越界：" + std::to_string(index));
+    }
+    const std::uint64_t offset = index * session.chunk_size;
+    const std::uint64_t length = std::min(session.chunk_size, session.size - offset);
+    if (data.size() != static_cast<std::size_t>(length)) {
+        return make_error(ErrorCode::ChunkMismatch, "分片大小不对");
+    }
+    const std::string actual_md5 = md5_hex(data);
+    if (!expected_md5.empty() && !iequals(expected_md5, actual_md5)) {
+        return make_error(ErrorCode::ChunkMismatch, "分片 MD5 与 X-Chunk-MD5 不匹配");
+    }
+
+    const std::filesystem::path target = chunk_path(upload_id, index);
+    const std::filesystem::path temp = target.string() + ".tmp";
+    std::error_code code;
+    std::filesystem::create_directories(target.parent_path(), code);
+    {
+        std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+        if (!out) {
+            return make_error(ErrorCode::StorageError, "无法写入分片：" + path_to_utf8(temp));
+        }
+        out.write(data.data(), static_cast<std::streamsize>(data.size()));
+        if (!out) {
+            std::filesystem::remove(temp, code);
+            return make_error(ErrorCode::StorageError, "写入分片失败");
+        }
+    }
+    std::filesystem::rename(temp, target, code);
+    if (code) {
+        std::filesystem::remove(temp, code);
+        return make_error(ErrorCode::StorageError, "分片改名失败：" + path_to_utf8(target));
+    }
+
+    if (!session.received[static_cast<std::size_t>(index)]) {
+        session.uploaded_bytes += length;
+    }
+    session.received[static_cast<std::size_t>(index)] = true;
+    session.chunk_hashes[static_cast<std::size_t>(index)] = actual_md5;
+    touch(session);
+    if (const Status saved = save_session(session); !ok(saved)) {
+        return *error_of(saved);
+    }
+    return session_json(session, false);
+}
+
+Result<nlohmann::json> UploadSessionManager::lookup(const std::string& upload_id) {
+    return lookup_for(upload_id, config_.current_user, config_.current_bucket);
+}
+
+Result<nlohmann::json> UploadSessionManager::lookup_for(const std::string& upload_id,
+                                                         const std::string& user,
+                                                         const std::string& bucket) {
+    return status(upload_id, user, bucket);
+}
+
+Result<nlohmann::json> UploadSessionManager::status(const std::string& id, const std::string& user,
+                                                    const std::string& bucket) {
     std::lock_guard<std::mutex> guard(mutex_);
     cleanup_expired_locked();
     const auto found = sessions_.find(id);
     if (found == sessions_.end()) {
         return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
     }
-    if (!owned(found->second)) {
+    if (!owned(found->second, user, bucket)) {
         return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
     }
     return session_json(found->second, true);
 }
 
-Result<nlohmann::json> UploadSessionManager::list(bool all) {
+Result<nlohmann::json> UploadSessionManager::list(bool all, const std::string& user,
+                                                   const std::string& bucket) {
     std::lock_guard<std::mutex> guard(mutex_);
     cleanup_expired_locked();
     nlohmann::json uploads = nlohmann::json::array();
     std::unordered_map<std::string, std::size_t> seen_final;
     std::unordered_map<std::string, std::size_t> seen_md5;
+    Config list_config = config_;
+    list_config.current_user = user;
+    list_config.current_bucket = bucket;
     for (const auto& item : sessions_) {
         const Session& session = item.second;
-        if (!owned(session)) {
+        if (!owned(session, user, bucket)) {
             continue;
         }
         if (!all && session.state == "canceled") {
@@ -532,13 +741,13 @@ Result<nlohmann::json> UploadSessionManager::list(bool all) {
             if (session.final_file_id.empty()) {
                 continue;
             }
-            FileService files(paths_, config_, logger_);
+            FileService files(paths_, list_config, logger_);
             Result<FileRecord> record = files.get_by_id(session.final_file_id);
             if (!ok(record)) {
                 continue;
             }
             const FileRecord& current = std::get<FileRecord>(record);
-            if (current.is_trash || !iequals(current.bucket, config_.current_bucket)) {
+            if (current.is_trash || !iequals(current.bucket, bucket)) {
                 continue;
             }
             std::optional<std::size_t> visible;
@@ -586,13 +795,14 @@ Result<nlohmann::json> UploadSessionManager::list(bool all) {
     return data;
 }
 
-Result<nlohmann::json> UploadSessionManager::pause(const std::string& id) {
+Result<nlohmann::json> UploadSessionManager::pause(const std::string& id, const std::string& user,
+                                                   const std::string& bucket) {
     std::lock_guard<std::mutex> guard(mutex_);
     const auto found = sessions_.find(id);
     if (found == sessions_.end()) {
         return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
     }
-    if (!owned(found->second)) {
+    if (!owned(found->second, user, bucket)) {
         return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
     }
     Session& session = found->second;
@@ -611,19 +821,22 @@ Result<nlohmann::json> UploadSessionManager::pause(const std::string& id) {
     return session_json(session, true);
 }
 
-Result<nlohmann::json> UploadSessionManager::resume(const std::string& id) {
+Result<nlohmann::json> UploadSessionManager::resume(const std::string& id, const std::string& user,
+                                                    const std::string& bucket) {
     std::thread old_worker;
     bool wait_for_old = false;
+    bool has_local_source = false;
     {
         std::lock_guard<std::mutex> guard(mutex_);
         const auto found = sessions_.find(id);
         if (found == sessions_.end()) {
             return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
         }
-        if (!owned(found->second)) {
+        if (!owned(found->second, user, bucket)) {
             return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
         }
         Session& session = found->second;
+        has_local_source = !session.source_path.empty();
         if (session.state == "completed") {
             return session_json(session, false);
         }
@@ -671,7 +884,7 @@ Result<nlohmann::json> UploadSessionManager::resume(const std::string& id) {
         if (found == sessions_.end()) {
             return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
         }
-        if (!owned(found->second)) {
+        if (!owned(found->second, user, bucket)) {
             return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
         }
         Session& session = found->second;
@@ -689,11 +902,14 @@ Result<nlohmann::json> UploadSessionManager::resume(const std::string& id) {
         }
     }
 
-    spawn_worker(id);
-    return status(id);
+    if (has_local_source) {
+        spawn_worker(id);
+    }
+    return status(id, user, bucket);
 }
 
-Result<nlohmann::json> UploadSessionManager::cancel(const std::string& id) {
+Result<nlohmann::json> UploadSessionManager::cancel(const std::string& id, const std::string& user,
+                                                    const std::string& bucket) {
     bool running = false;
     {
         std::lock_guard<std::mutex> guard(mutex_);
@@ -701,7 +917,7 @@ Result<nlohmann::json> UploadSessionManager::cancel(const std::string& id) {
         if (found == sessions_.end()) {
             return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
         }
-        if (!owned(found->second)) {
+        if (!owned(found->second, user, bucket)) {
             return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
         }
         Session& session = found->second;
@@ -719,17 +935,19 @@ Result<nlohmann::json> UploadSessionManager::cancel(const std::string& id) {
     if (!running) {
         cleanup_session_files(id);
     }
-    return status(id);
+    return status(id, user, bucket);
 }
 
-Result<nlohmann::json> UploadSessionManager::complete(const std::string& id) {
+Result<nlohmann::json> UploadSessionManager::complete(const std::string& id,
+                                                      const std::string& user,
+                                                      const std::string& bucket) {
     {
         std::lock_guard<std::mutex> guard(mutex_);
         const auto found = sessions_.find(id);
         if (found == sessions_.end()) {
             return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
         }
-        if (!owned(found->second)) {
+        if (!owned(found->second, user, bucket)) {
             return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + id);
         }
         if (!all_received(found->second)) {
@@ -745,7 +963,7 @@ Result<nlohmann::json> UploadSessionManager::complete(const std::string& id) {
         }
     }
     complete_in_worker(id);
-    return status(id);
+    return status(id, user, bucket);
 }
 
 bool UploadSessionManager::all_received(const Session& session) const {
@@ -762,9 +980,9 @@ bool UploadSessionManager::should_upload_continue(const std::string& id) const {
     return found != sessions_.end() && found->second.state == "uploading";
 }
 
-bool UploadSessionManager::owned(const Session& session) const {
-    return iequals(session.user, config_.current_user) &&
-           iequals(session.bucket, config_.current_bucket);
+bool UploadSessionManager::owned(const Session& session, const std::string& user,
+                                 const std::string& bucket) const {
+    return iequals(session.user, user) && iequals(session.bucket, bucket);
 }
 
 std::uint64_t UploadSessionManager::next_missing(const Session& session) const {
@@ -1253,6 +1471,13 @@ void UploadSessionManager::cleanup_session_files(const std::string& id) const {
 
 Result<nlohmann::json> UploadSessionManager::handle(const std::string& operation,
                                                      const nlohmann::json& args) {
+    return handle_for(operation, args, config_.current_user, config_.current_bucket);
+}
+
+Result<nlohmann::json> UploadSessionManager::handle_for(const std::string& operation,
+                                                        const nlohmann::json& args,
+                                                        const std::string& user,
+                                                        const std::string& bucket) {
     reap_finished();
 
     const auto argv = args.find("argv");
@@ -1264,29 +1489,32 @@ Result<nlohmann::json> UploadSessionManager::handle(const std::string& operation
     };
 
     if (operation == "upload.start") {
-        return start(args);
+        return start(args, user, bucket);
+    }
+    if (operation == "upload.init") {
+        return init_for(args, user, bucket);
     }
     if (operation == "upload.list") {
-        return list(args.value("all", false));
+        return list(args.value("all", false), user, bucket);
     }
     if (operation == "upload.status") {
         const std::string id = first_arg();
         if (id.empty()) {
             return make_error(ErrorCode::InvalidArgument, "upload status 需要 upload_id");
         }
-        return status(id);
+        return status(id, user, bucket);
     }
     if (operation == "upload.pause") {
-        return pause(first_arg());
+        return pause(first_arg(), user, bucket);
     }
     if (operation == "upload.resume") {
-        return resume(first_arg());
+        return resume(first_arg(), user, bucket);
     }
     if (operation == "upload.cancel") {
-        return cancel(first_arg());
+        return cancel(first_arg(), user, bucket);
     }
     if (operation == "upload.complete") {
-        return complete(first_arg());
+        return complete(first_arg(), user, bucket);
     }
     return make_error(ErrorCode::InvalidArgument, "未知的上传操作：" + operation);
 }

@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -43,8 +44,22 @@ public:
     // 处理 upload.start / status / list / pause / resume / cancel / complete。
     Result<nlohmann::json> handle(const std::string& operation, const nlohmann::json& args);
 
+    // HTTP 用：显式带认证用户与请求级 Bucket，不依赖全局 current_user/current_bucket。
+    Result<nlohmann::json> handle_for(const std::string& operation, const nlohmann::json& args,
+                                      const std::string& user, const std::string& bucket);
+
     // 给 file delete <upload_id> 用：返回会话（completed 时有 final_file_id）。
     Result<nlohmann::json> lookup(const std::string& upload_id);
+    Result<nlohmann::json> lookup_for(const std::string& upload_id, const std::string& user,
+                                      const std::string& bucket);
+
+    // HTTP 初始化（没有本地源文件；客户端逐片上传）。
+    Result<nlohmann::json> init_for(const nlohmann::json& args, const std::string& user,
+                                    const std::string& bucket);
+    // HTTP 写一个分片；data 是原始字节，md5 可空（空则服务端记录）。
+    Result<nlohmann::json> put_chunk_for(const std::string& upload_id, std::uint64_t index,
+                                         std::string_view data, const std::string& expected_md5,
+                                         const std::string& user, const std::string& bucket);
 
     // 服务停止/换根时调用：让后台线程在分片边界退出并 join。
     void stop();
@@ -74,13 +89,19 @@ private:
         std::string error;
     };
 
-    Result<nlohmann::json> start(const nlohmann::json& args);
-    Result<nlohmann::json> status(const std::string& id);
-    Result<nlohmann::json> list(bool all);
-    Result<nlohmann::json> pause(const std::string& id);
-    Result<nlohmann::json> resume(const std::string& id);
-    Result<nlohmann::json> cancel(const std::string& id);
-    Result<nlohmann::json> complete(const std::string& id);
+    Result<nlohmann::json> start(const nlohmann::json& args, const std::string& user,
+                                 const std::string& bucket);
+    Result<nlohmann::json> status(const std::string& id, const std::string& user,
+                                  const std::string& bucket);
+    Result<nlohmann::json> list(bool all, const std::string& user, const std::string& bucket);
+    Result<nlohmann::json> pause(const std::string& id, const std::string& user,
+                                 const std::string& bucket);
+    Result<nlohmann::json> resume(const std::string& id, const std::string& user,
+                                  const std::string& bucket);
+    Result<nlohmann::json> cancel(const std::string& id, const std::string& user,
+                                  const std::string& bucket);
+    Result<nlohmann::json> complete(const std::string& id, const std::string& user,
+                                    const std::string& bucket);
 
     Result<Session> find_session(const std::string& id) const;
     Result<Session> load_session(const std::filesystem::path& dir) const;
@@ -105,7 +126,8 @@ private:
     bool all_received(const Session& session) const;
     std::uint64_t next_missing(const Session& session) const;
     bool should_upload_continue(const std::string& id) const;
-    bool owned(const Session& session) const;
+    bool owned(const Session& session, const std::string& user,
+               const std::string& bucket) const;
 
     nlohmann::json session_json(const Session& session, bool include_missing) const;
     std::string next_name(const std::string& original, int sequence) const;

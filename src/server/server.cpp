@@ -67,7 +67,21 @@ int http_status_for(ErrorCode code) {
         case ErrorCode::ShareNotFound:
         case ErrorCode::NoCurrentBucket:
         case ErrorCode::RestoreBucketMissing:
+        case ErrorCode::UploadSessionNotFound:
+        case ErrorCode::UploadSessionExpired:
             return 404;
+        case ErrorCode::ChunkIndexInvalid:
+        case ErrorCode::ChunkMismatch:
+            return 400;
+        case ErrorCode::UploadIncomplete:
+        case ErrorCode::UploadCanceled:
+        case ErrorCode::UploadStateInvalid:
+        case ErrorCode::UploadMd5Mismatch:
+            return 409;
+        case ErrorCode::UploadLimitExceeded:
+            return 413;
+        case ErrorCode::InsufficientStorage:
+            return 507;
         case ErrorCode::FileAlreadyExists:
         case ErrorCode::FileNameConflict:
         case ErrorCode::BucketAlreadyExists:
@@ -111,6 +125,7 @@ nlohmann::json args_with_encoded_name(const std::string& encoded) {
 // cpp-httplib 的 pre-routing 与路由处理在同一个工作线程上顺序执行，所以用
 // thread_local 传递即可；post-routing 与下一次 pre-routing 都会清空它，避免串请求。
 thread_local std::string g_request_bucket;
+thread_local std::string g_request_user;
 
 // 不需要 token 的路径：健康检查、分享下载、登录/取盐。
 // 分享链接本身就是凭证（share_id 是随机 12 位十六进制）；登录/取盐必须在
@@ -146,7 +161,23 @@ std::string header_token(const httplib::Request& request) {
     return {};
 }
 
-// 请求体：接受 {"name":"工作"}，也接受与管道一致的 {"argv":["工作"]}。
+// 大文件 init/complete 之类的小 JSON 请求体：不套 argv/name 的兼容逻辑。
+Result<nlohmann::json> upload_json_body(const httplib::Request& request) {
+    if (request.body.empty()) {
+        return make_error(ErrorCode::InvalidArgument, "请求体不能为空");
+    }
+    try {
+        nlohmann::json body = nlohmann::json::parse(request.body);
+        if (!body.is_object()) {
+            return make_error(ErrorCode::InvalidArgument, "请求体必须是 JSON 对象");
+        }
+        return body;
+    } catch (const nlohmann::json::exception& error) {
+        return make_error(ErrorCode::JsonParseError,
+                          std::string("请求体不是合法 JSON：") + error.what());
+    }
+}
+
 Result<nlohmann::json> args_from_body(const httplib::Request& request) {
     if (request.body.empty()) {
         return make_error(ErrorCode::InvalidArgument, "请求体不能为空");
@@ -815,7 +846,9 @@ HttpServer::~HttpServer() { stop(); }
 Status HttpServer::start(const std::string& host, int port, std::string data_root, Logger* logger,
                          BusinessHandler handler, TokenVerifier verifier,
                          UploadLimitProvider upload_limit, SessionVerifier session_verifier,
-                         LoginHandler login, SaltHandler salt, LogoutHandler logout) {
+                         LoginHandler login, SaltHandler salt, LogoutHandler logout,
+                         UploadHandler upload_handler,
+                         UploadChunkHandler upload_chunk_handler) {
     if (impl_->running.load()) {
         return make_error(ErrorCode::InvalidArgument, "HTTP 服务已经在运行");
     }
@@ -835,6 +868,7 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
             -> httplib::Server::HandlerResponse {
             // 请求级 Bucket 不能串到下一个请求；公开路径与认证失败都要清掉。
             g_request_bucket.clear();
+            g_request_user.clear();
             if (!starts_with(request.path, "/api/") || is_public_path(request.path)) {
                 return httplib::Server::HandlerResponse::Unhandled;
             }
@@ -884,6 +918,7 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
             }
 
             const std::string requested_bucket = trim(request.get_header_value("X-FMT-Bucket"));
+            g_request_user = identity.username;
             if (identity.session) {
                 // 会话 token 绑定登录时选的 Bucket；请求头可选：
                 // 带就必须一致（防止拿一个 token 访问另一个库），不带就默认用会话桶。
@@ -905,7 +940,10 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
 
     // 每个请求结束都清掉请求级 Bucket，避免工作线程复用导致串请求。
     impl_->server->set_post_routing_handler(
-        [](const httplib::Request&, httplib::Response&) { g_request_bucket.clear(); });
+        [](const httplib::Request&, httplib::Response&) {
+            g_request_bucket.clear();
+            g_request_user.clear();
+        });
 
     impl_->server->Get("/api/ping", [](const httplib::Request&, httplib::Response& response) {
         response.set_content(dump(envelope_ok(nlohmann::json::object())), kJsonContentType);
@@ -996,6 +1034,117 @@ Status HttpServer::start(const std::string& host, int port, std::string data_roo
     // 业务路由：与命名管道共用同一份实现（见 register_business_routes）。
     register_business_routes(impl_->server.get(), std::move(handler),
                                 impl_->state->data_root, std::move(upload_limit));
+
+    // ---- 大文件分片上传 HTTP 入口（CLI/Java 共用） ----
+    if (upload_handler || upload_chunk_handler) {
+        const auto upload_run = [upload_handler](const std::string& operation,
+                                                 const nlohmann::json& args,
+                                                 httplib::Response& response) {
+            if (!upload_handler) {
+                respond(response, make_error(ErrorCode::ServiceOperationFailed,
+                                             "HTTP 未接入分片上传"));
+                return;
+            }
+            respond(response, upload_handler(operation, g_request_user, g_request_bucket, args));
+        };
+
+        impl_->server->Post("/api/upload/init",
+                            [upload_run](const httplib::Request& request,
+                                         httplib::Response& response) {
+                                const Result<nlohmann::json> body = upload_json_body(request);
+                                if (!ok(body)) {
+                                    respond(response, body);
+                                    return;
+                                }
+                                upload_run("upload.init", std::get<nlohmann::json>(body),
+                                           response);
+                            });
+
+        impl_->server->Get("/api/upload/list",
+                           [upload_run](const httplib::Request& request,
+                                        httplib::Response& response) {
+                               nlohmann::json args = nlohmann::json::object();
+                               if (request.has_param("all")) {
+                                   args["all"] = request.get_param_value("all") == "1" ||
+                                                 request.get_param_value("all") == "true";
+                               }
+                               upload_run("upload.list", args, response);
+                           });
+
+        impl_->server->Get(R"(/api/upload/([^/]+))",
+                           [upload_run](const httplib::Request& request,
+                                        httplib::Response& response) {
+                               nlohmann::json args = nlohmann::json::object();
+                               args["argv"] = nlohmann::json::array({request.matches[1]});
+                               upload_run("upload.status", args, response);
+                           });
+
+        impl_->server->Put(R"(/api/upload/([^/]+)/chunk)",
+                           [upload_chunk_handler](const httplib::Request& request,
+                                                  httplib::Response& response) {
+                               if (!upload_chunk_handler) {
+                                   respond(response, make_error(ErrorCode::ServiceOperationFailed,
+                                                                "HTTP 未接入分片写入"));
+                                   return;
+                               }
+                               if (!request.has_param("index")) {
+                                   respond(response, make_error(ErrorCode::InvalidArgument,
+                                                                "缺少 index 查询参数"));
+                                   return;
+                               }
+                               std::uint64_t index = 0;
+                               try {
+                                   const std::string text = request.get_param_value("index");
+                                   std::size_t used = 0;
+                                   index = std::stoull(text, &used);
+                                   if (used != text.size()) {
+                                       throw std::invalid_argument("index");
+                                   }
+                               } catch (const std::exception&) {
+                                   respond(response, make_error(ErrorCode::InvalidArgument,
+                                                                "index 必须是整数"));
+                                   return;
+                               }
+                               const std::string md5 = trim(
+                                   request.get_header_value("X-Chunk-MD5"));
+                               respond(response,
+                                       upload_chunk_handler(request.matches[1], index,
+                                                            request.body, md5, g_request_user,
+                                                            g_request_bucket));
+                           });
+
+        impl_->server->Post(R"(/api/upload/([^/]+)/complete)",
+                            [upload_run](const httplib::Request& request,
+                                         httplib::Response& response) {
+                                nlohmann::json args = nlohmann::json::object();
+                                args["argv"] = nlohmann::json::array({request.matches[1]});
+                                upload_run("upload.complete", args, response);
+                            });
+
+        impl_->server->Post(R"(/api/upload/([^/]+)/pause)",
+                            [upload_run](const httplib::Request& request,
+                                         httplib::Response& response) {
+                                nlohmann::json args = nlohmann::json::object();
+                                args["argv"] = nlohmann::json::array({request.matches[1]});
+                                upload_run("upload.pause", args, response);
+                            });
+
+        impl_->server->Post(R"(/api/upload/([^/]+)/resume)",
+                            [upload_run](const httplib::Request& request,
+                                         httplib::Response& response) {
+                                nlohmann::json args = nlohmann::json::object();
+                                args["argv"] = nlohmann::json::array({request.matches[1]});
+                                upload_run("upload.resume", args, response);
+                            });
+
+        impl_->server->Delete(R"(/api/upload/([^/]+))",
+                              [upload_run](const httplib::Request& request,
+                                           httplib::Response& response) {
+                                  nlohmann::json args = nlohmann::json::object();
+                                  args["argv"] = nlohmann::json::array({request.matches[1]});
+                                  upload_run("upload.cancel", args, response);
+                              });
+    }
 
     // 兜底：已经登记的模块里还没实现的操作。
     impl_->server->Get(R"(/api/.*)", [](const httplib::Request& request,

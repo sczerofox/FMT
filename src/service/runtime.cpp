@@ -533,11 +533,53 @@ void ServerRuntime::restart_http() {
     server::LogoutHandler logout = [this](const std::string& token) -> Status {
         return logout_http(token);
     };
+    server::UploadHandler upload_handler =
+        [this](const std::string& operation, const std::string& username,
+               const std::string& bucket, const nlohmann::json& args) -> Result<nlohmann::json> {
+        std::shared_ptr<UploadSessionManager> uploads;
+        Config config;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            uploads = uploads_;
+            if (context_ != nullptr) {
+                config = context_->config;
+            }
+        }
+        if (!uploads) {
+            return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+        }
+        const std::string user = username.empty() ? config.current_user : username;
+        const std::string selected_bucket = bucket.empty() ? config.current_bucket : bucket;
+        return uploads->handle_for(operation, args, user, selected_bucket);
+    };
+    server::UploadChunkHandler upload_chunk_handler =
+        [this](const std::string& upload_id, std::uint64_t index, std::string_view data,
+               const std::string& expected_md5, const std::string& username,
+               const std::string& bucket) -> Result<nlohmann::json> {
+        std::shared_ptr<UploadSessionManager> uploads;
+        Config config;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            uploads = uploads_;
+            if (context_ != nullptr) {
+                config = context_->config;
+            }
+        }
+        if (!uploads) {
+            return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+        }
+        const std::string user = username.empty() ? config.current_user : username;
+        const std::string selected_bucket = bucket.empty() ? config.current_bucket : bucket;
+        return uploads->put_chunk_for(upload_id, index, data, expected_md5, user,
+                                      selected_bucket);
+    };
 
     const Status started = created->start(host, port, root, logger, std::move(handler),
                                           std::move(verifier), std::move(upload_limit),
                                           std::move(session_verifier), std::move(login),
-                                          std::move(salt), std::move(logout));
+                                          std::move(salt), std::move(logout),
+                                          std::move(upload_handler),
+                                          std::move(upload_chunk_handler));
     if (!ok(started)) {
         // 端口被占用等：记 ERROR 日志，但**不中断**服务的其他功能。
         if (logger != nullptr) {

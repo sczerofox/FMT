@@ -6,12 +6,14 @@
 #include <cpp-httplib/httplib.h>
 
 #include "fmt/common/envelope.hpp"
+#include "fmt/common/hash.hpp"
 #include "fmt/common/string.hpp"
 #include "fmt/core/app.hpp"
 #include "fmt/core/path.hpp"
 #include "fmt/file/file.hpp"
 #include "fmt/bucket/bucket.hpp"
 #include "fmt/service/commands.hpp"
+#include "fmt/service/upload_sessions.hpp"
 #include "fmt/share/share.hpp"
 #include "fmt/storage/storage.hpp"
 #include "fmt_test.hpp"
@@ -47,6 +49,143 @@ httplib::Client test_client(const fmt::server::HttpServer& server) {
 }
 
 }  // namespace
+FMT_TEST(Server, 分片上传HTTP分片与完成) {
+    fmt_test::TempDir temp("server-upload-http");
+    const auto root = temp / "root";
+    fmt::PathManager paths(root);
+    FMT_CHECK(fmt::ok(fmt::ensure_root(paths)));
+    FMT_CHECK(fmt::ok(fmt::ensure_directory(paths.repository() / "user" / "work")));
+
+    fmt::Config config;
+    config.current_user = "user";
+    config.current_bucket = "work";
+    fmt::service::UploadSessionManager uploads(paths, config, nullptr);
+
+    fmt::server::SessionVerifier verifier =
+        [](const std::string& token) -> fmt::Result<fmt::server::AuthIdentity> {
+        if (token != "upload-token") {
+            return fmt::make_error(fmt::ErrorCode::Unauthorized, "token 无效");
+        }
+        fmt::server::AuthIdentity identity;
+        identity.username = "user";
+        identity.bucket = "work";
+        identity.session = true;
+        return identity;
+    };
+    fmt::server::UploadHandler upload_handler =
+        [&uploads](const std::string& operation, const std::string& user,
+                   const std::string& bucket,
+                   const nlohmann::json& args) -> fmt::Result<nlohmann::json> {
+        return uploads.handle_for(operation, args, user, bucket);
+    };
+    fmt::server::UploadChunkHandler chunk_handler =
+        [&uploads](const std::string& upload_id, std::uint64_t index, std::string_view data,
+                   const std::string& expected_md5, const std::string& user,
+                   const std::string& bucket) -> fmt::Result<nlohmann::json> {
+        return uploads.put_chunk_for(upload_id, index, data, expected_md5, user, bucket);
+    };
+
+    fmt::server::HttpServer server;
+    const fmt::Status started = server.start(
+        "127.0.0.1", 0, fmt::path_to_utf8(root), nullptr, {}, {}, {}, verifier, {}, {}, {},
+        upload_handler, chunk_handler);
+    FMT_CHECK(fmt::ok(started));
+    if (!fmt::ok(started)) {
+        return;
+    }
+
+    httplib::Client client("127.0.0.1", server.port());
+    client.set_default_headers({{"X-FMT-Token", "upload-token"}});
+
+    nlohmann::json init = nlohmann::json::object();
+    init["file_name"] = "http.bin";
+    init["size"] = 2 * 1024 * 1024;
+    init["chunk_size"] = 1024 * 1024;
+    const auto initialized = client.Post("/api/upload/init", init.dump(), "application/json");
+    FMT_CHECK(initialized != nullptr);
+    if (initialized == nullptr) {
+        server.stop();
+        return;
+    }
+    FMT_CHECK_EQ(initialized->status, 200);
+    const nlohmann::json init_body = nlohmann::json::parse(initialized->body);
+    FMT_CHECK(init_body["ok"].get<bool>());
+    const std::string upload_id = init_body["data"].value("upload_id", std::string{});
+    FMT_CHECK(!upload_id.empty());
+    FMT_CHECK_EQ(init_body["data"].value("chunk_count", std::uint64_t{0}), std::uint64_t{2});
+
+    const std::string first(1024 * 1024, 'a');
+    const std::string second(1024 * 1024, 'b');
+    const auto put_first = client.Put("/api/upload/" + upload_id + "/chunk?index=0",
+                                      {{"X-Chunk-MD5", fmt::md5_hex(first)}}, first,
+                                      "application/octet-stream");
+    FMT_CHECK(put_first != nullptr);
+    if (put_first != nullptr) {
+        FMT_CHECK_EQ(put_first->status, 200);
+    }
+
+    // HTTP 的 pause/resume 只切状态，不应去启动本地源文件 worker。
+    const auto paused = client.Post("/api/upload/" + upload_id + "/pause");
+    FMT_CHECK(paused != nullptr);
+    if (paused != nullptr) {
+        FMT_CHECK_EQ(paused->status, 200);
+        FMT_CHECK_EQ(nlohmann::json::parse(paused->body)["data"].value("state", std::string{}),
+                     std::string("paused"));
+    }
+    const auto refused = client.Put("/api/upload/" + upload_id + "/chunk?index=1",
+                                    {{"X-Chunk-MD5", fmt::md5_hex(second)}}, second,
+                                    "application/octet-stream");
+    FMT_CHECK(refused != nullptr);
+    if (refused != nullptr) {
+        FMT_CHECK_EQ(refused->status, 409);
+    }
+    const auto resumed = client.Post("/api/upload/" + upload_id + "/resume");
+    FMT_CHECK(resumed != nullptr);
+    if (resumed != nullptr) {
+        FMT_CHECK_EQ(resumed->status, 200);
+        FMT_CHECK_EQ(nlohmann::json::parse(resumed->body)["data"].value("state", std::string{}),
+                     std::string("uploading"));
+    }
+
+    const auto put_second = client.Put("/api/upload/" + upload_id + "/chunk?index=1",
+                                       {{"X-Chunk-MD5", fmt::md5_hex(second)}}, second,
+                                       "application/octet-stream");
+    FMT_CHECK(put_second != nullptr);
+    if (put_second != nullptr) {
+        FMT_CHECK_EQ(put_second->status, 200);
+    }
+
+    const auto status = client.Get("/api/upload/" + upload_id);
+    FMT_CHECK(status != nullptr);
+    if (status != nullptr) {
+        FMT_CHECK_EQ(status->status, 200);
+        const auto body = nlohmann::json::parse(status->body);
+        FMT_CHECK_EQ(body["data"].value("received_count", std::uint64_t{0}), std::uint64_t{2});
+    }
+
+    const auto completed = client.Post("/api/upload/" + upload_id + "/complete");
+    FMT_CHECK(completed != nullptr);
+    if (completed != nullptr) {
+        FMT_CHECK_EQ(completed->status, 200);
+        const auto body = nlohmann::json::parse(completed->body);
+        FMT_CHECK_EQ(body["data"].value("state", std::string{}), std::string("completed"));
+        FMT_CHECK(!body["data"].value("final_file_id", std::string{}).empty());
+    }
+
+    bool found_file = false;
+    std::error_code code;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(paths.repository(), code)) {
+        if (!entry.is_regular_file()) {
+            continue;
+        }
+        if (entry.path().filename() == "http.bin") {
+            found_file = true;
+        }
+    }
+    FMT_CHECK(found_file);
+    server.stop();
+}
+
 FMT_TEST(Server, 启动监听并应答状态) {
     fmt::server::HttpServer server;
     // 端口传 0：让系统分配一个空闲端口，测试不会撞上 4122 被占。

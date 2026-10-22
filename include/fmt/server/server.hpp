@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 
 #include <nlohmann/json.hpp>
 
@@ -21,6 +22,17 @@ namespace fmt::server {
 // 路由、参数与状态码，不认识任何业务对象。
 using BusinessHandler =
     std::function<Result<nlohmann::json>(const std::string& operation, const nlohmann::json& args)>;
+
+// 分片上传处理器：认证身份（用户名 + 请求级 Bucket）由 HTTP 层显式传入。
+// 大文件上传不能用 BusinessHandler 的全局 current_bucket，否则并发 token 会串 Bucket。
+using UploadHandler = std::function<Result<nlohmann::json>(
+    const std::string& operation, const std::string& username, const std::string& bucket,
+    const nlohmann::json& args)>;
+
+// 分片数据是原始二进制，不能塞进 JSON；单独一条类型避免 base64 膨胀。
+using UploadChunkHandler = std::function<Result<nlohmann::json>(
+    const std::string& upload_id, std::uint64_t index, std::string_view data,
+    const std::string& expected_md5, const std::string& username, const std::string& bucket)>;
 
 // token 校验器：有效返回**用户名**；无效返回错误（`Unauthorized` 或 `TokenExpired`）。
 //
@@ -94,7 +106,9 @@ public:
                  SessionVerifier session_verifier = nullptr,
                  LoginHandler login = nullptr,
                  SaltHandler salt = nullptr,
-                 LogoutHandler logout = nullptr);
+                 LogoutHandler logout = nullptr,
+                 UploadHandler upload_handler = nullptr,
+                 UploadChunkHandler upload_chunk_handler = nullptr);
 
     // 停止监听并等线程结束；可重复调用。
     void stop();
