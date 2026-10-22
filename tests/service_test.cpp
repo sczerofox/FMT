@@ -1896,6 +1896,98 @@ FMT_TEST(Service, 大文件内容与文件名验证) {
     FMT_CHECK(invalid.error.code == fmt::ErrorCode::FileNameLikeFileId);
 }
 
+FMT_TEST(Service, 大文件上传要求当前桶目录存在) {
+    fmt_test::TempDir temp("service-upload-bucket-check");
+    const auto root = temp / "root";
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("password", salt);
+    fmt::ipc::Request create_user;
+    create_user.id = 1;
+    create_user.op = "user.create";
+    create_user.args["username"] = "user";
+    create_user.args["password_digest"] = digest;
+    FMT_CHECK(runtime.handle(create_user).ok);
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 2;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+    fmt::ipc::Request use_bucket;
+    use_bucket.id = 3;
+    use_bucket.op = "bucket.use";
+    use_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(use_bucket).ok);
+
+    const std::filesystem::path source = temp / "small.bin";
+    {
+        std::ofstream out(source, std::ios::binary | std::ios::trunc);
+        out << "bucket-check";
+    }
+
+    // 模拟 user delete / 手工删目录后 config 仍指向旧桶。
+    std::error_code ignored;
+    std::filesystem::remove_all(root / "repository" / "user" / "work", ignored);
+
+    fmt::ipc::Request start;
+    start.id = 4;
+    start.op = "upload.start";
+    start.args["argv"] = nlohmann::json::array({source.string(), "small.bin"});
+    const fmt::ipc::Response rejected = runtime.handle(start);
+    FMT_CHECK(!rejected.ok);
+    FMT_CHECK(rejected.error.code == fmt::ErrorCode::NoCurrentBucket);
+
+    fmt::ipc::Request list;
+    list.id = 5;
+    list.op = "upload.list";
+    const fmt::ipc::Response listed = runtime.handle(list);
+    FMT_CHECK(listed.ok);
+    FMT_CHECK_EQ(listed.data.value("count", std::size_t{1}), std::size_t{0});
+}
+
+FMT_TEST(Service, 重载后清空当前账号与桶) {
+    fmt_test::TempDir temp("service-reload");
+    const auto root = temp / "root";
+    fmt::service::ServerRuntime runtime(root, temp / "state");
+    FMT_CHECK(fmt::ok(runtime.start()));
+
+    const std::string salt = fmt::directory_salt("user");
+    const std::string digest = fmt::password_digest("password", salt);
+    fmt::ipc::Request create_user;
+    create_user.id = 1;
+    create_user.op = "user.create";
+    create_user.args["username"] = "user";
+    create_user.args["password_digest"] = digest;
+    FMT_CHECK(runtime.handle(create_user).ok);
+    fmt::ipc::Request create_bucket;
+    create_bucket.id = 2;
+    create_bucket.op = "bucket.create";
+    create_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(create_bucket).ok);
+    fmt::ipc::Request use_bucket;
+    use_bucket.id = 3;
+    use_bucket.op = "bucket.use";
+    use_bucket.args["argv"] = nlohmann::json::array({"work"});
+    FMT_CHECK(runtime.handle(use_bucket).ok);
+
+    std::error_code ignored;
+    std::filesystem::remove_all(root / "repository", ignored);
+    std::filesystem::remove_all(root / "data", ignored);
+    std::filesystem::remove_all(root / "config", ignored);
+    const fmt::PathManager paths(root);
+    FMT_CHECK(fmt::ok(fmt::ensure_root(paths)));
+    FMT_CHECK(fmt::ok(runtime.reload()));
+
+    fmt::ipc::Request config;
+    config.id = 4;
+    config.op = "config.list";
+    const fmt::ipc::Response listed = runtime.handle(config);
+    FMT_CHECK(listed.ok);
+    FMT_CHECK_EQ(listed.data.value("current_bucket", std::string{}), std::string{});
+}
+
 FMT_TEST(Service, 大文件暂停重启后从缺口继续) {
     fmt_test::TempDir temp("service-upload-resume");
     const auto root = temp / "root";
@@ -2092,6 +2184,8 @@ FMT_TEST(Service, 大文件分片损坏会被发现并可重传) {
     FMT_CHECK(failed.ok);
     FMT_CHECK_EQ(failed.data.value("state", std::string{}), std::string("error"));
     FMT_CHECK(failed.data.value("error", std::string{}).find("校验失败") != std::string::npos);
+    // 失败不是暂停：残片应全部清掉，只留 session.json 供 resume。
+    FMT_CHECK(!std::filesystem::exists(root / "temp" / "upload-sessions" / upload_id / "chunks"));
 
     // 坏分片已被删除，再 resume 会重传并完成。
     bool resumed = false;

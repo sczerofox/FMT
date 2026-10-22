@@ -60,6 +60,9 @@ public:
     // 处理一个请求（可以脱离管道单独测试）。
     ipc::Response handle(const ipc::Request& request);
 
+    // 从磁盘重新加载当前数据根（user delete 之后清掉内存里的旧账号/旧桶）。
+    Status reload();
+
     std::filesystem::path current_root() const;
 
     // HTTP 登录：账号 + PBKDF2 摘要 + Bucket → 内存会话 token（短 TTL）。

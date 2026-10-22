@@ -204,6 +204,47 @@ Status ServerRuntime::start() {
     return std::monostate{};
 }
 
+Status ServerRuntime::reload() {
+    std::filesystem::path root;
+    std::shared_ptr<UploadSessionManager> old_uploads;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (context_ == nullptr) {
+            return make_error(ErrorCode::ServiceOperationFailed, "服务尚未初始化数据根");
+        }
+        root = context_->paths->root();
+        old_uploads = uploads_;
+        uploads_.reset();
+    }
+    if (old_uploads) {
+        old_uploads->stop();
+    }
+
+    Result<std::unique_ptr<AppContext>> created = initialize_service_context(root);
+    if (!ok(created)) {
+        // 新上下文读不出来时别把旧上下文也弄丢：重新挂一个上传管理器即可。
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (context_ != nullptr) {
+            uploads_ = std::make_shared<UploadSessionManager>(*context_->paths, context_->config,
+                                                              context_->logger.get());
+        }
+        return *error_of(created);
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        context_ = std::move(std::get<std::unique_ptr<AppContext>>(created));
+        uploads_ = std::make_shared<UploadSessionManager>(*context_->paths, context_->config,
+                                                          context_->logger.get());
+        refresh_current_bucket_locked();
+        clear_sessions();
+    }
+
+    // 配置/账号都换了，HTTP 也按新 context 重来；必须在锁外。
+    restart_http();
+    return std::monostate{};
+}
+
 Result<nlohmann::json> ServerRuntime::run_upload(const nlohmann::json& args) {
     std::string source;
     std::string name;
@@ -614,6 +655,19 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
             // CLI 据此打印「数据根已切换：旧 -> 新」，双击时就能看见服务跟过来了。
             response.data["previous_root"] = previous;
         }
+        return response;
+    }
+
+    // user delete 后 CLI 会发这一条：丢掉内存里的旧账号/旧桶，重新读磁盘。
+    if (request.op == "service.reload") {
+        const Status reloaded = reload();
+        if (!ok(reloaded)) {
+            response.ok = false;
+            response.error = *error_of(reloaded);
+            return response;
+        }
+        response.ok = true;
+        response.data["message"] = "服务已重新加载当前数据根";
         return response;
     }
 

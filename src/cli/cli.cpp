@@ -1485,6 +1485,42 @@ int delete_data_root(const Options& options) {
         return exit_code(ErrorCode::StorageError);
     }
 
+    // ensure_root 写的是默认 config；再显式保证当前桶为空，避免旧配置残留。
+    if (Result<Config> loaded = load_config(paths); ok(loaded)) {
+        Config fresh = std::get<Config>(loaded);
+        if (!fresh.current_bucket.empty()) {
+            fresh.current_bucket.clear();
+            if (const Status saved = save_config(paths, fresh); !ok(saved)) {
+                std::fprintf(stderr, "清空当前 Bucket 失败：%s\n",
+                             error_of(saved)->message.c_str());
+            }
+        }
+    }
+
+    // 服务可能还在跑并持有旧账号/旧桶的内存副本；删完通知它重新读盘。
+    if (service::query_state() == service::State::Running) {
+        Session session;
+        if (const Status connected = ensure_connected(session, options); ok(connected)) {
+            ipc::Request reload;
+            reload.id = session.next_id++;
+            reload.op = "service.reload";
+            reload.root = options.data_root;
+            reload.pid = GetCurrentProcessId();
+            Result<ipc::Response> response =
+                session.client.call(reload, ipc::kCommandTimeoutMs);
+            if (!ok(response) || !std::get<ipc::Response>(response).ok) {
+                const std::string reason =
+                    !ok(response) ? error_of(response)->message
+                                  : std::get<ipc::Response>(response).error.message;
+                std::fprintf(stderr,
+                             "服务未能自动重载（%s）；请执行 service reinstall 或重启服务。\n",
+                             reason.c_str());
+            } else {
+                std::printf("服务已重新加载：当前用户/当前 Bucket 已清空。\n");
+            }
+        }
+    }
+
     std::printf("\n数据已永久删除，目录结构已重建。\n");
     std::printf("现在可以直接建新账号：user create <用户名>\n");
     return 0;

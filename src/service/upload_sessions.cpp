@@ -287,6 +287,15 @@ void UploadSessionManager::load_existing() {
             session.error = "服务重启，上传已暂停；执行 upload resume 继续";
             touch(session);
             save_session(session);
+        } else if (session.state == "error") {
+            // 旧版本失败时可能留下几十 GB 分片；失败不是暂停，启动时清掉。
+            cleanup_session_files(session.id);
+            session.uploaded_bytes = 0;
+            session.received.assign(static_cast<std::size_t>(session.chunk_count), false);
+            session.chunk_hashes.assign(static_cast<std::size_t>(session.chunk_count),
+                                        std::string{});
+            touch(session);
+            save_session(session);
         }
         sessions_[session.id] = std::move(session);
     }
@@ -310,6 +319,19 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args) {
     }
     if (config_.current_bucket.empty()) {
         return make_error(ErrorCode::NoCurrentBucket, "未设置当前 Bucket");
+    }
+    // 大文件开始前先确认桶目录仍在：user delete / 手工删目录后，
+    // config.json 里的旧桶名可能已经失效，不能等 7GB 传完才在 commit 报错。
+    {
+        std::error_code bucket_code;
+        const std::filesystem::path bucket_dir =
+            paths_.repository() / path_from_utf8(config_.current_user) /
+            path_from_utf8(config_.current_bucket);
+        if (!std::filesystem::is_directory(bucket_dir, bucket_code)) {
+            return make_error(ErrorCode::NoCurrentBucket,
+                              "当前 Bucket 的目录不存在：" + config_.current_bucket +
+                                  "；请先 bucket create / bucket use");
+        }
     }
 
     const auto argv = args.find("argv");
@@ -1066,26 +1088,8 @@ void UploadSessionManager::complete_in_worker(const std::string& id) {
             if (!in) {
                 out.close();
                 std::filesystem::remove(assembled);
-                {
-                    std::lock_guard<std::mutex> guard(mutex_);
-                    const auto found = sessions_.find(id);
-                    if (found != sessions_.end()) {
-                        const std::uint64_t offset = index * found->second.chunk_size;
-                        const std::uint64_t length =
-                            std::min(found->second.chunk_size, found->second.size - offset);
-                        found->second.received[static_cast<std::size_t>(index)] = false;
-                        found->second.chunk_hashes[static_cast<std::size_t>(index)].clear();
-                        found->second.uploaded_bytes =
-                            found->second.uploaded_bytes > length
-                                ? found->second.uploaded_bytes - length
-                                : 0;
-                        found->second.state = "error";
-                        found->second.error = "分片 " + std::to_string(index) +
-                                              " 缺失，可 upload resume 重传";
-                        touch(found->second);
-                        save_session(found->second);
-                    }
-                }
+                set_error(id, "分片 " + std::to_string(index) +
+                                  " 缺失；已清理残片，可 upload resume 重传");
                 return;
             }
             Md5 chunk_hash;
@@ -1095,6 +1099,8 @@ void UploadSessionManager::complete_in_worker(const std::string& id) {
                 if (got > 0) {
                     if (!chunk_hash.update(buffer.data(), static_cast<std::size_t>(got)) ||
                         !hash.update(buffer.data(), static_cast<std::size_t>(got))) {
+                        in.close();
+                        out.close();
                         std::filesystem::remove(assembled);
                         set_error(id, "MD5 计算失败");
                         return;
@@ -1106,6 +1112,8 @@ void UploadSessionManager::complete_in_worker(const std::string& id) {
             const std::string& expected_chunk =
                 snapshot.chunk_hashes[static_cast<std::size_t>(index)];
             if (actual_chunk.empty()) {
+                in.close();
+                out.close();
                 std::filesystem::remove(assembled);
                 set_error(id, "分片 MD5 计算失败");
                 return;
@@ -1114,27 +1122,8 @@ void UploadSessionManager::complete_in_worker(const std::string& id) {
                 in.close();
                 out.close();
                 std::filesystem::remove(assembled);
-                std::filesystem::remove(chunk_path(id, index));
-                {
-                    std::lock_guard<std::mutex> guard(mutex_);
-                    const auto found = sessions_.find(id);
-                    if (found != sessions_.end()) {
-                        const std::uint64_t offset = index * found->second.chunk_size;
-                        const std::uint64_t length =
-                            std::min(found->second.chunk_size, found->second.size - offset);
-                        found->second.received[static_cast<std::size_t>(index)] = false;
-                        found->second.chunk_hashes[static_cast<std::size_t>(index)].clear();
-                        found->second.uploaded_bytes =
-                            found->second.uploaded_bytes > length
-                                ? found->second.uploaded_bytes - length
-                                : 0;
-                        found->second.state = "error";
-                        found->second.error = "分片 " + std::to_string(index) +
-                                              " 校验失败，已删除，可 upload resume 重传";
-                        touch(found->second);
-                        save_session(found->second);
-                    }
-                }
+                set_error(id, "分片 " + std::to_string(index) +
+                                  " 校验失败；已清理残片，可 upload resume 重传");
                 return;
             }
         }
@@ -1231,6 +1220,9 @@ void UploadSessionManager::complete_in_worker(const std::string& id) {
 }
 
 void UploadSessionManager::set_error(const std::string& id, const std::string& message) {
+    // 失败不是暂停：分片全部清掉，只留 session.json 供 status / resume。
+    // resume 会从源文件重新传，所以不会留下几十 GB 的残片。
+    cleanup_session_files(id);
     std::lock_guard<std::mutex> guard(mutex_);
     const auto found = sessions_.find(id);
     if (found == sessions_.end()) {
@@ -1238,6 +1230,9 @@ void UploadSessionManager::set_error(const std::string& id, const std::string& m
     }
     found->second.state = "error";
     found->second.error = message;
+    found->second.uploaded_bytes = 0;
+    found->second.received.assign(found->second.chunk_count, false);
+    found->second.chunk_hashes.assign(found->second.chunk_count, std::string{});
     touch(found->second);
     save_session(found->second);
 }
