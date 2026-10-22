@@ -382,6 +382,9 @@ public final class FmtClient implements AutoCloseable {
         FmtLargeUploadOptions effective = options == null ? FmtLargeUploadOptions.defaults() : options;
         requireLocalFile(file);
         String name = sanitizeName(fileName == null ? file.getFileName().toString() : fileName);
+        if (!effective.shouldContinue().getAsBoolean()) {
+            throw new FmtApiException(FmtError.local(FmtErrorCodes.UPLOAD_CANCELED, "上传已取消"));
+        }
         FmtUploadSession session;
         if (effective.resumeUploadId() != null) {
             session = channel().largeUploadStatus(effective.resumeUploadId()).orThrow();
@@ -404,6 +407,9 @@ public final class FmtClient implements AutoCloseable {
         requireLocalFile(file);
         FmtLargeUploadOptions effective = options == null ? FmtLargeUploadOptions.defaults() : options;
         String name = sanitizeName(fileName == null ? file.getFileName().toString() : fileName);
+        if (!effective.shouldContinue().getAsBoolean()) {
+            throw new FmtApiException(FmtError.local(FmtErrorCodes.UPLOAD_CANCELED, "上传已取消"));
+        }
         long size = Files.size(file);
         String md5 = effective.md5();
         if (md5 == null) {
@@ -480,6 +486,9 @@ public final class FmtClient implements AutoCloseable {
         long chunkSize = session.chunkSize();
         int chunkCount = (int) session.chunkCount();
         for (int index = 0; index < chunkCount; index++) {
+            if (!options.shouldContinue().getAsBoolean()) {
+                throw new FmtApiException(FmtError.local(FmtErrorCodes.UPLOAD_CANCELED, "上传已取消"));
+            }
             if (received.contains((long) index)) {
                 continue;
             }
@@ -493,6 +502,9 @@ public final class FmtClient implements AutoCloseable {
             report(session, index, options);
         }
 
+        if (!options.shouldContinue().getAsBoolean()) {
+            throw new FmtApiException(FmtError.local(FmtErrorCodes.UPLOAD_CANCELED, "上传已取消"));
+        }
         FmtUpload done = channel().completeLargeUpload(session.uploadId()).orThrow();
         FmtFile fileRecord = done.file();
         FmtUploadProgress completed = new FmtUploadProgress(

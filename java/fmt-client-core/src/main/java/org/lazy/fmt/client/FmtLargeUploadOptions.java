@@ -1,5 +1,7 @@
 package org.lazy.fmt.client;
 
+import java.util.function.BooleanSupplier;
+
 /**
  * 大文件分片上传参数。
  *
@@ -16,12 +18,14 @@ public final class FmtLargeUploadOptions {
     private final String md5;
     private final FmtUploadProgressListener progress;
     private final String resumeUploadId;
+    private final BooleanSupplier shouldContinue;
 
     private FmtLargeUploadOptions(Builder builder) {
         this.chunkSize = builder.chunkSize;
         this.md5 = builder.md5;
         this.progress = builder.progress == null ? FmtUploadProgressListener.NONE : builder.progress;
         this.resumeUploadId = builder.resumeUploadId;
+        this.shouldContinue = builder.shouldContinue == null ? () -> true : builder.shouldContinue;
     }
 
     public static Builder builder() {
@@ -51,12 +55,18 @@ public final class FmtLargeUploadOptions {
         return resumeUploadId;
     }
 
+    /** 每片前检查；返回 false 会中止上传（取消/暂停用）。 */
+    public BooleanSupplier shouldContinue() {
+        return shouldContinue;
+    }
+
     public static final class Builder {
 
         private long chunkSize;
         private String md5;
         private FmtUploadProgressListener progress;
         private String resumeUploadId;
+        private BooleanSupplier shouldContinue;
 
         public Builder chunkSize(long chunkSize) {
             if (chunkSize < 0) {
@@ -78,6 +88,11 @@ public final class FmtLargeUploadOptions {
 
         public Builder resumeUploadId(String uploadId) {
             this.resumeUploadId = uploadId == null || uploadId.isBlank() ? null : uploadId.trim();
+            return this;
+        }
+
+        public Builder shouldContinue(BooleanSupplier shouldContinue) {
+            this.shouldContinue = shouldContinue;
             return this;
         }
 
