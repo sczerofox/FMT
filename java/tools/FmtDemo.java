@@ -45,23 +45,23 @@ import java.util.function.Supplier;
  * <p>用法（Windows 上类路径分隔符是 {@code ;}）：
  * <pre>
  *   # 直接用刚打好的 jar（数据根默认 D:/Data/Temp/JMT/fmt，token 从 data/user.json 读）
- *   java -cp java\fmt-client-core\target\fmt-client-core-2.4.0.jar java\tools\FmtDemo.java
+ *   java -cp java\fmt-client-core\target\fmt-client-core-3.0.0.jar java\tools\FmtDemo.java
  *
  *   # 显式指定：地址 + 数据根（推荐这个写法：服务端换 token 之后 Java 侧不用改）
- *   java -cp ...\fmt-client-core-2.4.0.jar java\tools\FmtDemo.java ^
+ *   java -cp ...\fmt-client-core-3.0.0.jar java\tools\FmtDemo.java ^
  *        --data-root=D:/Data/Temp/JMT/fmt --out-dir=D:/tmp/fmt-demo
  *
  *   # 或直接给明文 token（占位符，别照抄：每个数据根一个）
- *   java -cp ...\fmt-client-core-2.4.0.jar java\tools\FmtDemo.java ^
+ *   java -cp ...\fmt-client-core-3.0.0.jar java\tools\FmtDemo.java ^
  *        --base-url=http://localhost:4122 --token=&lt;32 位十六进制&gt;
  *
  *   # 配假 FMT（java/tools/fake-fmt/FakeFmt.java）联调，不碰真服务
  *   java java\tools\fake-fmt\FakeFmt.java 14122
- *   java -cp ...\fmt-client-core-2.4.0.jar java\tools\FmtDemo.java ^
+ *   java -cp ...\fmt-client-core-3.0.0.jar java\tools\FmtDemo.java ^
  *        --base-url=http://127.0.0.1:14122 --token=test-token-1234567890abcdef --keep
  *
  *   # 上传本机某个文件（不给 --in 就上传一段内存字节）
- *   java -cp ...\fmt-client-core-2.4.0.jar java\tools\FmtDemo.java --in=D:/报表.xlsx
+ *   java -cp ...\fmt-client-core-3.0.0.jar java\tools\FmtDemo.java --in=D:/报表.xlsx
  * </pre>
  *
  * <p>可选参数：{@code --search=关键字}（列表页过滤）、{@code --keep}（不回滚，把演示文件留在
