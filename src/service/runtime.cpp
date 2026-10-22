@@ -654,6 +654,52 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
         return response;
     }
 
+    // file delete 也接受 upload_id：完成的上传会话 → final_file_id；
+    // 之后仍走 FileService::remove 的软删除（进 trash），物理删除仍是 trash delete。
+    nlohmann::json effective_args = request.args;
+    if (request.op == "file.delete") {
+        const auto argv = effective_args.find("argv");
+        if (argv != effective_args.end() && argv->is_array() && !argv->empty() &&
+            (*argv)[0].is_string() &&
+            starts_with((*argv)[0].get<std::string>(), "up-")) {
+            std::shared_ptr<UploadSessionManager> uploads;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                uploads = uploads_;
+            }
+            if (!uploads) {
+                response.ok = false;
+                response.error = make_error(ErrorCode::ServiceOperationFailed,
+                                            "服务尚未初始化数据根");
+                return response;
+            }
+            const std::string upload_id = (*argv)[0].get<std::string>();
+            Result<nlohmann::json> upload = uploads->lookup(upload_id);
+            if (!ok(upload)) {
+                response.ok = false;
+                response.error = *error_of(upload);
+                return response;
+            }
+            const nlohmann::json& session = std::get<nlohmann::json>(upload);
+            const std::string state = session.value("state", std::string{});
+            if (state != "completed") {
+                response.ok = false;
+                response.error = make_error(
+                    ErrorCode::UploadStateInvalid,
+                    "上传会话尚未完成（" + state + "），请先 upload wait，或 upload cancel");
+                return response;
+            }
+            const std::string file_id = session.value("final_file_id", std::string{});
+            if (file_id.empty()) {
+                response.ok = false;
+                response.error = make_error(ErrorCode::FileNotFound,
+                                            "上传会话没有对应的 file_id：" + upload_id);
+                return response;
+            }
+            effective_args["argv"][0] = file_id;
+        }
+    }
+
     // 上传是唯一的长任务：两段式，下载在锁外，登记在锁内。
     if (request.op == "file.upload") {
         Result<nlohmann::json> uploaded = run_upload(request.args);
@@ -682,7 +728,7 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
         return response;
     }
 
-    Result<nlohmann::json> result = execute_business(*context_, request.op, request.args);
+    Result<nlohmann::json> result = execute_business(*context_, request.op, effective_args);
     if (ok(result)) {
         response.ok = true;
         response.data = std::get<nlohmann::json>(result);

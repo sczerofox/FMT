@@ -1826,6 +1826,12 @@ FMT_TEST(Service, 大文件内容与文件名验证) {
     const std::string first_file = first_done.data.value("final_file_id", std::string{});
     FMT_CHECK(!first_file.empty());
 
+    // 同一个本地文件再传：直接秒传复用同一个 upload_id，不新增会话。
+    const fmt::ipc::Response reused = start(first, "same.bin");
+    FMT_CHECK(reused.ok);
+    FMT_CHECK(reused.data.value("reused", false));
+    FMT_CHECK_EQ(reused.data.value("upload_id", std::string{}), first_id);
+
     // 同内容不同文件名：应直接复用 first_file，不重新传。
     const fmt::ipc::Response duplicate = start(first, "other-name.bin");
     FMT_CHECK(duplicate.ok);
@@ -1843,6 +1849,46 @@ FMT_TEST(Service, 大文件内容与文件名验证) {
     FMT_CHECK(conflict_done.ok);
     FMT_CHECK_EQ(conflict_done.data.value("file_name", std::string{}),
                  std::string("same01.bin"));
+
+    // 两个 completed 会话指向同一个 file_id 时，list 合并成一行。
+    fmt::ipc::Request list;
+    list.id = 50;
+    list.op = "upload.list";
+    const fmt::ipc::Response listed = runtime.handle(list);
+    FMT_CHECK(listed.ok);
+    FMT_CHECK_EQ(listed.data.value("count", std::size_t{0}), std::size_t{2});
+    bool saw_duplicate = false;
+    for (const auto& item : listed.data["uploads"]) {
+        if (item.value("final_file_id", std::string{}) == first_file &&
+            item.value("duplicate_count", 1) >= 2) {
+            saw_duplicate = true;
+        }
+    }
+    FMT_CHECK(saw_duplicate);
+
+    // file delete <upload_id> 走软删除，file_id 不应再作为正常文件存在。
+    fmt::ipc::Request remove;
+    remove.id = 60;
+    remove.op = "file.delete";
+    remove.args["argv"] = nlohmann::json::array({first_id});
+    remove.args["force"] = true;
+    const fmt::ipc::Response removed = runtime.handle(remove);
+    FMT_CHECK(removed.ok);
+
+    fmt::ipc::Request get_file;
+    get_file.id = 61;
+    get_file.op = "file.get";
+    get_file.args["argv"] = nlohmann::json::array({"same.bin"});
+    FMT_CHECK(!runtime.handle(get_file).ok);
+
+    fmt::ipc::Request after_delete;
+    after_delete.id = 62;
+    after_delete.op = "upload.list";
+    const fmt::ipc::Response remaining = runtime.handle(after_delete);
+    FMT_CHECK(remaining.ok);
+    for (const auto& item : remaining.data["uploads"]) {
+        FMT_CHECK(item.value("final_file_id", std::string{}) != first_file);
+    }
 
     // 非法文件名在 upload.start 就拒绝，不建会话、不传分片。
     const fmt::ipc::Response invalid = start(first, "fmt-20261021-1");

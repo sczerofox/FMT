@@ -412,7 +412,7 @@ bool print_command_help(const std::string& topic) {
             "  pause <upload_id>        当前分片写完后暂停（算源文件 MD5 时也会尽快停）\n"
             "  resume <upload_id>       从缺少的分片继续；服务重启后也可用\n"
             "  cancel <upload_id>       取消并清理临时分片\n"
-            "  list                     列出当前用户的上传会话\n"
+            "  list [--all]             列出上传记录；默认把同 file_id 的历史合并成一行\n"
             "  wait <upload_id>         持续显示进度条、速度、ETA 直到完成\n"
             "\n"
             "每个分片写入时记录 MD5，拼接时逐片校验；坏片会删除并提示 resume 重传。\n"
@@ -442,9 +442,12 @@ bool print_command_help(const std::string& topic) {
             "  get <file_id|文件名>     按文件名查当前 Bucket 的正常文件（同名的在别的桶时\n"
             "                           会告诉你在哪个桶）；按 file_id 全局查，连回收站里的\n"
             "                           也查得到（带 is_trash 与 trash_path）\n"
-            "  delete <file_id|文件名>  软删除进回收站，file_id 不变；之后用\n"
+            "  delete <file_id|文件名|upload_id>\n"
+            "                           软删除进回收站，file_id 不变；之后用\n"
             "                           trash list / trash restore 找回来。按名字只在当前\n"
-            "                           Bucket 内生效；要删别的桶里的那份请用 file_id（会先确认）\n"
+            "                           Bucket 内生效；要删别的桶里的那份请用 file_id（会先确认）。\n"
+            "                           给 completed 的 upload_id 也可以，服务会解析到\n"
+            "                           对应的 file_id；未完成的上传请先 upload cancel。\n"
             "\n"
             "文件落在 repository/<用户>/<Bucket>/YYYY/MM/DD/ 下；上传先写 temp/，\n"
             "校验（大小上限、MD5、文件名）通过后才移动入库。\n"
@@ -2010,6 +2013,9 @@ void print_upload_one(const nlohmann::json& data) {
     if (data.contains("expires_at")) {
         std::printf("expires   = %s\n", data.value("expires_at", std::string{}).c_str());
     }
+    if (data.value("reused", false)) {
+        std::printf("reused    = %s\n", data.value("message", std::string{}).c_str());
+    }
     if (!data.value("final_file_id", std::string{}).empty()) {
         std::printf("file_id   = %s\n", data.value("final_file_id", std::string{}).c_str());
     }
@@ -2125,6 +2131,12 @@ int run_upload_command(const std::vector<std::string>& parts, Session& session,
         }
         print_upload_one(value.data);
         if (!wait) {
+            if (value.data.value("state", std::string{}) == "completed") {
+                std::printf("秒传完成：%s（%s）\n",
+                            value.data.value("final_file_id", std::string{}).c_str(),
+                            value.data.value("file_name", std::string{}).c_str());
+                return 0;
+            }
             std::printf("后台上传中：upload status %s / upload pause %s\n",
                         value.data.value("upload_id", std::string{}).c_str(),
                         value.data.value("upload_id", std::string{}).c_str());
@@ -2146,6 +2158,11 @@ int run_upload_command(const std::vector<std::string>& parts, Session& session,
     }
 
     if (verb == "list") {
+        for (std::size_t i = 2; i < parts.size(); ++i) {
+            if (parts[i] == "--all") {
+                args["all"] = true;
+            }
+        }
         Result<ipc::Response> response = upload_call(session, options, "upload.list", args);
         if (!ok(response)) {
             print_failure(*error_of(response));
@@ -2159,13 +2176,27 @@ int run_upload_command(const std::vector<std::string>& parts, Session& session,
         const auto uploads = value.data.find("uploads");
         if (uploads != value.data.end() && uploads->is_array()) {
             for (const auto& item : *uploads) {
-                std::printf("  %s  %s  %d%%  %s\n",
-                            item.value("upload_id", std::string{}).c_str(),
+                std::printf("  %s  %s  %d%%  %s", item.value("upload_id", std::string{}).c_str(),
                             item.value("file_name", std::string{}).c_str(),
                             item.value("percent", 0),
                             item.value("state", std::string{}).c_str());
+                if (!item.value("final_file_id", std::string{}).empty()) {
+                    std::printf("  file %s", item.value("final_file_id", std::string{}).c_str());
+                }
+                if (item.value("duplicate_count", 1) > 1) {
+                    std::printf("  (%llu 条历史)",
+                                static_cast<unsigned long long>(
+                                    item.value("duplicate_count", 1)));
+                }
+                std::printf("\n");
             }
-            std::printf("共 %zu 个上传会话\n", uploads->size());
+            std::printf("共 %zu 个上传文件", uploads->size());
+            if (value.data.value("total_sessions", uploads->size()) > uploads->size()) {
+                std::printf("（%zu 条历史会话）",
+                            static_cast<std::size_t>(
+                                value.data.value("total_sessions", uploads->size())));
+            }
+            std::printf("\n");
         }
         return 0;
     }

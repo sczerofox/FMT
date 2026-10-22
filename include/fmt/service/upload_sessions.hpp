@@ -43,6 +43,9 @@ public:
     // 处理 upload.start / status / list / pause / resume / cancel / complete。
     Result<nlohmann::json> handle(const std::string& operation, const nlohmann::json& args);
 
+    // 给 file delete <upload_id> 用：返回会话（completed 时有 final_file_id）。
+    Result<nlohmann::json> lookup(const std::string& upload_id);
+
     // 服务停止/换根时调用：让后台线程在分片边界退出并 join。
     void stop();
 
@@ -54,6 +57,7 @@ private:
         std::string source_path;
         std::string file_name;
         std::uint64_t size = 0;
+        std::int64_t source_mtime = 0;  // 源文件最后写入时间（秒）；老会话为 0
         std::uint64_t chunk_size = 0;
         std::uint64_t chunk_count = 0;
         std::string md5;
@@ -72,7 +76,7 @@ private:
 
     Result<nlohmann::json> start(const nlohmann::json& args);
     Result<nlohmann::json> status(const std::string& id);
-    Result<nlohmann::json> list();
+    Result<nlohmann::json> list(bool all);
     Result<nlohmann::json> pause(const std::string& id);
     Result<nlohmann::json> resume(const std::string& id);
     Result<nlohmann::json> cancel(const std::string& id);
@@ -101,6 +105,7 @@ private:
     bool all_received(const Session& session) const;
     std::uint64_t next_missing(const Session& session) const;
     bool should_upload_continue(const std::string& id) const;
+    bool owned(const Session& session) const;
 
     nlohmann::json session_json(const Session& session, bool include_missing) const;
     std::string next_name(const std::string& original, int sequence) const;
