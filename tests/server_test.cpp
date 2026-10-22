@@ -172,6 +172,22 @@ FMT_TEST(Server, 分片上传HTTP分片与完成) {
         FMT_CHECK(!body["data"].value("final_file_id", std::string{}).empty());
     }
 
+    // HTTP 上传也要进入 upload list，且标出来源。
+    const auto listed = uploads.handle_for("upload.list", nlohmann::json::object(), "user",
+                                           "work");
+    FMT_CHECK(fmt::ok(listed));
+    if (fmt::ok(listed)) {
+        const auto& data = std::get<nlohmann::json>(listed);
+        FMT_CHECK(data.value("count", std::size_t{0}) >= 1);
+        bool saw_http = false;
+        for (const auto& item : data["uploads"]) {
+            if (item.value("origin", std::string{}) == "http") {
+                saw_http = true;
+            }
+        }
+        FMT_CHECK(saw_http);
+    }
+
     bool found_file = false;
     std::error_code code;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(paths.repository(), code)) {

@@ -137,6 +137,7 @@ nlohmann::json UploadSessionManager::session_json(const Session& session,
     value["upload_id"] = session.id;
     value["user"] = session.user;
     value["bucket"] = session.bucket;
+    value["origin"] = session.origin;
     value["source_path"] = session.source_path;
     value["source_mtime"] = session.source_mtime;
     value["file_name"] = session.final_file_name.empty() ? session.file_name : session.final_file_name;
@@ -210,6 +211,7 @@ Result<UploadSessionManager::Session> UploadSessionManager::load_session(
     session.id = value.value("upload_id", std::string{});
     session.user = value.value("user", std::string{});
     session.bucket = value.value("bucket", std::string{});
+    session.origin = value.value("origin", std::string{"cli"});
     session.source_path = value.value("source_path", std::string{});
     session.source_mtime = value.value("source_mtime", std::int64_t{0});
     session.file_name = value.value("file_name", std::string{});
@@ -480,6 +482,7 @@ Result<nlohmann::json> UploadSessionManager::start(const nlohmann::json& args,
     Session session;
     session.user = user;
     session.bucket = bucket;
+    session.origin = "cli";
     session.source_path = source_text;
     session.source_mtime = source_mtime;
     session.file_name = name;
@@ -614,6 +617,7 @@ Result<nlohmann::json> UploadSessionManager::init_for(const nlohmann::json& args
     Session session;
     session.user = user;
     session.bucket = bucket;
+    session.origin = "http";
     session.file_name = name;
     session.size = size;
     session.chunk_size = chunk_size;
@@ -710,6 +714,48 @@ Result<nlohmann::json> UploadSessionManager::lookup_for(const std::string& uploa
     return status(upload_id, user, bucket);
 }
 
+std::size_t UploadSessionManager::prune_missing_files(const std::string& user,
+                                                       const std::string& bucket) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    cleanup_expired_locked();
+    Config config = config_;
+    config.current_user = user;
+    if (!bucket.empty()) {
+        config.current_bucket = bucket;
+    }
+    FileService files(paths_, config, logger_);
+    std::vector<std::string> missing;
+    for (const auto& item : sessions_) {
+        const Session& session = item.second;
+        if (!iequals(session.user, user)) {
+            continue;
+        }
+        if (!bucket.empty() && !iequals(session.bucket, bucket)) {
+            continue;
+        }
+        if (session.state != "completed" || session.final_file_id.empty()) {
+            continue;
+        }
+        Result<FileRecord> record = files.get_by_id(session.final_file_id);
+        if (!ok(record)) {
+            if (error_of(record)->code == ErrorCode::FileNotFound) {
+                missing.push_back(session.id);
+            }
+            continue;
+        }
+        const FileRecord& current = std::get<FileRecord>(record);
+        if (!current.is_trash && !matches_file(session, current)) {
+            missing.push_back(session.id);
+        }
+    }
+    for (const std::string& id : missing) {
+        std::error_code ignored;
+        std::filesystem::remove_all(session_dir(id), ignored);
+        sessions_.erase(id);
+    }
+    return missing.size();
+}
+
 Result<nlohmann::json> UploadSessionManager::status(const std::string& id, const std::string& user,
                                                     const std::string& bucket) {
     std::lock_guard<std::mutex> guard(mutex_);
@@ -731,6 +777,7 @@ Result<nlohmann::json> UploadSessionManager::list(bool all, const std::string& u
     nlohmann::json uploads = nlohmann::json::array();
     std::unordered_map<std::string, std::size_t> seen_final;
     std::unordered_map<std::string, std::size_t> seen_md5;
+    std::vector<std::string> stale;
     Config list_config = config_;
     list_config.current_user = user;
     list_config.current_bucket = bucket;
@@ -749,10 +796,18 @@ Result<nlohmann::json> UploadSessionManager::list(bool all, const std::string& u
             FileService files(paths_, list_config, logger_);
             Result<FileRecord> record = files.get_by_id(session.final_file_id);
             if (!ok(record)) {
+                if (error_of(record)->code == ErrorCode::FileNotFound) {
+                    stale.push_back(session.id);
+                }
                 continue;
             }
             const FileRecord& current = std::get<FileRecord>(record);
             if (current.is_trash || !iequals(current.bucket, bucket)) {
+                continue;
+            }
+            if (!matches_file(session, current)) {
+                // file_id 被物理删除后的新文件复用；这条历史已失效。
+                stale.push_back(session.id);
                 continue;
             }
             std::optional<std::size_t> visible;
@@ -790,6 +845,12 @@ Result<nlohmann::json> UploadSessionManager::list(bool all, const std::string& u
         nlohmann::json value = session_json(session, false);
         value["duplicate_count"] = 1;
         uploads.push_back(std::move(value));
+    }
+
+    for (const std::string& id : stale) {
+        std::error_code ignored;
+        std::filesystem::remove_all(session_dir(id), ignored);
+        sessions_.erase(id);
     }
 
     nlohmann::json data = nlohmann::json::object();
@@ -988,6 +1049,45 @@ bool UploadSessionManager::should_upload_continue(const std::string& id) const {
 bool UploadSessionManager::owned(const Session& session, const std::string& user,
                                  const std::string& bucket) const {
     return iequals(session.user, user) && iequals(session.bucket, bucket);
+}
+
+bool UploadSessionManager::matches_file(const Session& session, const FileRecord& record) {
+    if (record.is_trash || !iequals(record.user, session.user)) {
+        return false;
+    }
+    if (session.size != record.size) {
+        return false;
+    }
+    return session.md5.empty() || iequals(session.md5, record.md5);
+}
+
+Result<std::string> UploadSessionManager::verified_file_id(const std::string& upload_id,
+                                                            const std::string& user,
+                                                            const std::string& bucket) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    cleanup_expired_locked();
+    const auto found = sessions_.find(upload_id);
+    if (found == sessions_.end() || !owned(found->second, user, bucket)) {
+        return make_error(ErrorCode::UploadSessionNotFound, "上传会话不存在：" + upload_id);
+    }
+    const Session& session = found->second;
+    if (session.state != "completed" || session.final_file_id.empty()) {
+        return make_error(ErrorCode::UploadStateInvalid, "上传会话尚未完成：" + upload_id);
+    }
+    Config config = config_;
+    config.current_user = user;
+    config.current_bucket = bucket;
+    FileService files(paths_, config, logger_);
+    Result<FileRecord> record = files.get_by_id(session.final_file_id);
+    if (!ok(record)) {
+        return make_error(ErrorCode::UploadSessionNotFound,
+                          "上传会话对应的文件已不存在：" + session.final_file_id);
+    }
+    if (!matches_file(session, std::get<FileRecord>(record))) {
+        return make_error(ErrorCode::UploadSessionNotFound,
+                          "上传会话已失效（file_id 已被其他文件复用）：" + upload_id);
+    }
+    return session.final_file_id;
 }
 
 std::uint64_t UploadSessionManager::next_missing(const Session& session) const {

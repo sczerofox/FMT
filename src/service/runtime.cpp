@@ -792,7 +792,26 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
                                             "上传会话没有对应的 file_id：" + upload_id);
                 return response;
             }
-            effective_args["argv"][0] = file_id;
+            Config config;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                if (context_ != nullptr) {
+                    config = context_->config;
+                }
+            }
+            std::string verified_bucket = config.current_bucket;
+            if (const auto scoped = effective_args.find("_bucket");
+                scoped != effective_args.end() && scoped->is_string()) {
+                verified_bucket = scoped->get<std::string>();
+            }
+            const Result<std::string> verified =
+                uploads->verified_file_id(upload_id, config.current_user, verified_bucket);
+            if (!ok(verified)) {
+                response.ok = false;
+                response.error = *error_of(verified);
+                return response;
+            }
+            effective_args["argv"][0] = std::get<std::string>(verified);
         }
     }
 
@@ -828,6 +847,22 @@ ipc::Response ServerRuntime::handle(const ipc::Request& request) {
     if (ok(result)) {
         response.ok = true;
         response.data = std::get<nlohmann::json>(result);
+
+        // 只有**物理清除**回收站内容后才删上传会话；软删除由 upload list 按
+        // is_trash 隐藏，恢复文件后历史仍可回来。
+        if (uploads_ && !effective_args.value("dry_run", false) &&
+            (request.op == "trash.delete" || request.op == "trash.empty")) {
+            const std::string user = context_->config.current_user;
+            std::string bucket = context_->config.current_bucket;
+            if (const auto scoped = effective_args.find("_bucket");
+                scoped != effective_args.end() && scoped->is_string()) {
+                bucket = scoped->get<std::string>();
+            }
+            if (request.op == "trash.empty") {
+                bucket.clear();  // 整站清空：所有 Bucket 的上传历史都检查
+            }
+            uploads_->prune_missing_files(user, bucket);
+        }
         return response;
     }
 

@@ -2224,6 +2224,9 @@ int run_upload_command(const std::vector<std::string>& parts, Session& session,
                                 static_cast<unsigned long long>(
                                     item.value("duplicate_count", 1)));
                 }
+                if (item.value("origin", std::string{}) == "http") {
+                    std::printf("  [HTTP]");
+                }
                 std::printf("\n");
             }
             std::printf("共 %zu 个上传文件", uploads->size());

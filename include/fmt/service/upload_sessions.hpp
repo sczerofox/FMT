@@ -28,6 +28,10 @@
 #include "fmt/config/config.hpp"
 #include "fmt/core/path_manager.hpp"
 
+namespace fmt {
+struct FileRecord;
+}
+
 namespace fmt::service {
 
 class UploadSessionManager {
@@ -53,6 +57,15 @@ public:
     Result<nlohmann::json> lookup_for(const std::string& upload_id, const std::string& user,
                                       const std::string& bucket);
 
+    // trash delete/empty 物理清除后：删掉指向已不存在 file_id 的会话记录。
+    // 软删除（文件还在 trash）不会调用它。
+    std::size_t prune_missing_files(const std::string& user, const std::string& bucket);
+
+    // 校验 upload_id 的 final_file_id 仍指向同一份内容；防止物理删除后
+    // file_id 被新文件复用，导致 file delete <upload_id> 删错文件。
+    Result<std::string> verified_file_id(const std::string& upload_id,
+                                         const std::string& user, const std::string& bucket);
+
     // HTTP 初始化（没有本地源文件；客户端逐片上传）。
     Result<nlohmann::json> init_for(const nlohmann::json& args, const std::string& user,
                                     const std::string& bucket);
@@ -69,6 +82,7 @@ private:
         std::string id;
         std::string user;
         std::string bucket;
+        std::string origin = "cli";  // cli / http
         std::string source_path;
         std::string file_name;
         std::uint64_t size = 0;
@@ -128,6 +142,7 @@ private:
     bool should_upload_continue(const std::string& id) const;
     bool owned(const Session& session, const std::string& user,
                const std::string& bucket) const;
+    static bool matches_file(const Session& session, const FileRecord& record);
 
     nlohmann::json session_json(const Session& session, bool include_missing) const;
     std::string next_name(const std::string& original, int sequence) const;

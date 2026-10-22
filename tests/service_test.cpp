@@ -1890,6 +1890,28 @@ FMT_TEST(Service, 大文件内容与文件名验证) {
         FMT_CHECK(item.value("final_file_id", std::string{}) != first_file);
     }
 
+    // 物理清空回收站：大文件会话记录要跟着删；同一文件的重复历史也一起删。
+    fmt::ipc::Request purge;
+    purge.id = 63;
+    purge.op = "trash.delete";
+    purge.args["argv"] = nlohmann::json::array({first_file});
+    purge.args["force"] = true;
+    const fmt::ipc::Response purged = runtime.handle(purge);
+    FMT_CHECK(purged.ok);
+
+    fmt::ipc::Request gone_status;
+    gone_status.id = 64;
+    gone_status.op = "upload.status";
+    gone_status.args["argv"] = nlohmann::json::array({first_id});
+    FMT_CHECK(!runtime.handle(gone_status).ok);
+
+    fmt::ipc::Request after_purge;
+    after_purge.id = 65;
+    after_purge.op = "upload.list";
+    const fmt::ipc::Response after_purge_list = runtime.handle(after_purge);
+    FMT_CHECK(after_purge_list.ok);
+    FMT_CHECK_EQ(after_purge_list.data.value("count", std::size_t{0}), std::size_t{1});
+
     // 非法文件名在 upload.start 就拒绝，不建会话、不传分片。
     const fmt::ipc::Response invalid = start(first, "fmt-20261021-1");
     FMT_CHECK(!invalid.ok);
