@@ -151,6 +151,11 @@ nlohmann::json UploadSessionManager::session_json(const Session& session,
     value["updated_at"] = session.updated_at;
     value["expires_at"] = session.expires_at;
     value["final_file_id"] = session.final_file_id;
+    // HTTP 的 complete 直接返回这个 JSON；Java 的 FmtUpload.from 读根上的 file_id。
+    // 给已完成会话补一份别名，status/list 看到也无害。
+    if (!session.final_file_id.empty()) {
+        value["file_id"] = session.final_file_id;
+    }
     value["error"] = session.error;
 
     nlohmann::json received = nlohmann::json::array();
