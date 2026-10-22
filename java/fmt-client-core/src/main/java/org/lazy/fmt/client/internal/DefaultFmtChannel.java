@@ -25,6 +25,7 @@ import org.lazy.fmt.client.model.FmtTrashEmpty;
 import org.lazy.fmt.client.model.FmtTrashEntry;
 import org.lazy.fmt.client.model.FmtTrashListing;
 import org.lazy.fmt.client.model.FmtUpload;
+import org.lazy.fmt.client.model.FmtUploadSession;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -260,6 +261,80 @@ public final class DefaultFmtChannel implements FmtChannel {
         // 流只能读一次 → 不允许 401 重试（重试会读到已耗尽的流）。
         // 未知长度时走 chunked，服务端（cpp-httplib）支持。
         return uploadInternal(HttpRequest.BodyPublishers.ofInputStream(() -> in), name, false);
+    }
+
+    @Override
+    public FmtResult<FmtUploadSession> initLargeUpload(String fileName, long size, long chunkSize,
+                                                       String md5) {
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("file_name", fileName);
+        body.put("size", size);
+        if (chunkSize > 0) {
+            body.put("chunk_size", chunkSize);
+        }
+        if (md5 != null && !md5.isBlank()) {
+            body.put("md5", md5);
+        }
+        return jsonCall("POST", "/api/upload/init", null, body, true)
+                .map(FmtUploadSession::from);
+    }
+
+    @Override
+    public FmtResult<FmtUploadSession> largeUploadStatus(String uploadId) {
+        return uploadSessionCall("GET", "/api/upload/" + encodeSegment(uploadId), null);
+    }
+
+    @Override
+    public FmtResult<FmtUploadSession> uploadLargeChunk(String uploadId, int index, byte[] data,
+                                                        String chunkMd5) {
+        if (data == null) {
+            return FmtResult.failure(FmtErrorCodes.INVALID_ARGUMENT, "分片内容不能为空");
+        }
+        String path = "/api/upload/" + encodeSegment(uploadId) + "/chunk";
+        String encodedQuery = encodeQuery(Map.of("index", Integer.toString(index)));
+        String label = "PUT " + path + "?" + encodedQuery;
+        HttpResponse<String> response = exchange(label, true, true, false, config.streamTimeout(),
+                () -> {
+                    HttpRequest.Builder builder = HttpRequest.newBuilder(resolve(path, encodedQuery))
+                            .PUT(HttpRequest.BodyPublishers.ofByteArray(data));
+                    builder.setHeader("Content-Type", "application/octet-stream");
+                    if (chunkMd5 != null && !chunkMd5.isBlank()) {
+                        builder.setHeader("X-Chunk-MD5", chunkMd5);
+                    }
+                    return builder;
+                },
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        return parseEnvelope(response.statusCode(), response.body()).map(FmtUploadSession::from);
+    }
+
+    @Override
+    public FmtResult<FmtUpload> completeLargeUpload(String uploadId) {
+        String path = "/api/upload/" + encodeSegment(uploadId) + "/complete";
+        String label = "POST " + path;
+        HttpResponse<String> response = exchange(label, true, false, false, config.streamTimeout(),
+                () -> HttpRequest.newBuilder(resolve(path, null))
+                        .POST(HttpRequest.BodyPublishers.noBody()),
+                HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+        return parseEnvelope(response.statusCode(), response.body()).map(FmtUpload::from);
+    }
+
+    @Override
+    public FmtResult<FmtUploadSession> pauseLargeUpload(String uploadId) {
+        return uploadSessionCall("POST", "/api/upload/" + encodeSegment(uploadId) + "/pause", null);
+    }
+
+    @Override
+    public FmtResult<FmtUploadSession> resumeLargeUpload(String uploadId) {
+        return uploadSessionCall("POST", "/api/upload/" + encodeSegment(uploadId) + "/resume", null);
+    }
+
+    @Override
+    public FmtResult<FmtUploadSession> cancelLargeUpload(String uploadId) {
+        return uploadSessionCall("DELETE", "/api/upload/" + encodeSegment(uploadId), null);
+    }
+
+    private FmtResult<FmtUploadSession> uploadSessionCall(String method, String path, Object body) {
+        return jsonCall(method, path, null, body, true).map(FmtUploadSession::from);
     }
 
     @Override

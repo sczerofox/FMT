@@ -307,20 +307,57 @@ fmt.upload(bytes, "报表.xlsx");                          // 内存里的字节
 try (InputStream in = file.getInputStream()) {           // 流（chunked，不参与 401 重试）
     fmt.upload(in, file.getOriginalFilename());
 }
-// 本机文件：自己读出来交进去（SDK 没有 upload(Path)，这是有意的）
+// 本机文件：FmtClient 的 Path 便捷方法（客户端本地读文件，不是把路径给服务端）
 Path report = Path.of("D:/a.xlsx");
-try (InputStream in = Files.newInputStream(report)) {
-    fmt.upload(in, report.getFileName().toString());
-}
+fmt.upload(report);
 ```
 
-> **为什么删掉了 `upload(Path)`**：接口一旦收路径，就很容易把**服务端**的路径当参数递进来
-> （FMT 只监听 localhost，客户端与服务端经常在同一台机器上），那等于让一次上传把服务进程
-> 能读到的任意文件拖出去；这种误用在编译期完全看不出来。所以内容只能由调用方自己读成
-> 字节或流，文件名也必须显式给。
+> **底层 `FmtChannel.upload` 仍然只收 byte[] / InputStream**：`FmtClient.upload(Path)`
+> 只是客户端本地打开文件，内容照样由调用方进程读出；服务端从不接收路径。
 
 > 超过 FMT 的 `max_upload_size` 时服务端**边收边判、立刻中止**：你可能拿到 `FMT-303`，
 > 也可能拿到连接被重置的 IO 异常。建议业务侧先用文件大小做一次粗预检。
+
+### 4.3.1 大文件分片上传
+
+`upload(...)` 仍然是一次 HTTP 请求，适合普通文件；大文件用 `uploadLarge(...)`：
+
+```java
+try (FmtClient fmt = new FmtClient("lazy", "123456", "pet")) {
+    FmtFilePackage pkg = fmt.uploadLarge(
+            Path.of("D:/Application/minecraft.rar"),
+            "minecraft.rar",
+            FmtLargeUploadOptions.builder()
+                    .chunkSize(8L * 1024 * 1024)
+                    .progress(p -> System.out.printf(
+                            "%d%%  分片 %d/%d%n",
+                            p.percent(), p.chunkIndex() + 1, p.chunkCount()))
+                    .build());
+    System.out.println(pkg.fileId());
+}
+```
+
+它会自动算整文件 MD5、建会话、逐片 PUT（带 `X-Chunk-MD5`）、回调进度并完成入库。
+
+断点续传：
+
+```java
+FmtUploadSession status = fmt.largeUploadStatus(uploadId);
+fmt.resumeLargeUpload(Path.of("D:/Application/minecraft.rar"), uploadId,
+        FmtLargeUploadOptions.builder()
+                .progress(p -> System.out.println(p.percent() + "%"))
+                .build());
+```
+
+暂停/取消：
+
+```java
+fmt.pauseLargeUpload(uploadId);
+fmt.cancelLargeUpload(uploadId);
+```
+
+`uploadLarge` 开始前会读一遍源文件算 MD5；续传不会重算，只按服务端的 `received/missing` 传缺片。
+文件大小必须与会话一致，否则抛配置异常。
 
 ### 4.4 FMT → Java 只能拉，不能推
 

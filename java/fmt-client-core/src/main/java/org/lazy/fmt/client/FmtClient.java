@@ -12,20 +12,27 @@ import org.lazy.fmt.client.model.FmtServerStatus;
 import org.lazy.fmt.client.model.FmtShare;
 import org.lazy.fmt.client.model.FmtTrashListing;
 import org.lazy.fmt.client.model.FmtUpload;
+import org.lazy.fmt.client.model.FmtUploadProgress;
+import org.lazy.fmt.client.model.FmtUploadSession;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Duration;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 最简单的 FMT 客户端：**先建连接，再调业务**。
@@ -355,6 +362,187 @@ public final class FmtClient implements AutoCloseable {
             Files.deleteIfExists(spool);
         }
     }
+
+    /** 大文件上传：自动分片、秒传、断点续传、进度回调。 */
+    public FmtFilePackage uploadLarge(Path file) throws IOException {
+        return uploadLarge(file, file == null ? null : file.getFileName().toString(),
+                FmtLargeUploadOptions.defaults());
+    }
+
+    public FmtFilePackage uploadLarge(Path file, String fileName) throws IOException {
+        return uploadLarge(file, fileName, FmtLargeUploadOptions.defaults());
+    }
+
+    public FmtFilePackage uploadLarge(Path file, FmtLargeUploadOptions options) throws IOException {
+        return uploadLarge(file, file == null ? null : file.getFileName().toString(), options);
+    }
+
+    public FmtFilePackage uploadLarge(Path file, String fileName, FmtLargeUploadOptions options)
+            throws IOException {
+        FmtLargeUploadOptions effective = options == null ? FmtLargeUploadOptions.defaults() : options;
+        requireLocalFile(file);
+        String name = sanitizeName(fileName == null ? file.getFileName().toString() : fileName);
+        FmtUploadSession session;
+        if (effective.resumeUploadId() != null) {
+            session = channel().largeUploadStatus(effective.resumeUploadId()).orThrow();
+            if (session.canceled()) {
+                throw new FmtApiException(FmtError.local(FmtErrorCodes.UPLOAD_CANCELED,
+                        "上传会话已取消：" + session.uploadId()));
+            }
+            if (session.failed() || "paused".equalsIgnoreCase(session.state())) {
+                session = channel().resumeLargeUpload(session.uploadId()).orThrow();
+            }
+        } else {
+            session = startLargeUpload(file, name, effective);
+        }
+        return finishLargeUpload(file, name, session, effective);
+    }
+
+    /** 只初始化/查询会话，不上传分片；适合“先拿 upload_id 再决定何时传”。 */
+    public FmtUploadSession startLargeUpload(Path file, String fileName,
+                                             FmtLargeUploadOptions options) throws IOException {
+        requireLocalFile(file);
+        FmtLargeUploadOptions effective = options == null ? FmtLargeUploadOptions.defaults() : options;
+        String name = sanitizeName(fileName == null ? file.getFileName().toString() : fileName);
+        long size = Files.size(file);
+        String md5 = effective.md5();
+        if (md5 == null) {
+            md5 = md5(Files.newInputStream(file));
+        }
+        FmtUploadSession session = channel().initLargeUpload(name, size, effective.chunkSize(), md5)
+                .orThrow();
+        report(session, -1, effective);
+        return session;
+    }
+
+    /** 续传：file 必须是同一个文件（大小必须一致）。 */
+    public FmtFilePackage resumeLargeUpload(Path file, String uploadId, FmtLargeUploadOptions options)
+            throws IOException {
+        FmtLargeUploadOptions effective = options == null ? FmtLargeUploadOptions.defaults() : options;
+        FmtLargeUploadOptions withResume = FmtLargeUploadOptions.builder()
+                .chunkSize(effective.chunkSize())
+                .md5(effective.md5())
+                .progress(effective.progress())
+                .resumeUploadId(uploadId)
+                .build();
+        return uploadLarge(file, file.getFileName().toString(), withResume);
+    }
+
+    public FmtFilePackage resumeLargeUpload(Path file, String uploadId) throws IOException {
+        return resumeLargeUpload(file, uploadId, FmtLargeUploadOptions.defaults());
+    }
+
+    public FmtUploadSession largeUploadStatus(String uploadId) {
+        return channel().largeUploadStatus(uploadId).orThrow();
+    }
+
+    public FmtUploadSession pauseLargeUpload(String uploadId) {
+        return channel().pauseLargeUpload(uploadId).orThrow();
+    }
+
+    /** 只把服务端状态切回 uploading；分片仍由 {@link #resumeLargeUpload(Path, String)} 上传。 */
+    public FmtUploadSession resumeLargeUpload(String uploadId) {
+        return channel().resumeLargeUpload(uploadId).orThrow();
+    }
+
+    public FmtUploadSession cancelLargeUpload(String uploadId) {
+        return channel().cancelLargeUpload(uploadId).orThrow();
+    }
+
+    private FmtFilePackage finishLargeUpload(Path file, String name, FmtUploadSession session,
+                                             FmtLargeUploadOptions options) throws IOException {
+        long size = Files.size(file);
+        if (session.size() > 0 && session.size() != size) {
+            throw new FmtConfigurationException(
+                    "续传文件大小不一致：会话 " + session.size() + " 字节，本地 " + size + " 字节");
+        }
+        if (session.completed()) {
+            report(session, -1, options);
+            return packageFor(session, name);
+        }
+        if (session.chunkCount() == 0) {
+            // 空文件没有分片，直接完成。
+            FmtUpload done = channel().completeLargeUpload(session.uploadId()).orThrow();
+            FmtFile fileRecord = done.file();
+            options.progress().onProgress(new FmtUploadProgress(
+                    session.uploadId(), fileRecord.fileName(), size, size, -1, 0, "completed",
+                    List.of()));
+            return new FmtFilePackage(channel(), fileRecord, fileRecord.fileName());
+        }
+        if (session.chunkSize() <= 0 || session.chunkCount() <= 0) {
+            throw new FmtConfigurationException("服务端返回的分片信息不完整：" + session.uploadId());
+        }
+        if (session.chunkCount() > Integer.MAX_VALUE) {
+            throw new FmtConfigurationException("分片数量过多：" + session.chunkCount());
+        }
+
+        Set<Long> received = new HashSet<>(session.received());
+        long chunkSize = session.chunkSize();
+        int chunkCount = (int) session.chunkCount();
+        for (int index = 0; index < chunkCount; index++) {
+            if (received.contains((long) index)) {
+                continue;
+            }
+            long offset = (long) index * chunkSize;
+            int length = (int) Math.min(chunkSize, size - offset);
+            byte[] data = readChunk(file, offset, length);
+            String chunkMd5 = md5(data);
+            FmtUploadSession updated = channel().uploadLargeChunk(session.uploadId(), index, data,
+                    chunkMd5).orThrow();
+            session = updated;
+            report(session, index, options);
+        }
+
+        FmtUpload done = channel().completeLargeUpload(session.uploadId()).orThrow();
+        FmtFile fileRecord = done.file();
+        FmtUploadProgress completed = new FmtUploadProgress(
+                session.uploadId(), fileRecord.fileName(), size, size, chunkCount - 1, chunkCount,
+                "completed", List.of());
+        options.progress().onProgress(completed);
+        return new FmtFilePackage(channel(), fileRecord, fileRecord.fileName());
+    }
+
+    private FmtFilePackage packageFor(FmtUploadSession session, String name) {
+        String fileId = session.finalFileId();
+        FmtFile file = fileId == null || fileId.isBlank()
+                ? channel().getFile(session.fileName()).orThrow()
+                : channel().getFile(fileId).orThrow();
+        return new FmtFilePackage(channel(), file, name);
+    }
+
+    private static void report(FmtUploadSession session, long chunkIndex,
+                               FmtLargeUploadOptions options) {
+        if (session == null) {
+            return;
+        }
+        options.progress().onProgress(new FmtUploadProgress(
+                session.uploadId(), session.fileName(), session.size(), session.uploadedBytes(),
+                chunkIndex, session.chunkCount(), session.state(), session.received()));
+    }
+
+    private static void requireLocalFile(Path file) {
+        if (file == null) {
+            throw new FmtConfigurationException("上传文件为空");
+        }
+        if (!Files.isRegularFile(file)) {
+            throw new FmtConfigurationException("不是可读的本地文件：" + file);
+        }
+    }
+
+    private static byte[] readChunk(Path file, long offset, int length) throws IOException {
+        ByteBuffer buffer = ByteBuffer.allocate(length);
+        try (FileChannel channel = FileChannel.open(file, StandardOpenOption.READ)) {
+            channel.position(offset);
+            while (buffer.hasRemaining()) {
+                int read = channel.read(buffer);
+                if (read < 0) {
+                    throw new IOException("读取分片时文件提前结束：" + file);
+                }
+            }
+        }
+        return buffer.array();
+    }
+
 
     private FmtFilePackage uploadInternal(InputStreamFactory factory, String requestedName,
                                           String md5) {

@@ -93,6 +93,18 @@ public final class FmtErrorCodes {
     /** 该文件类型不支持预览（下载不受影响）。 */
     public static final String PREVIEW_UNSUPPORTED = "FMT-701";
 
+    // ---- FMT-8xx 分片上传 ----
+    public static final String UPLOAD_SESSION_NOT_FOUND = "FMT-800";
+    public static final String UPLOAD_SESSION_EXPIRED = "FMT-801";
+    public static final String CHUNK_INDEX_INVALID = "FMT-802";
+    public static final String CHUNK_MISMATCH = "FMT-803";
+    public static final String UPLOAD_INCOMPLETE = "FMT-804";
+    public static final String UPLOAD_CANCELED = "FMT-805";
+    public static final String UPLOAD_STATE_INVALID = "FMT-806";
+    public static final String UPLOAD_MD5_MISMATCH = "FMT-807";
+    public static final String INSUFFICIENT_STORAGE = "FMT-808";
+    public static final String UPLOAD_LIMIT_EXCEEDED = "FMT-809";
+
     private static final Map<Integer, String> NAMES = Map.ofEntries(
             Map.entry(0, "Ok"),
             Map.entry(1, "InvalidArgument"), Map.entry(2, "FileNotFound"),
@@ -121,7 +133,12 @@ public final class FmtErrorCodes {
             Map.entry(600, "ServiceAlreadyInstalled"), Map.entry(601, "ServiceNotInstalled"),
             Map.entry(602, "ServiceOperationFailed"), Map.entry(603, "AdminRequired"),
             Map.entry(604, "NoCurrentUser"),
-            Map.entry(700, "HttpRequestInvalid"), Map.entry(701, "PreviewUnsupported"));
+            Map.entry(700, "HttpRequestInvalid"), Map.entry(701, "PreviewUnsupported"),
+            Map.entry(800, "UploadSessionNotFound"), Map.entry(801, "UploadSessionExpired"),
+            Map.entry(802, "ChunkIndexInvalid"), Map.entry(803, "ChunkMismatch"),
+            Map.entry(804, "UploadIncomplete"), Map.entry(805, "UploadCanceled"),
+            Map.entry(806, "UploadStateInvalid"), Map.entry(807, "UploadMd5Mismatch"),
+            Map.entry(808, "InsufficientStorage"), Map.entry(809, "UploadLimitExceeded"));
 
     /** 与 C++ 侧 {@code exit_code()} 对齐的退出码（跨语言脚本分类用）。 */
     private static final Map<Integer, Integer> EXIT_CODES = Map.ofEntries(
@@ -140,7 +157,10 @@ public final class FmtErrorCodes {
             Map.entry(500, 3), Map.entry(501, 5), Map.entry(502, 5), Map.entry(503, 5),
             Map.entry(600, 8), Map.entry(601, 8), Map.entry(602, 8), Map.entry(603, 5),
             Map.entry(604, 7),
-            Map.entry(700, 2), Map.entry(701, 2));
+            Map.entry(700, 2), Map.entry(701, 2),
+            Map.entry(800, 3), Map.entry(801, 3), Map.entry(802, 2), Map.entry(803, 4),
+            Map.entry(804, 4), Map.entry(805, 4), Map.entry(806, 4), Map.entry(807, 4),
+            Map.entry(808, 1), Map.entry(809, 2));
 
     private FmtErrorCodes() {
     }

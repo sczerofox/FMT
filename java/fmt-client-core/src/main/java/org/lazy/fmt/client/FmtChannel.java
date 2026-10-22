@@ -13,6 +13,7 @@ import org.lazy.fmt.client.model.FmtTrashEmpty;
 import org.lazy.fmt.client.model.FmtTrashEntry;
 import org.lazy.fmt.client.model.FmtTrashListing;
 import org.lazy.fmt.client.model.FmtUpload;
+import org.lazy.fmt.client.model.FmtUploadSession;
 
 import java.io.InputStream;
 import java.net.URI;
@@ -146,6 +147,29 @@ public interface FmtChannel extends AutoCloseable {
      * ——由**调用方**决定读哪个文件，SDK 不接受路径参数（见 {@link #upload(byte[], String)}）。
      */
     FmtResult<FmtUpload> upload(InputStream in, String fileName);
+
+    // ------------------------------------------------------------------
+    // 大文件分片上传（HTTP /api/upload/*）
+    // ------------------------------------------------------------------
+
+    /** 初始化分片会话；{@code md5} 可为 null。 */
+    FmtResult<FmtUploadSession> initLargeUpload(String fileName, long size, long chunkSize,
+                                                String md5);
+
+    FmtResult<FmtUploadSession> largeUploadStatus(String uploadId);
+
+    /** 上传一个分片；{@code chunkMd5} 可为 null。 */
+    FmtResult<FmtUploadSession> uploadLargeChunk(String uploadId, int index, byte[] data,
+                                                 String chunkMd5);
+
+    /** 完成并入库；服务端会拼接、逐片校验并做同名/同内容处理。 */
+    FmtResult<FmtUpload> completeLargeUpload(String uploadId);
+
+    FmtResult<FmtUploadSession> pauseLargeUpload(String uploadId);
+
+    FmtResult<FmtUploadSession> resumeLargeUpload(String uploadId);
+
+    FmtResult<FmtUploadSession> cancelLargeUpload(String uploadId);
 
     FmtResult<FmtPayload> download(String idOrName, Path target);
 
