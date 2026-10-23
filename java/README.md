@@ -312,6 +312,11 @@ fmt.upload(report);
 
 > **底层 `FmtChannel.upload` 仍然只收 byte[] / InputStream**：`FmtClient.upload(Path)`
 > 只是客户端本地打开文件，内容照样由调用方进程读出；服务端从不接收路径。
+>
+> **不落盘的区别**：`FmtClient.upload(InputStream, name)` 为了支持 FMT-304/FMT-105
+> 的自动重试，会先把流落到一个 `fmt-upload-*.bin` 临时文件；不想多一份盘就直接用
+> `fmt.channel().upload(in, name)`（一次流式请求，不重试）或大文件用
+> `fmt.uploadLarge(in, size, name)`（边读边分片，不落盘）。
 
 > 超过 FMT 的 `max_upload_size` 时服务端**边收边判、立刻中止**：你可能拿到 `FMT-303`，
 > 也可能拿到连接被重置的 IO 异常。建议业务侧先用文件大小做一次粗预检。
