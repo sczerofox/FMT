@@ -1,9 +1,7 @@
 package com.hncgy.mybatis.controller;
 
-import org.lazy.fmt.client.FmtClient;
 import org.lazy.fmt.client.FmtResult;
 import org.lazy.fmt.client.model.*;
-import org.lazy.fmt.spring.FmtFileResponse;
 import com.hncgy.mybatis.service.FmtService;
 import org.springframework.core.io.Resource;
 import org.springframework.http.ResponseEntity;
@@ -31,11 +29,9 @@ import java.util.List;
 public class FmtController {
 
     private final FmtService fmtService;
-    private final FmtClient fmtClient;
 
-    public FmtController(FmtService fmtService, FmtClient fmtClient) {
+    public FmtController(FmtService fmtService) {
         this.fmtService = fmtService;
-        this.fmtClient = fmtClient;
     }
 
     /** 探活：ping 不需要凭证。 */
@@ -81,13 +77,13 @@ public class FmtController {
     /** 下载：文件基本信息 + 附件响应都在 FmtFileResponse 里。 */
     @GetMapping("/files/{id}/download")
     public ResponseEntity<Resource> download(@PathVariable String id) {
-        return FmtFileResponse.of(fmtClient, id).download();
+        return fmtService.downloadResponse(id).download();
     }
 
     /** 预览：图片/文本类内联返回，浏览器可直接作为 img src / iframe。 */
     @GetMapping("/files/{id}/preview")
     public ResponseEntity<Resource> preview(@PathVariable String id) {
-        return FmtFileResponse.of(fmtClient, id).preview();
+        return fmtService.previewResponse(id).preview();
     }
 
     /** 删除预检：?dry_run=1，零副作用。 */

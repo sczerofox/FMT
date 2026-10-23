@@ -10038,7 +10038,7 @@ HTTP 会话没有本地 `source_path`，`pause/resume` 只改状态；`resume` �
 以及 `Server.分片上传HTTP分片与完成`（HTTP init → chunk → pause → resume → complete 全链路，
 并追加「篡改分片 → complete 409 + FMT-806」的失败断言）、
 `CliE2e.大文件上传会话`（60 MB 文件走真实 exe 与真实管道）。
-C++ 全量 200 项；Java 侧共 **111 项**（core 83 + starter 28），其中
+C++ 全量 200 项；Java 侧共 **112 项**（core 84 + starter 28），其中
 `FmtLargeUploadTest` 覆盖初始化/分片/暂停/取消/断点续传/进度回调。
 
 **版本**：`CMakeLists.txt` 的 `project(FMT VERSION 3.0.0)`、Java 四个 pom 的

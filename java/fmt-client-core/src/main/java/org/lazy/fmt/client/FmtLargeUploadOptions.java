@@ -41,7 +41,13 @@ public final class FmtLargeUploadOptions {
         return chunkSize;
     }
 
-    /** 整文件 MD5；null 表示客户端先算一遍（用于秒传和最终校验）。 */
+    /**
+     * 整文件 MD5。
+     *
+     * <p>{@code Path} 版为 null 时客户端先读一遍源文件算 MD5（用于秒传和最终校验）；
+     * {@code InputStream} 版为 null 时不预读，由服务端在 complete 阶段计算
+     * （代价：没有「同内容不同名」的秒传）。
+     */
     public String md5() {
         return md5;
     }

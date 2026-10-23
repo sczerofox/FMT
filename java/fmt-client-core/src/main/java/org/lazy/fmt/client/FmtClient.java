@@ -377,6 +377,56 @@ public final class FmtClient implements AutoCloseable {
         return uploadLarge(file, file == null ? null : file.getFileName().toString(), options);
     }
 
+    /**
+     * **直接从流分片上传**：不落本地临时文件，一边读一边把分片推给 FMT。
+     *
+     * <p>适合 Spring 的 {@code MultipartFile.getInputStream()}：调用方只需要知道
+     * {@code size}（{@code MultipartFile.getSize()}）。没有给 {@code md5} 时，
+     * 服务端在 complete 时自己算整文件 MD5；代价是**放弃秒传判重**（同内容不同名
+     * 不会被提前复用）。需要秒传就把 MD5 放进 {@link FmtLargeUploadOptions#md5(String)}。
+     *
+     * <p>这个方法只负责「流 → 分片」；调用方仍然要把文件送到这个 Java 进程
+     * （浏览器 → Spring → FMT 是两跳网络）。要真正只走一跳，只能让调用方直连 FMT。
+     */
+    public FmtFilePackage uploadLarge(InputStream in, long size, String fileName)
+            throws IOException {
+        return uploadLarge(in, size, fileName, FmtLargeUploadOptions.defaults());
+    }
+
+    public FmtFilePackage uploadLarge(InputStream in, long size, String fileName,
+                                      FmtLargeUploadOptions options) throws IOException {
+        if (in == null) {
+            throw new FmtConfigurationException("上传流为空");
+        }
+        if (size < 0) {
+            throw new FmtConfigurationException("上传流大小不能为负：" + size);
+        }
+        FmtLargeUploadOptions effective = options == null
+                ? FmtLargeUploadOptions.defaults() : options;
+        String name = sanitizeName(fileName);
+        if (!effective.shouldContinue().getAsBoolean()) {
+            throw new FmtApiException(FmtError.local(FmtErrorCodes.UPLOAD_CANCELED, "上传已取消"));
+        }
+
+        FmtUploadSession session;
+        if (effective.resumeUploadId() != null) {
+            session = channel().largeUploadStatus(effective.resumeUploadId()).orThrow();
+            if (session.canceled()) {
+                throw new FmtApiException(FmtError.local(FmtErrorCodes.UPLOAD_CANCELED,
+                        "上传会话已取消：" + session.uploadId()));
+            }
+            if (session.failed() || "paused".equalsIgnoreCase(session.state())) {
+                session = channel().resumeLargeUpload(session.uploadId()).orThrow();
+            }
+        } else {
+            // md5 可以为 null：服务端会在 complete 时自己算，只是没有秒传。
+            session = channel().initLargeUpload(name, size, effective.chunkSize(), effective.md5())
+                    .orThrow();
+        }
+        report(session, -1, effective);
+        return finishLargeUpload(in, size, name, session, effective);
+    }
+
     public FmtFilePackage uploadLarge(Path file, String fileName, FmtLargeUploadOptions options)
             throws IOException {
         FmtLargeUploadOptions effective = options == null ? FmtLargeUploadOptions.defaults() : options;
@@ -512,6 +562,90 @@ public final class FmtClient implements AutoCloseable {
                 "completed", List.of());
         options.progress().onProgress(completed);
         return new FmtFilePackage(channel(), fileRecord, fileRecord.fileName());
+    }
+
+    private FmtFilePackage finishLargeUpload(InputStream in, long size, String name,
+                                             FmtUploadSession session,
+                                             FmtLargeUploadOptions options) throws IOException {
+        if (session.size() > 0 && session.size() != size) {
+            throw new FmtConfigurationException(
+                    "续传流大小不一致：会话 " + session.size() + " 字节，调用方 " + size + " 字节");
+        }
+        if (session.completed()) {
+            report(session, -1, options);
+            return packageFor(session, name);
+        }
+        if (session.chunkCount() == 0) {
+            FmtUpload done = channel().completeLargeUpload(session.uploadId()).orThrow();
+            FmtFile record = done.file();
+            options.progress().onProgress(new FmtUploadProgress(
+                    session.uploadId(), record.fileName(), size, size, -1, 0, "completed",
+                    List.of()));
+            return new FmtFilePackage(channel(), record, record.fileName());
+        }
+        if (session.chunkSize() <= 0) {
+            throw new FmtConfigurationException("服务端返回的分片信息不完整：" + session.uploadId());
+        }
+        if (session.chunkCount() > Integer.MAX_VALUE) {
+            throw new FmtConfigurationException("分片数量过多：" + session.chunkCount());
+        }
+
+        Set<Long> received = new HashSet<>(session.received());
+        long chunkSize = session.chunkSize();
+        int chunkCount = (int) session.chunkCount();
+        for (int index = 0; index < chunkCount; index++) {
+            if (!options.shouldContinue().getAsBoolean()) {
+                throw new FmtApiException(FmtError.local(FmtErrorCodes.UPLOAD_CANCELED, "上传已取消"));
+            }
+            long offset = (long) index * chunkSize;
+            int length = (int) Math.min(chunkSize, size - offset);
+            if (received.contains((long) index)) {
+                // 续传/复用会话：流只能顺序读，跳过快照里已经收到的分片。
+                skipFully(in, length);
+                continue;
+            }
+            byte[] data = readExactly(in, length);
+            String chunkMd5 = md5(data);
+            session = channel().uploadLargeChunk(session.uploadId(), index, data, chunkMd5)
+                    .orThrow();
+            report(session, index, options);
+        }
+        if (!options.shouldContinue().getAsBoolean()) {
+            throw new FmtApiException(FmtError.local(FmtErrorCodes.UPLOAD_CANCELED, "上传已取消"));
+        }
+        FmtUpload done = channel().completeLargeUpload(session.uploadId()).orThrow();
+        FmtFile record = done.file();
+        options.progress().onProgress(new FmtUploadProgress(
+                session.uploadId(), record.fileName(), size, size, chunkCount - 1, chunkCount,
+                "completed", List.of()));
+        return new FmtFilePackage(channel(), record, record.fileName());
+    }
+
+    private static byte[] readExactly(InputStream in, int length) throws IOException {
+        byte[] data = new byte[length];
+        int read = 0;
+        while (read < length) {
+            int got = in.read(data, read, length - read);
+            if (got < 0) {
+                throw new IOException("上传流提前结束：已读 " + read + " / " + length + " 字节");
+            }
+            read += got;
+        }
+        return data;
+    }
+
+    private static void skipFully(InputStream in, long length) throws IOException {
+        long left = length;
+        while (left > 0) {
+            long skipped = in.skip(left);
+            if (skipped <= 0) {
+                if (in.read() < 0) {
+                    throw new IOException("上传流提前结束：还差 " + left + " 字节");
+                }
+                skipped = 1;
+            }
+            left -= skipped;
+        }
     }
 
     private FmtFilePackage packageFor(FmtUploadSession session, String name) {

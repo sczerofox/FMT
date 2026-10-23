@@ -375,7 +375,7 @@ GET /api/ping
 | 列桶 / 看当前桶 | `fmt.listBuckets()` | `GET /api/bucket`（**只读**） |
 | 清空回收站 | `fmt.emptyTrash(dryRun, force)` | `DELETE /api/trash/empty[?dry_run=1\|force=1]` |
 | 上传字节/流 | `fmt.upload(byte[], name)` / `fmt.upload(InputStream, name)` | `POST /api/file/upload?name=<编码后的文件名>`，**请求体就是文件内容**；流走 `Transfer-Encoding: chunked`。**SDK 不收 `Path`**（安全口径，见下）。服务端**也收** `multipart/form-data`（取第一个带 `filename` 的 part，Postman / 浏览器表单 / Spring 的 `MultipartFile` 直接可用），但 **SDK 仍然只推裸字节**——这样大文件不必先拼进内存、也不过一遍 multipart 编解码；Demo 从 `MultipartFile` 取出流再交给 SDK（见下） |
-| 大文件分片 | `fmt.uploadLarge(Path, name, options)` / `resumeLargeUpload` / `pauseLargeUpload` / `cancelLargeUpload` / `largeUploadStatus` | `POST /api/upload/init` → `PUT /api/upload/<id>/chunk?index=N` → `POST /api/upload/<id>/complete`；暂停/继续/取消/查询各一条（v3.0.0） |
+| 大文件分片 | `fmt.uploadLarge(Path, name, options)` / `uploadLarge(InputStream, size, name, options)` / `resumeLargeUpload` / `pauseLargeUpload` / `cancelLargeUpload` / `largeUploadStatus` | `POST /api/upload/init` → `PUT /api/upload/<id>/chunk?index=N` → `POST /api/upload/<id>/complete`；暂停/继续/取消/查询各一条（v3.0.0；流式版不落临时文件） |
 | 列文件 | `fmt.listFiles(FileQuery)` | `GET /api/file?search=&sort=&page=&page_size=` |
 | 单条信息 | `fmt.getFile(id)` | `GET /api/file/<id或名>`（含相对数据根的 `path`） |
 | 下载 | `fmt.download(id, target, overwrite)` | `GET /api/file/<…>/download`（流式落盘，先 `.part` 再改名） |
@@ -483,6 +483,86 @@ fmt.cancelLargeUpload(uploadId);                 // 取消并清理临时分片
 边界：文件大小必须与会话一致；`complete` 失败（分片损坏 / MD5 不符）服务端返回
 `409 + FMT-806`，不会用 200 假装成功；HTTP 会话的 `resume` 只切状态，缺片由客户端重传；
 会话默认 24h 过期、单文件 8 GB、每用户 4 个活动会话。
+
+**直接从 `InputStream` 分片（Spring `MultipartFile`，不落第二份盘）**：
+
+```java
+try (InputStream in = multipartFile.getInputStream()) {
+    FmtFilePackage pkg = fmt.uploadLarge(
+            in, multipartFile.getSize(), multipartFile.getOriginalFilename(),
+            FmtLargeUploadOptions.defaults());
+}
+```
+
+SDK 一边读流一边 `PUT` 分片，不创建 `fmt-upload-*.bin` 临时文件。**不给 `md5` 时**
+服务端在 complete 阶段自己算整文件 MD5，代价是放弃「同内容不同名」的秒传；需要秒传就
+把 MD5 放进 `FmtLargeUploadOptions.md5(...)`。这个 API 只消除「SDK 再落一份盘」，
+不消除「浏览器 → Spring → FMT」两跳网络（见 §5.3.2）。
+
+#### 5.3.2 只保留一个 `FmtController` + 一个 `FmtService`
+
+业务工程可以只写这两个文件；模型、JSON 解析、错误信封、异常翻译、下载/预览响应都在 jar：
+
+```java
+@RestController
+@RequestMapping("/api/fmt")
+public class FmtController {
+    private final FmtService fmtService;
+
+    public FmtController(FmtService fmtService) {
+        this.fmtService = fmtService;
+    }
+
+    @PostMapping("/upload")
+    public FmtUpload upload(@RequestParam("file") MultipartFile file) throws IOException {
+        return fmtService.upload(file);
+    }
+
+    @GetMapping("/files/{id}/download")
+    public ResponseEntity<Resource> download(@PathVariable String id) {
+        return fmtService.downloadResponse(id).download();
+    }
+}
+```
+
+```java
+@Service
+public class FmtService {
+    private final FmtChannel fmt;
+    private final FmtClient client;
+
+    public FmtService(FmtChannel fmt) {
+        this.fmt = fmt;
+        this.client = FmtClient.wrap(fmt);
+    }
+
+    public FmtUpload upload(MultipartFile file) throws IOException {
+        long max = fmt.getConfig().orThrow().maxUploadSize();
+        try (InputStream in = file.getInputStream()) {
+            if (file.getSize() > max) {
+                return new FmtUpload(client.uploadLarge(
+                        in, file.getSize(), file.getOriginalFilename()).file(), null);
+            }
+            return fmt.upload(in, file.getOriginalFilename()).orThrow();
+        }
+    }
+
+    public FmtFileResponse downloadResponse(String id) {
+        return FmtFileResponse.of(client, id);
+    }
+}
+```
+
+`FmtResult` / `FmtFile` / `FmtFilePackage` / `FmtFileResponse` / `FmtExceptionAdvice` /
+`SimpleJson` 都在 `fmt-client-core` 与 `fmt-spring-boot-starter` 里，业务工程不用再复制
+模型或解析函数。可编译版本见仓库 `java/tools/springboot/FmtController.java` 与
+`FmtService.java`（该目录只有这两个 Java 文件）。
+
+**「不二次上传」的准确边界**：FMT 没有预签名直传 URL，token 也不应下发给浏览器；只要
+中间有 Spring 进程，文件必然经过「调用方 → Spring → FMT」两跳。能做的是让 Spring
+**不落盘、不二次读文件**（§5.3.1 的流式分片）。真正只走一跳只有：① 调用方与 FMT 同机
+且安全持有 token，直接 `POST /api/file/upload`；② 反向代理把某路径直接转发给 FMT 并在
+代理侧注入 token。
 
 ### 5.4 并发与幂等
 
@@ -682,7 +762,7 @@ POST <url>  X-FMT-Signature: HMAC-SHA256(secret, body)   负载 {"event":"file.u
 | `SdkModelJacksonTest`（starter） | record 模型能被宿主 Jackson 干净序列化，布尔助手不会覆盖同名字段（`bucket` 不再是 `false`） |
 | `FmtLargeUploadTest`（v3.0.0） | 大文件分片：init / 逐片 PUT / 暂停 / 取消 / 断点续传 / 进度回调 / 失败会话 |
 
-> **v3.0.0 当前**：Java 侧共 **111 项**（core 83 + starter 28），全绿；C++ 侧 **200 项**，
+> **v3.0.0 当前**：Java 侧共 **112 项**（core 84 + starter 28），全绿；C++ 侧 **200 项**，
 > `ctest` 100% 通过。
 
 ### 10.2 真机 smoke（**已实测**，2026-10-10）

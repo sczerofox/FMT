@@ -2,20 +2,24 @@ package com.hncgy.mybatis.service;
 
 import org.lazy.fmt.client.FmtApiException;
 import org.lazy.fmt.client.FmtChannel;
+import org.lazy.fmt.client.FmtClient;
 import org.lazy.fmt.client.FmtError;
 import org.lazy.fmt.client.FmtErrorCodes;
+import org.lazy.fmt.client.FmtLargeUploadOptions;
 import org.lazy.fmt.client.FmtResult;
 import org.lazy.fmt.client.model.FileQuery;
 import org.lazy.fmt.client.model.FmtBucketListing;
 import org.lazy.fmt.client.model.FmtConfig;
 import org.lazy.fmt.client.model.FmtDeleteCheck;
 import org.lazy.fmt.client.model.FmtFile;
+import org.lazy.fmt.client.model.FmtFilePackage;
 import org.lazy.fmt.client.model.FmtPage;
 import org.lazy.fmt.client.model.FmtPayload;
 import org.lazy.fmt.client.model.FmtServerStatus;
 import org.lazy.fmt.client.model.FmtShare;
 import org.lazy.fmt.client.model.FmtTrashListing;
 import org.lazy.fmt.client.model.FmtUpload;
+import org.lazy.fmt.spring.FmtFileResponse;
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -42,9 +46,11 @@ import java.util.List;
 public class FmtService {
 
     private final FmtChannel fmt;
+    private final FmtClient client;
 
-    public FmtService(FmtChannel fmt) {
-        this.fmt = fmt;
+    public FmtService(FmtClient client) {
+        this.client = client;
+        this.fmt = client.channel();
     }
 
     // ------------------------------------------------------------------
@@ -98,8 +104,17 @@ public class FmtService {
         if (name == null || name.isBlank()) {
             name = "upload.bin";
         }
+        long size = file.getSize();
+        long maxSingle = fmt.getConfig().orThrow().maxUploadSize();
         try (InputStream in = file.getInputStream()) {
-            return upload(in, name);
+            // 小文件：一次 HTTP 请求，FmtChannel 直接把流推给 FMT（不落第二份盘）。
+            // 大文件：直接从同一个 MultipartFile 流分片，SDK 不创建临时文件。
+            if (size > 0 && size > maxSingle) {
+                FmtFilePackage pkg = client.uploadLarge(
+                        in, size, name, FmtLargeUploadOptions.defaults());
+                return new FmtUpload(pkg.file(), null);
+            }
+            return fmt.upload(in, name).orThrow();
         }
     }
 
@@ -111,6 +126,16 @@ public class FmtService {
     /** 下载/预览落盘；{@code target} 由调用方决定，SDK 不接受服务端路径。 */
     public FmtPayload download(String idOrName, Path target) {
         return fmt.download(idOrName, target).orThrow();
+    }
+
+    /** 下载响应（文件信息 + 流式附件）由 starter 里的 FmtFileResponse 组装。 */
+    public FmtFileResponse downloadResponse(String idOrName) {
+        return FmtFileResponse.of(client, idOrName);
+    }
+
+    /** 预览响应（图片/文本内联）；不支持的类型由 FmtFileResponse 按 FMT-701 处理。 */
+    public FmtFileResponse previewResponse(String idOrName) {
+        return FmtFileResponse.of(client, idOrName);
     }
 
     public FmtDeleteCheck checkDelete(String idOrName) {

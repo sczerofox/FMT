@@ -357,6 +357,89 @@ fmt.cancelLargeUpload(uploadId);
 `uploadLarge` 开始前会读一遍源文件算 MD5；续传不会重算，只按服务端的 `received/missing` 传缺片。
 文件大小必须与会话一致，否则抛配置异常。
 
+**不落本地临时文件（Spring `MultipartFile` / 任意 `InputStream`）**：
+
+```java
+try (InputStream in = multipartFile.getInputStream()) {
+    FmtFilePackage pkg = fmt.uploadLarge(
+            in, multipartFile.getSize(), multipartFile.getOriginalFilename(),
+            FmtLargeUploadOptions.defaults());   // 可选 .md5(...) 换取秒传判重
+}
+```
+
+`uploadLarge(InputStream, size, name, ...)` 一边读流一边推分片，**SDK 不创建临时文件**；
+不给 `md5` 时服务端在 complete 阶段自己算（代价是放弃“同内容不同名”的秒传）。
+这仍是「调用方 → 你的 Java 进程 → FMT」两跳网络；**如果要求真正只走一跳，只能让调用方
+直接访问 FMT**（见 4.3.2 末尾）。
+
+### 4.3.2 只保留 `FmtController` + `FmtService` 两个 Java 文件
+
+可以。把「HTTP 参数/响应」留在 Controller、业务编排留在 Service，其余都放进 jar：
+
+```java
+// FmtController.java
+@RestController
+@RequestMapping("/api/fmt")
+public class FmtController {
+    private final FmtService fmtService;
+
+    public FmtController(FmtService fmtService) {
+        this.fmtService = fmtService;
+    }
+
+    @PostMapping("/upload")
+    public FmtUpload upload(@RequestParam("file") MultipartFile file) throws IOException {
+        return fmtService.upload(file);          // 大小文件自动分流
+    }
+
+    @GetMapping("/files/{id}/download")
+    public ResponseEntity<Resource> download(@PathVariable String id) {
+        return fmtService.downloadResponse(id).download();
+    }
+}
+```
+
+```java
+// FmtService.java
+@Service
+public class FmtService {
+    private final FmtChannel fmt;
+    private final FmtClient client;
+
+    public FmtService(FmtChannel fmt) {
+        this.fmt = fmt;
+        this.client = FmtClient.wrap(fmt);
+    }
+
+    public FmtUpload upload(MultipartFile file) throws IOException {
+        long max = fmt.getConfig().orThrow().maxUploadSize();
+        try (InputStream in = file.getInputStream()) {
+            if (file.getSize() > max) {
+                return new FmtUpload(client.uploadLarge(
+                        in, file.getSize(), file.getOriginalFilename()).file(), null);
+            }
+            return fmt.upload(in, file.getOriginalFilename()).orThrow();
+        }
+    }
+
+    public FmtFileResponse downloadResponse(String id) {
+        return FmtFileResponse.of(client, id);
+    }
+}
+```
+
+`FmtUpload` / `FmtFile` / `FmtResult` / `FmtFileResponse` / `FmtExceptionAdvice` / JSON 解析
+全部在 `fmt-client-core.jar` 与 `fmt-spring-boot-starter.jar` 里，**业务工程不需要再抄任何
+模型或解析函数**。完整可编译版本见
+[`tools/springboot/FmtController.java`](tools/springboot/FmtController.java) 与
+[`tools/springboot/FmtService.java`](tools/springboot/FmtService.java)。
+
+> **「不二次上传」的边界**：FMT 没有客户端直传的预签名 URL，token 也不该发给浏览器。
+> 所以只要中间有你的 Spring 进程，文件必然经过「浏览器 → Spring → FMT」两跳；但可以让
+> **Spring 不落第二份盘、不二次读文件**（上面的流式分片就是）。真正只走一跳只有两种做法：
+> ① 调用方和 FMT 在同一台机器且能安全拿到 token，直接 `POST /api/file/upload`；
+> ② 用反向代理把某个路径直接转发给 FMT 并注入 token（应用只发一次请求）。
+
 ### 4.4 FMT → Java 只能拉，不能推
 
 FMT 没有 webhook / SSE / 回调。要「新文件自动进 Java」，就得**定时拉 + 游标去重**，

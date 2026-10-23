@@ -5,12 +5,14 @@ import org.junit.jupiter.api.io.TempDir;
 import org.lazy.fmt.client.model.FmtFilePackage;
 import org.lazy.fmt.client.model.FmtUploadProgress;
 
+import java.io.ByteArrayInputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -80,6 +82,59 @@ class FmtLargeUploadTest {
             assertTrue(progress.size() >= 4, "应至少收到 init + 3 片 + completed");
             assertEquals("completed", progress.get(progress.size() - 1).state());
             assertEquals(100, progress.get(progress.size() - 1).percent());
+        }
+    }
+
+    @Test
+    void 流式分片直接上传且不需要本地临时文件() throws Exception {
+        int size = 2 * 1024 * 1024 + 512 * 1024;   // 2.5 MB -> 3 片
+        byte[] content = new byte[size];
+        for (int i = 0; i < content.length; i++) {
+            content[i] = (byte) (i % 251);
+        }
+        try (StubFmtServer stub = StubFmtServer.start(TOKEN)) {
+            stub.on("POST", "/api/upload/init", request -> {
+                String body = request.bodyText();
+                assertTrue(body.contains("\"file_name\":\"stream.bin\""), body);
+                assertTrue(body.contains("\"size\":" + size), body);
+                assertTrue(body.contains("\"chunk_size\":1048576"), body);
+                // 调用方没给 md5：不要伪造一个，complete 时由服务端计算。
+                assertFalse(body.contains("\"md5\""), body);
+                return StubFmtServer.Reply.ok("""
+                        {"upload_id":"up-stream","file_name":"stream.bin","size":2621440,
+                         "chunk_size":1048576,"chunk_count":3,"state":"uploading",
+                         "uploaded_bytes":0,"received":[],"received_count":0}
+                        """);
+            });
+            stub.on("PUT", "/api/upload/up-stream/chunk", request -> {
+                int index = Integer.parseInt(request.queryParam("index"));
+                assertEquals(index == 2 ? 512 * 1024 : 1024 * 1024, request.body().length);
+                return StubFmtServer.Reply.ok("""
+                        {"upload_id":"up-stream","file_name":"stream.bin","size":2621440,
+                         "chunk_size":1048576,"chunk_count":3,"state":"uploading",
+                         "uploaded_bytes":1048576,"received":[0],"received_count":1}
+                        """);
+            });
+            stub.on("POST", "/api/upload/up-stream/complete", request ->
+                    StubFmtServer.Reply.ok("""
+                            {"upload_id":"up-stream","file_id":"fmt-20261023-1",
+                             "file_name":"stream.bin","size":2621440,
+                             "md5":"ignored","state":"completed"}
+                            """));
+            stub.on("GET", "/api/upload/up-stream", request -> StubFmtServer.Reply.ok("""
+                    {"upload_id":"up-stream","file_name":"stream.bin","size":2621440,
+                     "chunk_size":1048576,"chunk_count":3,"state":"uploading",
+                     "uploaded_bytes":0,"received":[],"received_count":0}
+                    """));
+
+            FmtClient client = FmtClient.token(TOKEN, "pet").setBaseUrl(stub.baseUrl());
+            FmtFilePackage pkg = client.uploadLarge(
+                    new ByteArrayInputStream(content), size, "stream.bin",
+                    FmtLargeUploadOptions.builder().chunkSize(1024 * 1024).build());
+
+            assertEquals("fmt-20261023-1", pkg.fileId());
+            assertEquals(3, stub.requests().stream()
+                    .filter(r -> "PUT".equals(r.method())).count());
         }
     }
 

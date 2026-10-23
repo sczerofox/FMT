@@ -10498,6 +10498,11 @@ DELETE /api/upload/<upload_id>
 - Java：`FmtClient.uploadLarge(Path, name, FmtLargeUploadOptions)` 自动算 MD5、init、
   逐片 PUT、回调进度、complete；`resumeLargeUpload` / `pauseLargeUpload` /
   `cancelLargeUpload` / `largeUploadStatus` 对应上面四条会话接口。
+  **新增 `uploadLarge(InputStream, size, name, options)`**：直接从 Spring
+  `MultipartFile.getInputStream()` 边读边分片，SDK 不落临时文件；不给 MD5 时由服务端
+  在 complete 阶段计算（放弃同内容秒传）。Java 业务工程只需保留
+  `FmtController` + `FmtService` 两个文件，模型/解析/异常/下载响应都在 jar，
+  可编译版本见 `java/tools/springboot/`。
 
 ## 129.5 错误码
 
