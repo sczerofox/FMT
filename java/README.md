@@ -1,6 +1,7 @@
 # FMT Java 客户端（jar）
 
-> 当前版本：**3.0.0**（v3.0.0 新增 `FmtClient.uploadLarge(...)` 大文件分片续传）。
+> 当前版本：**3.0.1**（3.0.1 新增 `uploadLarge(InputStream, ...)` 流式分片；v3.0.0 新增
+> `uploadLarge(Path, ...)` 大文件分片续传）。
 
 把 FMT 的 HTTP 服务接进 Java / Spring Boot 项目：**建一条通道，token 交给通道**，
 之后业务代码里再也看不到 token。
@@ -83,7 +84,7 @@ try (FmtClient fmt = new FmtClient("lazy", "123456", "pet")) {
 <dependency>
   <groupId>org.lazy</groupId>
   <artifactId>fmt-spring-boot-starter</artifactId>
-  <version>3.0.0</version>
+  <version>3.0.1</version>
 </dependency>
 ```
 
@@ -226,11 +227,11 @@ try (FmtChannel fmt = Fmt.channel(core)) {
 ```powershell
 # 对着假 FMT 联调（不碰真服务）
 java java\tools\fake-fmt\FakeFmt.java 14122
-java -cp java\fmt-client-core\target\fmt-client-core-3.0.0.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-3.0.1.jar java\tools\FmtDemo.java `
      --base-url=http://127.0.0.1:14122 --token=test-token-1234567890abcdef --keep
 
 # 对着真服务：地址 + 数据根（token 从 <数据根>/data/user.json 读）
-java -cp java\fmt-client-core\target\fmt-client-core-3.0.0.jar java\tools\FmtDemo.java `
+java -cp java\fmt-client-core\target\fmt-client-core-3.0.1.jar java\tools\FmtDemo.java `
      --data-root=D:\Data\Temp\JMT\fmt --out-dir=D:\tmp\fmt-demo
 ```
 
@@ -533,7 +534,7 @@ java -jar fmt-client-demo/target/fmt-bridge.jar `
 WARN org.lazy.fmt.client : 连接 http://localhost:4122 被拒，改用 http://127.0.0.1:4122 重试（GET /api/ping）
 WARN org.lazy.fmt.client : 连接 http://127.0.0.1:4122 被拒，改用 http://[0:0:0:0:0:0:0:1]:4122 重试（GET /api/ping）
 [fmt-smoke] GET /api/ping：ok（公开接口，不需要 token）
-[fmt-smoke] GET /api/status：数据根=D:/Data/Temp/JMT/fmt，版本=3.0.0，pid=23420
+[fmt-smoke] GET /api/status：数据根=D:/Data/Temp/JMT/fmt，版本=3.0.1，pid=23420
 [fmt-smoke] GET /api/file：2 个文件（共 2）
 [fmt-smoke]   · fmt-20261008-2  17364485.jpg  3889891 B
 [fmt-smoke]   · fmt-20261008-0  asdva.jpg  130184 B

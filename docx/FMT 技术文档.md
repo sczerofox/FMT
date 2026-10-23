@@ -387,14 +387,14 @@ cmake --build cmake-build-release --parallel
 
 ### 3.4 版本号与构建日期
 
-单一来源：`CMakeLists.txt` 的 `project(FMT VERSION 3.0.0)`。
+单一来源：`CMakeLists.txt` 的 `project(FMT VERSION 3.0.1)`。
 经 `cmake/version.hpp.in` 生成 `fmt/version.hpp`（`fmt::version::MAJOR/MINOR/PATCH/STRING`）：
 
 ```cpp
 inline constexpr std::string_view MAJOR = "3";
 inline constexpr std::string_view MINOR = "0";
 inline constexpr std::string_view PATCH = "0";
-inline constexpr std::string_view STRING = "3.0.0";
+inline constexpr std::string_view STRING = "3.0.1";
 ```
 
 **构建日期也由 CMake 在配置时生成**，格式 `%Y.%m.%d`（本地时间），进同一个头文件：
@@ -418,7 +418,7 @@ inline constexpr std::string_view BUILD_DATE = "@FMT_BUILD_DATE@";   // 如 2026
 **横幅与 `--version` 共用同一个字符串**（`banner_text()`，`src/cli/cli.cpp`）：
 
 ```text
-File Manager Tool  v3.0.0  ( build  2026.10.23 )
+File Manager Tool  v3.0.1  ( build  2026.10.23 )
 ```
 
 ```cpp
@@ -431,7 +431,7 @@ std::string banner_text() {
 | 项 | 约定 |
 |---|---|
 | 程序名 | 固定 **`File Manager Tool`**（文档名/工程名仍叫 FMT，只有程序横幅用这个名字） |
-| 版本部分 | 直接取 `version::STRING`，当前 `v3.0.0`；横幅、`--version`、`version` 命令同源 |
+| 版本部分 | 直接取 `version::STRING`，当前 `v3.0.1`；横幅、`--version`、`version` 命令同源 |
 | 构建日期 | `BUILD_DATE`，CMake 配置时按本地时间生成，**每次重新配置都会变** |
 | 空格 | 「Tool」与「v3.0.0」之间、`(` 与 `build` 之间、`build` 与日期之间都是**两个空格**（照实现原样） |
 | 单一来源 | `--version` 与交互横幅调同一个 `banner_text()`，不各写一份 |
@@ -6949,7 +6949,7 @@ dwServiceSpecificExitCode = FMT 编号的数字部分)`（见 13.2.3 / 13.7.1）
 > `fmt_test.cpp`，`FMT_TEST(suite, 名称)` / `FMT_CHECK_EQ` 宏，**零第三方依赖、可完全离线构建**，
 > 断言失败继续跑下一个用例），并在 `tests/CMakeLists.txt` 里用 `add_test(NAME fmt_tests …)`
 > 接进 CTest——所以「不写自动化测试」这条**只对 Catch2 那种形态成立**：不引外部框架，
-> 但模块行为仍有单元测试兜底。**v3.0.0 当前 200 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
+> 但模块行为仍有单元测试兜底。**v3.0.1 当前 200 个用例、全绿**（上一轮 118 + 提交 `a2b6cd1` 新增 6 条
 `HttpClient.*` + 提交 `0ad9efc` 新增 2 条 `File.*` + 提交 `5bf2c1f` 新增 2 条 `File.*`
 与 1 条 `Bucket.*` + **提交 `9c3d2cb` 新增 5 条** + **提交 `0fc242b` 新增 4 条** +
 **提交 `a9af276` 新增 2 条** + **提交 `2c841c8` / `5b316b3` 各新增 1 条** +
@@ -10041,8 +10041,13 @@ HTTP 会话没有本地 `source_path`，`pause/resume` 只改状态；`resume` �
 C++ 全量 200 项；Java 侧共 **112 项**（core 84 + starter 28），其中
 `FmtLargeUploadTest` 覆盖初始化/分片/暂停/取消/断点续传/进度回调。
 
-**版本**：`CMakeLists.txt` 的 `project(FMT VERSION 3.0.0)`、Java 四个 pom 的
-`3.0.0`、`version.hpp` 生成的横幅 `File Manager Tool  v3.0.0` 全部同源。
+**版本**：`CMakeLists.txt` 的 `project(FMT VERSION 3.0.1)`、Java 四个 pom 的
+`3.0.1`、`version.hpp` 生成的横幅 `File Manager Tool  v3.0.1` 全部同源。
+
+**v3.0.1 追加**：`FmtClient.uploadLarge(InputStream, size, name, options)` 直接从调用方
+的流（如 Spring `MultipartFile.getInputStream()`）逐片读取并 `PUT`，SDK 不创建临时文件；
+未给 MD5 时由服务端在 complete 阶段计算（放弃同内容秒传）。业务侧只保留
+`FmtController` + `FmtService` 两个 Java 文件，模型/JSON/异常/下载响应都在 jar。
 
 ---
 
@@ -10091,7 +10096,7 @@ C++ 全量 200 项；Java 侧共 **112 项**（core 84 + starter 28），其中
 | 旧 `paths::` 自由函数 | 仍保留 `executable_path` / `root` 等自由函数供启动阶段使用，与 `PathManager` 并存；后续可考虑收敛，但 `root()` 必须保留（它要先于 PathManager 存在） |
 | `text::join` 的使用纪律 | 凡是用用户输入拼接路径，必须经 `common/text`。这条纪律目前靠代码审查保证，没有编译期强制 |
 | `AppContext` 的指针持有纪律 | `paths` 与 `logger` 都必须 `unique_ptr` 持有，因为业务服务保存它们的引用。这条约束靠注释说明，没有编译期强制——改动 `AppContext` 成员时容易踩回去 |
-| 自动化回归测试 | **口径已变**：本分支阶段 2 起有了一套**自研最小运行器**（`tests/fmt_test.hpp`，`FMT_TEST` / `FMT_CHECK_EQ`，零第三方依赖、可离线构建，`add_test(NAME fmt_tests …)` 接进 CTest），**v3.0.0 当前 200 个用例、全绿**（上一轮 118 个，
+| 自动化回归测试 | **口径已变**：本分支阶段 2 起有了一套**自研最小运行器**（`tests/fmt_test.hpp`，`FMT_TEST` / `FMT_CHECK_EQ`，零第三方依赖、可离线构建，`add_test(NAME fmt_tests …)` 接进 CTest），**v3.0.1 当前 200 个用例、全绿**（上一轮 118 个，
 提交 `a2b6cd1` 又新增 6 条 `HttpClient.*`，见 17.2、17.2.1、18.18、18.19、18.20；
 提交 `0ad9efc` 再新增 2 条 `File.*`，见 18.21；提交 `5bf2c1f` 再新增 2 条 `File.*`
 与 1 条 `Bucket.*`，见 18.22；提交 `9c3d2cb` 再新增 5 条，见 18.23；

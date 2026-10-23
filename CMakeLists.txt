@@ -27,7 +27,7 @@ cmake_minimum_required(VERSION 3.20)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 project(FMT
-        VERSION 3.0.0
+        VERSION 3.0.1
         DESCRIPTION "FMT - Windows File Management System"
         LANGUAGES CXX
         HOMEPAGE_URL "https://github.com/sczerofox/FMT")
@@ -85,7 +85,7 @@ endif()
 # ---------------------------------------------------------------------------
 # 版本头（生成，请勿手工修改）
 #
-# 构建日期进横幅：File Manager Tool  v3.0.0  ( build 2026.10.23 )
+# 构建日期进横幅：File Manager Tool  v3.0.1  ( build 2026.10.23 )
 # ---------------------------------------------------------------------------
 string(TIMESTAMP FMT_BUILD_DATE "%Y.%m.%d")
 

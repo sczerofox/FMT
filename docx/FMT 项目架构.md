@@ -1822,6 +1822,10 @@ before a bucket goes」；
 > 每用户 4 个活动会话，逐片 MD5 + 整文件 MD5 校验，支持服务重启后续传。
 > 新增 `FMT-800`～`FMT-809`，C++ 全量测试 **200 项**。详见
 > `FMT 技术文档.md` 第 18.49 节与 `FMT 开发文档.md` 第 129 节。
+>
+> **v3.0.1（2026.10.23）追加**：`FmtClient.uploadLarge(InputStream, size, name, options)`
+> 直接消费调用方的流（Spring `MultipartFile`）逐片上传，SDK 不再创建第二份临时文件；
+> Java 示例收敛为 `FmtController` + `FmtService` 两个文件，其余模型/解析/异常/响应都在 jar。
 
 当前代码里**已经存在**的部分（阶段 2～5）：
 

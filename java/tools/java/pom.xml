@@ -28,7 +28,7 @@
     <dependency>
       <groupId>org.lazy</groupId>
       <artifactId>fmt-client-core</artifactId>
-      <version>3.0.0</version>
+      <version>3.0.1</version>
     </dependency>
 
     <dependency>

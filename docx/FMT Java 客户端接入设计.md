@@ -762,7 +762,7 @@ POST <url>  X-FMT-Signature: HMAC-SHA256(secret, body)   负载 {"event":"file.u
 | `SdkModelJacksonTest`（starter） | record 模型能被宿主 Jackson 干净序列化，布尔助手不会覆盖同名字段（`bucket` 不再是 `false`） |
 | `FmtLargeUploadTest`（v3.0.0） | 大文件分片：init / 逐片 PUT / 暂停 / 取消 / 断点续传 / 进度回调 / 失败会话 |
 
-> **v3.0.0 当前**：Java 侧共 **112 项**（core 84 + starter 28），全绿；C++ 侧 **200 项**，
+> **v3.0.1 当前**：Java 侧共 **112 项**（core 84 + starter 28），全绿；C++ 侧 **200 项**，
 > `ctest` 100% 通过。
 
 ### 10.2 真机 smoke（**已实测**，2026-10-10）
@@ -929,7 +929,7 @@ user.json」）。所以对着**旧 exe** 跑，桥接侧看到的是（都是**
 
 | 场景 | 做法 |
 |---|---|
-| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:3.0.0` |
+| Maven 多模块工程内 | `mvn -s tools/maven-settings.xml clean install`，然后依赖 `org.lazy:fmt-spring-boot-starter:3.0.1` |
 | 不想动私服 | `mvn install:install-file` 把两个 jar 装进本地仓库，或直接 `<scope>system</scope>`（不推荐） |
 | 只在非 Spring 项目用 | 只依赖 `fmt-client-core`（零依赖，Java 17+） |
 | 当独立桥接服务跑 | `java -jar fmt-bridge.jar`（demo 模块打成可执行 jar），别的系统调它的 REST |

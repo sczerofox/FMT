@@ -9420,7 +9420,7 @@ file.upload 的 30 分钟命令超时残余风险：上限到了仍可能出现�
 > `Service.永久删除后分享如实报文件不存在` / `Service.并发最后一次下载不会超发` /
 > `Server.分享路由与公开下载`；实测 `fmt_tests.exe` → 「共 162 项：通过 162，失败 0」，
 > `Service.` 19 项、`Server.` 8 项全绿，`ctest` 100%）**。
-> 用例条数只维护在上面这条台阶链里（**v3.0.0 当前 200**；第 109、112 节是按覆盖范围列用例、
+> 用例条数只维护在上面这条台阶链里（**v3.0.1 当前 200**；第 109、112 节是按覆盖范围列用例、
 > 不写条数）。v3.0.0 新增的 38 条分片上传用例见第 129.6 节。
 
 后续开发过程中，如果发现：
@@ -9716,7 +9716,7 @@ Service Stopped...
 | 项 | 约定 |
 | --- | --- |
 | 程序名 | 固定 `File Manager Tool`（文档名/工程名仍叫 FMT，只有横幅用这个名字） |
-| 版本部分 | 直接取 `version::STRING`，当前 `v3.0.0`；横幅与 `--version` 同源 |
+| 版本部分 | 直接取 `version::STRING`，当前 `v3.0.1`；横幅与 `--version` 同源 |
 | 构建日期 | CMake 配置时生成（`FMT_BUILD_DATE`，`%Y.%m.%d` 本地时间），每次重新配置都会变 |
 | 单一来源 | 横幅、`--version` / `-v`、以及 `version` 命令（提交 `d108c80`）调同一个 `version_text()`（内部就是 `banner_text()`），不各写一份；源码里不得硬编码版本号或日期 |
 | 用法标题 | `--help` 里是 `用法：fmt.exe [命令]`，不再用 `FMT 2.0.0 - Windows 文件管理系统` 这类旧标题 |
@@ -10413,7 +10413,7 @@ blocked 的情况     歧义（file.delete）、同名冲突 / 随桶删除 / �
 | 结构化输出 | **V1 不做**：没有 `--json`，也不预留参数名；机器可读通道是命令退出码（`0` / 未安装 `FMT-601` → `8`），人类可读通道是固定顺序的几行文本，见第 70、127.4 节 |
 | 双击引导 | 单实例 → 数据根体检与补齐 → 查 SCM（走 `query_status()`；未安装 install / 运行中不动 / 已安装未运行提权 start 并用 `settle_state()` 等它落定）→ 仍没起读失败编号，命中数据根/配置类错误码（FMT-005/006/007/008/009/011/013/014）不重装、其余提权 reinstall 一次 → 宿主 exe 丢失询问 reinstall → hello 声明数据根 → 横幅与提示符，见第 75 节 |
 | 服务状态文件 | `%ProgramData%\FMT\service.json`（当前数据根 + 安装信息），不属于业务数据 |
-| 横幅与版本 | 程序名固定 `File Manager Tool`，横幅与 `--version` 共用 `banner_text()`：`File Manager Tool  v3.0.0  ( build  <CMake 配置时生成的日期> )`；日期来自 `FMT_BUILD_DATE`（`%Y.%m.%d` 本地时间）→ `version.hpp` 的 `BUILD_DATE`；用法标题 `用法：fmt.exe [命令]`，见第 127.1 节 |
+| 横幅与版本 | 程序名固定 `File Manager Tool`，横幅与 `--version` 共用 `banner_text()`：`File Manager Tool  v3.0.1  ( build  <CMake 配置时生成的日期> )`；日期来自 `FMT_BUILD_DATE`（`%Y.%m.%d` 本地时间）→ `version.hpp` 的 `BUILD_DATE`；用法标题 `用法：fmt.exe [命令]`，见第 127.1 节 |
 | 控制台约定 | 控制台只留交互与异常：横幅、提示符、命令结果、stderr 上的异常。双击时的数据根体检结果（新建目录 / 新建文件 / 完整）、服务当前状态只进日志（模块 `Cli` / `Service`）；**换根通知是例外**（提交 `8f2fbc5`）：切换时 stderr 打印 `root_switch_notice()`，交互窗口横幅永远显示「数据根：…」（**原口径「换根通知也只进日志」已作废**），见第 65、127.1 节 |
 | help 命令 | `--help` 打印带横幅与退出码表的完整用法（内含命令总览）；`help` 不带参数只列命令、`help <组>` 打印该组详情（`service` / `bucket` / `file` / `upload` / `share` / `trash` / `help` / `version` / `exit`），交互式与一次性都支持，不提权、不连服务、不写日志；`help <未知组>` → stderr 一行 + `FMT-001` / 退出码 2；`exit` / `quit` 是正式命令，见第 68、95、127.2 节 |
 | CLI 界面 | 横幅 `File Manager Tool  v3.0.0  ( build  2026.10.09 )` + `Service Running...` + **`数据根：…`**（提交 `8f2fbc5`），提示符 `fmt> `（打印前先输出一个空行，空命令不重复空行），正常 → stdout / 错误 → stderr，见第 127 节 |
@@ -10498,7 +10498,7 @@ DELETE /api/upload/<upload_id>
 - Java：`FmtClient.uploadLarge(Path, name, FmtLargeUploadOptions)` 自动算 MD5、init、
   逐片 PUT、回调进度、complete；`resumeLargeUpload` / `pauseLargeUpload` /
   `cancelLargeUpload` / `largeUploadStatus` 对应上面四条会话接口。
-  **新增 `uploadLarge(InputStream, size, name, options)`**：直接从 Spring
+  **v3.0.1 新增 `uploadLarge(InputStream, size, name, options)`**：直接从 Spring
   `MultipartFile.getInputStream()` 边读边分片，SDK 不落临时文件；不给 MD5 时由服务端
   在 complete 阶段计算（放弃同内容秒传）。Java 业务工程只需保留
   `FmtController` + `FmtService` 两个文件，模型/解析/异常/下载响应都在 jar，
